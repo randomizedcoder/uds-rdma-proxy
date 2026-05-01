@@ -13,6 +13,26 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+# Kernel module build artifacts
+kernel/*.o
+kernel/*.ko
+kernel/*.mod
+kernel/*.mod.c
+kernel/*.mod.o
+kernel/modules.order
+kernel/Module.symvers
+kernel/.*.cmd
+kernel/.tmp_versions/
+kernel/.module-common.o
+
+# Nix
+result
+.direnv/
+
+# Fuzz corpus and artifacts
+fuzz/corpus/
+fuzz/artifacts/
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

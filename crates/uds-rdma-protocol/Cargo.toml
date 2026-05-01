@@ -1,0 +1,10 @@
+[package]
+name = "uds-rdma-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "Shared protocol types for UDS-RDMA proxy (no_std + alloc compatible)"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["std"]
+std = []

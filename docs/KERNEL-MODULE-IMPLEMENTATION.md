@@ -10,7 +10,7 @@ Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.
 
 | # | Phase | Status | Completion |
 |---|-------|--------|------------|
-| 0 | [Prerequisites](#phase-0-prerequisites) | Not Started | 0/7 |
+| 0 | [Prerequisites](#phase-0-prerequisites) | In Progress | 4/7 |
 | 1 | [k0 -- Proof of Concept](#phase-1-k0----proof-of-concept) | Not Started | 0/9 |
 | 2 | [urp CLI + GENL](#phase-2-urp-cli--genl-interface) | Not Started | 0/9 |
 | 3 | [k1 -- Functional](#phase-3-k1----functional) | Not Started | 0/14 |
@@ -21,17 +21,28 @@ Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.
 
 ## Phase 0: Prerequisites
 
-**Status**: Not Started
+**Status**: In Progress
 
 ### Deliverables
 
-- [ ] `uds-rdma-protocol` crate compiles with `--no-default-features` (no_std + alloc)
-- [ ] `cargo test` passes: frame roundtrip, credit state, reorder buffer (20+ test cases)
+- [x] `uds-rdma-protocol` crate compiles with `--no-default-features` (no_std + alloc)
+- [x] `cargo test` passes: frame roundtrip, credit state, reorder buffer (20+ test cases)
 - [ ] `cargo +nightly miri test` passes (no UB)
 - [ ] `cargo fuzz run frame_decode` runs for 60s with no crashes
-- [ ] `make -C kernel` produces `urp.ko` (empty module: init prints, exit prints)
+- [x] `make -C kernel` produces `urp.ko` (empty module: init prints, exit prints)
 - [ ] `sudo insmod kernel/urp.ko && sudo rmmod urp` succeeds on host
-- [ ] MicroVM kernel boots with `CONFIG_KUNIT=y`
+- [ ] ~~MicroVM kernel boots with `CONFIG_KUNIT=y`~~ (deferred to Phase 5)
+
+### Variations from Plan
+
+1. **Not an extraction** -- Plan says "extract protocol logic from the userspace proxy design." No userspace code exists. This is a clean-room implementation from design docs.
+2. **Phase 0.3 deferred** -- KUnit/MicroVM infrastructure does not exist yet. Deferred to Phase 5.
+3. **FrameHeader is a regular Rust struct** -- NOT `#[repr(C, packed)]`. Manual byte-level encode/decode via `to_le_bytes`/`from_le_bytes` avoids UB. Packed repr deferred to Phase 3 FFI.
+4. **Multi-module crate** -- 8 modules (frame, credit, reorder, probe, mtu, qp, constants, error) instead of single `lib.rs`.
+5. **63 test cases** -- Well above the 20+ target (frame: 22, credit: 8, reorder: 8, probe: 6, mtu: 12, qp: 4, plus extras).
+6. **FFI exports deferred** to Phase 3.
+7. **Kernel module built against 6.12.68 headers** -- Running kernel is 6.18.22 (NixOS). Build validated, insmod not possible without matching headers. Nix flake devshell will provide correct kernel-dev for the running kernel.
+8. **Miri/fuzz require nightly** -- Not available outside Nix devshell. Stable Rust (1.94.0) is from Nix system profile.
 
 ### Notes
 

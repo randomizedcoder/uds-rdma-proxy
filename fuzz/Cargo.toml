@@ -1,0 +1,37 @@
+[package]
+name = "uds-rdma-protocol-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.uds-rdma-protocol]
+path = "../crates/uds-rdma-protocol"
+
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+doc = false
+
+[[bin]]
+name = "frame_roundtrip"
+path = "fuzz_targets/frame_roundtrip.rs"
+doc = false
+
+[[bin]]
+name = "reorder_buffer"
+path = "fuzz_targets/reorder_buffer.rs"
+doc = false
+
+[[bin]]
+name = "credit_state_machine"
+path = "fuzz_targets/credit_state_machine.rs"
+doc = false
+
+[workspace]
+members = ["."]
