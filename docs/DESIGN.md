@@ -40,6 +40,9 @@ Application A  <--UDS-->  uds-rdma-proxy  <==RDMA/RoCEv2==>  uds-rdma-proxy  <--
 | 23 | [`urp` CLI Tool](design/23-cli-tool.md) | Standalone Rust CLI (neli + clap), subcommands (add/remove/set/show/stats/monitor/drain), JSON/human/oneline output, systemd deployment, monitoring integration |
 | A | [Glossary](design/appendix-glossary.md) | CQ, CQE, DCQCN, DSCP, ECMP, ECN, MR, PFC, QP, RC, RoCEv2, SQE, SRQ, UDS, WQE, WC, mTLS, PSK, IPsec inline |
 | B | [RoCEv2 Security Practices](design/appendix-rocev2-security.md) | Industry survey (cloud, storage, HPC), common practices (VLANs, isolation), NIC crypto capabilities (ConnectX-6 Dx+), justification for tiered security |
+| | **Implementation** | |
+| | [Kernel Module Plan](KERNEL-MODULE-PLAN.md) | 6-phase implementation plan: prerequisites, k0 PoC, urp CLI + GENL, k1 functional, k2 optimized, MicroVM integration |
+| | [Implementation Tracker](KERNEL-MODULE-IMPLEMENTATION.md) | Progress tracking with per-phase status, definition-of-done checklists, test result tables |
 
 ---
 
