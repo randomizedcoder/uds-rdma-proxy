@@ -1,2 +1,4 @@
 obj-m := urp.o
-urp-objs := urp_main.o
+urp-objs := urp_main.o urp_socket.o urp_rdma.o urp_pump.o urp_proc.o
+
+ccflags-y += -I$(src)/include
