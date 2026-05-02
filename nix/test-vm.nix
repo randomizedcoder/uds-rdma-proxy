@@ -8,9 +8,40 @@
 #
 # The VM kernel matches the flake-pinned nixpkgs, so urp.ko built by
 # buildUrpKo loads without vermagic mismatch.
-{ pkgs, urpKo, testKmodK0, urpTestClient }:
+#
+# Set enableSanitizers = true to build a debug kernel with KASAN + KMEMLEAK.
+# This triggers a full kernel rebuild (~30 min first time, cached after).
+{ pkgs, buildUrpKo, urpTestClient, enableSanitizers ? false }:
 
 let
+  sanitizerPatches = [{
+    name = "kasan-kmemleak-kunit";
+    patch = null;
+    extraStructuredConfig = with pkgs.lib.kernel; {
+      KASAN = yes;
+      KASAN_GENERIC = yes;
+      DEBUG_KMEMLEAK = yes;
+      DEBUG_KMEMLEAK_AUTO_SCAN = yes;
+      KUNIT = yes;
+    };
+  }];
+
+  baseKernel = pkgs.linuxPackages.kernel;
+
+  vmKernelPackages =
+    if enableSanitizers then
+      pkgs.linuxPackagesFor (baseKernel.override {
+        kernelPatches = baseKernel.kernelPatches ++ sanitizerPatches;
+      })
+    else
+      pkgs.linuxPackages;
+
+  urpKo = buildUrpKo vmKernelPackages;
+
+  testKmodK0 = import ./test-kmod-k0.nix {
+    inherit pkgs urpKo urpTestClient;
+  };
+
   # SSH key pair for programmatic VM access.
   # Stored in nix store (world-readable) — acceptable for a local dev/test VM.
   sshKeys = pkgs.runCommand "urp-vm-ssh-keys" {
@@ -33,10 +64,13 @@ let
           host.port = 2222;
           guest.port = 22;
         }];
-        memorySize = 2048;
+        # KASAN adds ~2-3x memory overhead
+        memorySize = if enableSanitizers then 4096 else 2048;
         cores = 2;
         graphics = false;
       };
+
+      boot.kernelPackages = vmKernelPackages;
 
       services.openssh = {
         enable = true;
@@ -67,6 +101,11 @@ let
 
       boot.kernelModules = [ "ib_core" "rdma_cm" "rdma_rxe" ];
 
+      # KMEMLEAK: enable scan trigger via debugfs
+      boot.kernelParams = pkgs.lib.optionals enableSanitizers [
+        "kmemleak=on"
+      ];
+
       networking = {
         hostName = "urp-test";
         firewall.enable = false;
@@ -79,4 +118,5 @@ let
 in {
   vm = nixos.config.system.build.vm;
   inherit sshKeys;
+  inherit enableSanitizers;
 }

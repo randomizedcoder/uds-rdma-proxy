@@ -37,11 +37,23 @@
         };
 
         testVm = import ./nix/test-vm.nix {
-          inherit pkgs urpKo testKmodK0 urpTestClient;
+          inherit pkgs urpTestClient;
+          inherit (nixChecks) buildUrpKo;
+        };
+
+        testVmDebug = import ./nix/test-vm.nix {
+          inherit pkgs urpTestClient;
+          inherit (nixChecks) buildUrpKo;
+          enableSanitizers = true;
         };
 
         urpVm = import ./nix/urp-vm.nix {
           inherit pkgs testVm;
+        };
+
+        urpVmDebug = import ./nix/urp-vm.nix {
+          inherit pkgs;
+          testVm = testVmDebug;
         };
       in
       {
@@ -55,6 +67,7 @@
           urp-ko = urpKo;
           test-kmod-k0 = testKmodK0;
           urp-vm = urpVm;
+          urp-vm-debug = urpVmDebug;
         };
 
         # buildUrpKo: function to build against any kernel.

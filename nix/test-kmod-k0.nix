@@ -136,6 +136,24 @@ pkgs.writeShellApplication {
         exit 1
     fi
 
+    # ---- KUnit tests (if CONFIG_KUNIT=y) ----
+
+    if dmesg | grep -q "KTAP version"; then
+        log "KUnit tests detected, checking results..."
+        KUNIT_FAIL=$(dmesg | grep -c "not ok.*urp" || true)
+        KUNIT_PASS=$(dmesg | grep -c "ok.*urp" || true)
+        if [ "$KUNIT_FAIL" -gt 0 ]; then
+            err "KUnit: $KUNIT_FAIL test(s) failed"
+            dmesg | grep "not ok.*urp" | while IFS= read -r line; do echo "    $line"; done
+        elif [ "$KUNIT_PASS" -gt 0 ]; then
+            pass "KUnit: $KUNIT_PASS test(s) passed"
+        else
+            log "KUnit: no urp tests found (CONFIG_KUNIT may be off)"
+        fi
+    else
+        log "KUnit not available (run with urp-vm-debug for KUnit tests)"
+    fi
+
     # ---- Test 2: /proc/urp/stats ----
 
     log "Test 2: /proc/urp/stats..."
@@ -172,7 +190,7 @@ pkgs.writeShellApplication {
     # ---- Test 3: Echo via RDMA test client ----
 
     log "Test 3: Basic echo via RDMA..."
-    if urp-test-client "$RXE_IP" "''${PORT}" "hello RDMA kernel" 1 2>/dev/null; then
+    if urp-test-client "$RXE_IP" "''${PORT}" echo "hello RDMA kernel" 1 2>/dev/null; then
         pass "Basic RDMA echo"
     else
         # Expected: the test client connects via RDMA, the module accepts,
@@ -181,32 +199,87 @@ pkgs.writeShellApplication {
         err "Basic RDMA echo"
     fi
 
-    # ---- Test 4: Multiple roundtrips ----
+    # ---- Test 4: 1000 echo roundtrips ----
 
     if [ "$TEST_FAILED" -eq 0 ]; then
-        log "Test 4: 100 echo roundtrips..."
-        if urp-test-client "$RXE_IP" "''${PORT}" "roundtrip-test" 100 2>/dev/null; then
-            pass "100 echo roundtrips"
+        log "Test 4: 1000 echo roundtrips..."
+        if urp-test-client "$RXE_IP" "''${PORT}" echo "roundtrip-test" 1000 2>/dev/null; then
+            pass "1000 echo roundtrips"
         else
             err "Echo roundtrips failed"
         fi
     fi
 
-    # ---- Test 5: Stats verification ----
+    # ---- Test 5: Throughput (100 MB) ----
 
-    log "Test 5: Stats after data transfer..."
+    if [ "$TEST_FAILED" -eq 0 ]; then
+        log "Test 5: Throughput test (100 MB)..."
+        if urp-test-client "$RXE_IP" "''${PORT}" throughput 100 2>&1 | tee /tmp/urp_throughput.txt; then
+            pass "Throughput test (100 MB)"
+            grep "Throughput:" /tmp/urp_throughput.txt || true
+        else
+            err "Throughput test failed"
+        fi
+    fi
+
+    # ---- Test 6: Latency (1000 roundtrips) ----
+
+    if [ "$TEST_FAILED" -eq 0 ]; then
+        log "Test 6: Latency test (1000 x 64B roundtrips)..."
+        if urp-test-client "$RXE_IP" "''${PORT}" latency 1000 2>&1 | tee /tmp/urp_latency.txt; then
+            pass "Latency test"
+            grep "RTT" /tmp/urp_latency.txt || true
+        else
+            err "Latency test failed"
+        fi
+    fi
+
+    # ---- Test 7: Stats verification ----
+
+    log "Test 7: Stats after data transfer..."
     if [ -f /proc/urp/stats ]; then
         log "Stats:"
         while IFS= read -r line; do echo "    $line"; done < /proc/urp/stats
     fi
 
-    # ---- Test 6: rmmod ----
+    # ---- Test 8: rmmod ----
 
-    log "Test 6: rmmod..."
+    log "Test 8: rmmod..."
     if rmmod urp; then
         pass "rmmod succeeded"
     else
         err "rmmod failed"
+    fi
+
+    # ---- KASAN check ----
+    log "Checking for KASAN errors..."
+    if grep -q "CONFIG_KASAN=y" /boot/config-"$(uname -r)" 2>/dev/null || \
+       zgrep -q "CONFIG_KASAN=y" /proc/config.gz 2>/dev/null; then
+        if dmesg | grep -i "BUG: KASAN" >/dev/null 2>&1; then
+            err "KASAN errors detected"
+            dmesg | grep -A5 "BUG: KASAN" | while IFS= read -r line; do echo "    $line"; done
+        else
+            pass "KASAN clean"
+        fi
+    else
+        log "KASAN not enabled in kernel (run with urp-vm-debug for sanitizer testing)"
+    fi
+
+    # ---- KMEMLEAK check ----
+    log "Checking for memory leaks..."
+    if [ -f /sys/kernel/debug/kmemleak ]; then
+        # Trigger a scan after rmmod
+        echo scan > /sys/kernel/debug/kmemleak 2>/dev/null || true
+        sleep 1
+        LEAKS=$(cat /sys/kernel/debug/kmemleak 2>/dev/null || echo "")
+        if [ -n "$LEAKS" ] && echo "$LEAKS" | grep -q "urp"; then
+            err "KMEMLEAK: urp-related leaks detected"
+            echo "$LEAKS" | grep -A5 "urp" | while IFS= read -r line; do echo "    $line"; done
+        else
+            pass "KMEMLEAK clean (no urp leaks)"
+        fi
+    else
+        log "KMEMLEAK not enabled in kernel (run with urp-vm-debug for sanitizer testing)"
     fi
 
     # ---- Check dmesg for errors ----

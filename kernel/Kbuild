@@ -1,4 +1,5 @@
 obj-m := urp.o
 urp-objs := urp_main.o urp_socket.o urp_rdma.o urp_pump.o urp_proc.o
+urp-$(CONFIG_KUNIT) += urp_test.o
 
 ccflags-y += -I$(src)/include
