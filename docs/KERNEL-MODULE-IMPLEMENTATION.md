@@ -54,7 +54,7 @@ Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.
 
 ## Phase 1: k0 -- Proof of Concept
 
-**Status**: In Progress
+**Status**: Complete (sanitizer runtime testing deferred to Phase 5)
 
 ### Deliverables
 
@@ -64,8 +64,8 @@ Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.
 - [x] `/proc/urp/stats` shows correct byte/frame counters
 - [x] Clean insmod/rmmod cycle with no kernel errors in dmesg
 - [x] KUnit tests written: 12 tests (frame codec roundtrip, endianness, boundary values, buffer lifecycle)
-- [ ] KASAN clean: no memory errors during test suite (debug VM infrastructure ready, needs kernel build)
-- [ ] KMEMLEAK clean: no leaks after `rmmod` (debug VM infrastructure ready, needs kernel build)
+- [ ] **TODO (deferred to Phase 5)**: KASAN clean -- no memory errors during test suite. Sanitizer kernel builds successfully but panics at boot ("No filesystem could mount root fs"); root cause is `kernel.override { kernelPatches = ... }` dropping NixOS-injected configs needed by the qemu-vm rootfs (likely VIRTIO_BLK / 9P_FS). Fix path: restructure `nix/test-vm.nix` to use `boot.kernelPatches` inside the NixOS config (canonical pattern), breaking the urpKo/kernelPackages cycle via two-pass eval. Defer to Phase 5 with broader MicroVM/test-infra rework.
+- [ ] **TODO (deferred to Phase 5)**: KMEMLEAK clean -- no leaks after `rmmod`. Same blocker as KASAN.
 - [x] Latency measured: p50=1.07ms, p99=1.22ms (rdma_rxe in QEMU -- not representative of hardware)
 - [ ] **Decision gate**: No userspace proxy exists yet to compare against. Deferred to after userspace v2 implementation.
 
@@ -98,7 +98,7 @@ Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.
 6. **NixOS test VM** -- Plan defers MicroVM to Phase 5. Added early as QEMU VM (`nix run .#urp-vm`) for kernel module testing without host sudo. VM kernel matches flake-pinned nixpkgs, so urp.ko loads without vermagic mismatch.
 7. **Userspace RDMA test client** -- Plan assumes dual module instances for testing. Kernel modules are global -- can't load twice. Created a minimal userspace RDMA CM client (`tools/urp-test-client.c`) that connects to the module's listener and sends/receives URP DATA frames.
 8. **Acceptor data path setup before `rdma_accept`** -- UDS connect and pump start happen in the `CONNECT_REQUEST` CM handler, before `rdma_accept()` transitions the QP to RTR/RTS. This prevents a race where recv completions fire before the UDS forwarding path is ready.
-9. **Debug VM with sanitizers** -- Separate debug VM variant (`nix run .#urp-vm-debug`) with KASAN, KMEMLEAK, and KUnit enabled. Requires full kernel rebuild (~30 min first time, cached after). Standard VM stays fast for iteration.
+9. **Debug VM with sanitizers** -- Separate debug VM variant (`nix run .#urp-vm-debug`) with KASAN, KMEMLEAK, and KUnit enabled. Requires full kernel rebuild (~30 min first time, cached after). Standard VM stays fast for iteration. **TODO**: debug kernel currently panics at boot due to missing virtio/9p config; runtime sanitizer testing deferred to Phase 5 (see Deliverables section).
 10. **Decision gate deferred** -- No userspace proxy v2 exists to compare latency against. The kernel module latency numbers (p50=1.07ms rdma_rxe in QEMU) are not meaningful for the comparison. Decision gate moves to after userspace v2.
 
 ### Latency Results
@@ -131,12 +131,13 @@ Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.
   nix run .#urp-vm -- ssh test-kmod-k0   # Run integration tests
   nix run .#urp-vm -- stop     # Stop VM
   ```
-- **Debug VM with sanitizers**:
+- **Debug VM with sanitizers** (TODO -- currently panics at boot; deferred to Phase 5):
   ```
   nix run .#urp-vm-debug -- start    # Start VM with KASAN/KMEMLEAK/KUnit kernel
   nix run .#urp-vm-debug -- ssh test-kmod-k0   # Tests include sanitizer checks
   nix run .#urp-vm-debug -- stop
   ```
+  Boot panic: kernel reaches userspace setup but cannot mount root fs (VIRTIO_BLK / 9P_FS missing from override-built kernel). Fix path: switch `nix/test-vm.nix` from `kernel.override { kernelPatches = ... }` to `boot.kernelPatches` inside the NixOS config so NixOS-injected qemu-vm configs are preserved.
 - **Host testing** (requires `--impure` for kernel match):
   ```
   nix build --impure --expr \

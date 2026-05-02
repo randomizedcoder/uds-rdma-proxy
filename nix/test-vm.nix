@@ -17,12 +17,12 @@ let
   sanitizerPatches = [{
     name = "kasan-kmemleak-kunit";
     patch = null;
-    extraStructuredConfig = with pkgs.lib.kernel; {
-      KASAN = yes;
-      KASAN_GENERIC = yes;
-      DEBUG_KMEMLEAK = yes;
-      DEBUG_KMEMLEAK_AUTO_SCAN = yes;
-      KUNIT = yes;
+    structuredExtraConfig = with pkgs.lib.kernel; with pkgs.lib; {
+      KASAN = mkForce yes;
+      KASAN_GENERIC = mkForce yes;
+      DEBUG_KMEMLEAK = mkForce yes;
+      DEBUG_KMEMLEAK_AUTO_SCAN = mkForce yes;
+      KUNIT = mkForce yes;
     };
   }];
 
