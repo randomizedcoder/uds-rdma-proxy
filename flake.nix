@@ -32,17 +32,31 @@
 
         urpTestClient = import ./nix/urp-test-client.nix { inherit pkgs; };
 
+        urpCli = import ./nix/urp-cli.nix {
+          inherit pkgs;
+          inherit (packages) rustToolchain;
+        };
+
+        # Phase 3a: FFI staticlib for the optional Rust-backed reorder
+        # buffer. Only consumed by the kernel build when
+        # CONFIG_URP_REORDER_RUST=y; the default urp-ko build (C rbtree
+        # backend) does not use it.
+        urpProtocolFfi = import ./nix/urp-protocol-ffi.nix {
+          inherit pkgs;
+          inherit (packages) rustToolchain;
+        };
+
         testKmodK0 = import ./nix/test-kmod-k0.nix {
-          inherit pkgs urpKo urpTestClient;
+          inherit pkgs urpKo urpTestClient urpCli;
         };
 
         testVm = import ./nix/test-vm.nix {
-          inherit pkgs urpTestClient;
+          inherit pkgs urpTestClient urpCli;
           inherit (nixChecks) buildUrpKo;
         };
 
         testVmDebug = import ./nix/test-vm.nix {
-          inherit pkgs urpTestClient;
+          inherit pkgs urpTestClient urpCli;
           inherit (nixChecks) buildUrpKo;
           enableSanitizers = true;
         };
@@ -65,6 +79,8 @@
 
         packages = {
           urp-ko = urpKo;
+          urp-cli = urpCli;
+          urp-protocol-ffi = urpProtocolFfi;
           test-kmod-k0 = testKmodK0;
           urp-vm = urpVm;
           urp-vm-debug = urpVmDebug;

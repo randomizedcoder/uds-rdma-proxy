@@ -1,0 +1,20 @@
+[package]
+name = "uds-rdma-protocol-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "C-ABI staticlib bridge for uds-rdma-protocol, intended to be linked into the urp.ko kernel module under CONFIG_URP_REORDER_RUST=y"
+license = "MIT OR Apache-2.0"
+
+[lib]
+# The kernel module links the .a; `staticlib` only. We disable `test = false`
+# because the FFI crate provides its own `#[panic_handler]` and the libtest
+# harness pulls in `std`, which would cause a duplicate-lang-item error.
+# Tests live in the protocol crate (cargo test) and on the kernel side
+# (KUnit). See `kernel/tests/urp_test_reorder.c`.
+crate-type = ["staticlib"]
+test = false
+doctest = false
+bench = false
+
+[dependencies]
+uds-rdma-protocol = { path = "../uds-rdma-protocol", default-features = false }
