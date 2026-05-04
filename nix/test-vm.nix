@@ -11,7 +11,7 @@
 #
 # Set enableSanitizers = true to build a debug kernel with KASAN + KMEMLEAK.
 # This triggers a full kernel rebuild (~30 min first time, cached after).
-{ pkgs, buildUrpKo, urpTestClient, enableSanitizers ? false }:
+{ pkgs, buildUrpKo, urpTestClient, urpCli, enableSanitizers ? false }:
 
 let
   sanitizerPatches = [{
@@ -26,7 +26,7 @@ let
     };
   }];
 
-  baseKernel = pkgs.linuxPackages.kernel;
+  baseKernel = pkgs.linuxPackages_latest.kernel;
 
   vmKernelPackages =
     if enableSanitizers then
@@ -34,12 +34,12 @@ let
         kernelPatches = baseKernel.kernelPatches ++ sanitizerPatches;
       })
     else
-      pkgs.linuxPackages;
+      pkgs.linuxPackages_latest;
 
   urpKo = buildUrpKo vmKernelPackages;
 
   testKmodK0 = import ./test-kmod-k0.nix {
-    inherit pkgs urpKo urpTestClient;
+    inherit pkgs urpKo urpTestClient urpCli;
   };
 
   # SSH key pair for programmatic VM access.
@@ -97,6 +97,7 @@ let
       ] ++ [
         testKmodK0
         urpTestClient
+        urpCli
       ];
 
       boot.kernelModules = [ "ib_core" "rdma_cm" "rdma_rxe" ];

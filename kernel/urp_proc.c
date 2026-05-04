@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * UDS-RDMA Proxy (urp) — /proc/urp/stats
+ * UDS-RDMA Proxy (urp) -- /proc/urp/<name>/stats
  *
- * Phase k0: Simple counters for tx_bytes, rx_bytes, tx_frames, rx_frames,
- * connections.
+ * Phase 2: per-endpoint subdirectories. Each endpoint gets a /proc/urp/<name>/
+ * directory containing a "stats" file. The endpoint pointer is attached as
+ * pde_data on the stats inode so urp_stats_show can resolve it without
+ * holding any global state.
  */
 
 #include "urp.h"
@@ -12,7 +14,7 @@ static struct proc_dir_entry *urp_proc_dir;
 
 static int urp_stats_show(struct seq_file *m, void *v)
 {
-	struct urp_endpoint *ep = urp_ep;
+	struct urp_endpoint *ep = m->private;
 
 	if (!ep) {
 		seq_puts(m, "no endpoint\n");
@@ -39,7 +41,7 @@ static int urp_stats_show(struct seq_file *m, void *v)
 
 static int urp_stats_open(struct inode *inode, struct file *file)
 {
-	return single_open(file, urp_stats_show, NULL);
+	return single_open(file, urp_stats_show, pde_data(inode));
 }
 
 static const struct proc_ops urp_stats_ops = {
@@ -57,14 +59,6 @@ int urp_proc_init(void)
 		return -ENOMEM;
 	}
 
-	if (!proc_create(URP_PROC_STATS, 0444, urp_proc_dir, &urp_stats_ops)) {
-		pr_err("urp: failed to create /proc/%s/%s\n",
-		       URP_PROC_DIR, URP_PROC_STATS);
-		proc_remove(urp_proc_dir);
-		urp_proc_dir = NULL;
-		return -ENOMEM;
-	}
-
 	return 0;
 }
 
@@ -73,5 +67,39 @@ void urp_proc_cleanup(void)
 	if (urp_proc_dir) {
 		proc_remove(urp_proc_dir);
 		urp_proc_dir = NULL;
+	}
+}
+
+int urp_endpoint_proc_create(struct urp_endpoint *ep)
+{
+	struct proc_dir_entry *dir, *stats;
+
+	if (!urp_proc_dir)
+		return -ENOENT;
+
+	dir = proc_mkdir(ep->name, urp_proc_dir);
+	if (!dir) {
+		pr_err("urp: failed to create /proc/%s/%s\n",
+		       URP_PROC_DIR, ep->name);
+		return -ENOMEM;
+	}
+
+	stats = proc_create_data(URP_PROC_STATS, 0444, dir, &urp_stats_ops, ep);
+	if (!stats) {
+		pr_err("urp: failed to create /proc/%s/%s/%s\n",
+		       URP_PROC_DIR, ep->name, URP_PROC_STATS);
+		proc_remove(dir);
+		return -ENOMEM;
+	}
+
+	ep->proc_dir = dir;
+	return 0;
+}
+
+void urp_endpoint_proc_remove(struct urp_endpoint *ep)
+{
+	if (ep->proc_dir) {
+		proc_remove(ep->proc_dir);
+		ep->proc_dir = NULL;
 	}
 }

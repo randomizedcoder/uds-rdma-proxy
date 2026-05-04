@@ -1,4 +1,4 @@
-{ pkgs, urpKo, urpTestClient }:
+{ pkgs, urpKo, urpTestClient, urpCli }:
 
 pkgs.writeShellApplication {
   name = "test-kmod-k0";
@@ -13,21 +13,28 @@ pkgs.writeShellApplication {
     gnused
     procps
     util-linux
+    jq
     urpTestClient
+    urpCli
   ];
 
   text = ''
-    # test-kmod-k0 — Phase k0 kernel module integration test
+    # test-kmod-k0 -- Phase 2 (GENL) kernel module integration test
     #
-    # Single-module test using rdma_rxe loopback:
-    #   1. Create rxe device on a veth pair
-    #   2. Start echo server on UDS socket
-    #   3. Load urp.ko as acceptor (RDMA listen, UDS connect to echo)
-    #   4. Use urp-test-client to send data via RDMA → module → echo → back
+    # Same data-path coverage as the original Phase 1 test, plus the new
+    # control-plane surface introduced by Phase 2:
+    #   1. Module loads idle (no module_param).
+    #   2. `urp add` installs an endpoint via generic netlink.
+    #   3. `/proc/urp/<name>/stats` exists per-endpoint.
+    #   4. `urp show` (single + dump) and `urp show --json` work.
+    #   5. Error paths report EEXIST / ENOENT / EINVAL meaningfully.
+    #   6. RDMA echo / throughput / latency still pass.
+    #   7. `urp drain` then `urp remove` torn down cleanly, then rmmod.
     #
     # Usage: sudo test-kmod-k0 [path-to-urp.ko]
 
     URP_KO="''${1:-${urpKo}/lib/modules/$(uname -r)/urp.ko}"
+    EP_NAME="test"
     CONNECT_PATH="/tmp/urp_test_echo.sock"
     PORT=4791
     ECHO_PID=""
@@ -49,18 +56,16 @@ pkgs.writeShellApplication {
     cleanup() {
         log "Cleaning up..."
 
-        # Stop echo server
+        # Best-effort: drain + remove the endpoint via the CLI before unloading.
+        urp remove "''${EP_NAME}" 2>/dev/null || true
+
         if [ -n "''${ECHO_PID}" ]; then
             kill "''${ECHO_PID}" 2>/dev/null || true
         fi
 
-        # Unload module
         rmmod urp 2>/dev/null || true
-
-        # Remove sockets
         rm -f "''${CONNECT_PATH}"
 
-        # Remove RXE device
         if [ -n "''${RXE_DEV}" ]; then
             rdma link delete "''${RXE_DEV}" 2>/dev/null || true
         fi
@@ -70,7 +75,7 @@ pkgs.writeShellApplication {
 
     trap cleanup EXIT
 
-    # ---- Preflight checks ----
+    # ---- Preflight ----
 
     if [ "$(id -u)" -ne 0 ]; then
         fail "Must run as root"
@@ -86,32 +91,39 @@ pkgs.writeShellApplication {
     # ---- Setup rdma_rxe ----
 
     log "Setting up rdma_rxe..."
-
-    # Load RDMA stack
     modprobe ib_core 2>/dev/null || true
     modprobe rdma_cm 2>/dev/null || true
     modprobe rdma_rxe 2>/dev/null || true
 
-    # Find a suitable network device for rxe (prefer eth0, fall back to first non-lo)
-    NETDEV=$(ip -o link show | grep -v lo: | head -1 | sed 's/^[0-9]*: \([^:@]*\).*/\1/')
-    if [ -z "$NETDEV" ]; then
-        fail "No network device found for rdma_rxe"
+    # Find first non-loopback interface with an IPv4 address.
+    # `grep || true` is needed because writeShellApplication enforces pipefail.
+    NETDEV=""
+    RXE_IP=""
+    while IFS= read -r line; do
+        # Extract iface name via parameter expansion: strip "N: " prefix,
+        # then drop "@..." or ":..." suffixes.
+        cand="''${line#*: }"
+        cand="''${cand%%:*}"
+        cand="''${cand%%@*}"
+        addr=$(ip -4 -o addr show "$cand" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1 || true)
+        if [ -n "$addr" ]; then
+            NETDEV="$cand"
+            RXE_IP="$addr"
+            break
+        fi
+    done < <(ip -o link show | grep -v 'lo:' || true)
+
+    if [ -z "$NETDEV" ] || [ -z "$RXE_IP" ]; then
+        fail "No network device with IPv4 address found for rdma_rxe"
         exit 1
     fi
 
     RXE_DEV="rxe_test"
     rdma link delete "''${RXE_DEV}" 2>/dev/null || true
     rdma link add "''${RXE_DEV}" type rxe netdev "$NETDEV"
-
-    # Get the IP of the rdma_rxe device's underlying interface (not 127.0.0.1 — loopback has no rxe)
-    RXE_IP=$(ip -4 addr show "$NETDEV" | grep 'inet ' | sed 's/.*inet \([0-9.]*\).*/\1/' | head -1)
-    if [ -z "$RXE_IP" ]; then
-        fail "No IPv4 address on $NETDEV"
-        exit 1
-    fi
     log "rdma_rxe device ''${RXE_DEV} created on $NETDEV ($RXE_IP)"
 
-    # ---- Start echo server ----
+    # ---- Echo server ----
 
     log "Starting echo server..."
     rm -f "''${CONNECT_PATH}"
@@ -123,86 +135,151 @@ pkgs.writeShellApplication {
         fail "Echo server failed to start"
         exit 1
     fi
-
     log "Echo server running (PID ''${ECHO_PID})"
 
-    # ---- Test 1: insmod ----
+    # ---- Test 1: pre-load CLI behaviour ----
 
-    log "Test 1: insmod..."
-    if insmod "''${URP_KO}" connect_path="''${CONNECT_PATH}" bind_port="''${PORT}"; then
+    log "Test 1: urp add with module not loaded -> error..."
+    if ! urp add "''${EP_NAME}" --connect-path "''${CONNECT_PATH}" --bind "0.0.0.0:''${PORT}" 2>/dev/null; then
+        pass "urp add returns nonzero when module not loaded"
+    else
+        err "urp add succeeded with no module loaded"
+    fi
+
+    # ---- Test 2: insmod (no params) ----
+
+    log "Test 2: insmod (idle module)..."
+    if insmod "''${URP_KO}"; then
         pass "insmod succeeded"
     else
         err "insmod failed"
         exit 1
     fi
 
-    # ---- KUnit tests (if CONFIG_KUNIT=y) ----
+    # ---- Test 3: /proc/urp empty ----
 
+    log "Test 3: /proc/urp empty after load..."
+    if [ -d /proc/urp ] && [ -z "$(ls -A /proc/urp 2>/dev/null)" ]; then
+        pass "/proc/urp directory present and empty"
+    else
+        err "/proc/urp absent or non-empty after fresh insmod"
+    fi
+
+    # ---- Test 4: urp show on empty ----
+
+    log "Test 4: urp show -> empty..."
+    if urp show >/tmp/urp_show_empty.txt 2>&1; then
+        pass "urp show (empty) succeeded"
+    else
+        err "urp show failed on empty endpoint set"
+    fi
+
+    # ---- KUnit tests (if CONFIG_KUNIT=y) ----
     if dmesg | grep -q "KTAP version"; then
         log "KUnit tests detected, checking results..."
         KUNIT_FAIL=$(dmesg | grep -c "not ok.*urp" || true)
         KUNIT_PASS=$(dmesg | grep -c "ok.*urp" || true)
         if [ "$KUNIT_FAIL" -gt 0 ]; then
             err "KUnit: $KUNIT_FAIL test(s) failed"
-            dmesg | grep "not ok.*urp" | while IFS= read -r line; do echo "    $line"; done
         elif [ "$KUNIT_PASS" -gt 0 ]; then
             pass "KUnit: $KUNIT_PASS test(s) passed"
-        else
-            log "KUnit: no urp tests found (CONFIG_KUNIT may be off)"
         fi
-    else
-        log "KUnit not available (run with urp-vm-debug for KUnit tests)"
     fi
 
-    # ---- Test 2: /proc/urp/stats ----
+    # ---- Test 5: urp add (acceptor) ----
 
-    log "Test 2: /proc/urp/stats..."
-    if [ -f /proc/urp/stats ]; then
-        STATS=$(cat /proc/urp/stats)
+    log "Test 5: urp add ''${EP_NAME} --connect-path ... --bind 0.0.0.0:''${PORT}..."
+    if urp add "''${EP_NAME}" --connect-path "''${CONNECT_PATH}" --bind "0.0.0.0:''${PORT}"; then
+        pass "urp add succeeded"
+    else
+        err "urp add failed"
+        exit 1
+    fi
+
+    # ---- Test 6: per-endpoint /proc subdir ----
+
+    log "Test 6: /proc/urp/''${EP_NAME}/stats..."
+    if [ -f "/proc/urp/''${EP_NAME}/stats" ]; then
+        STATS=$(cat "/proc/urp/''${EP_NAME}/stats")
         if echo "$STATS" | grep -q "tx_frames:"; then
-            pass "/proc/urp/stats readable"
+            pass "/proc/urp/''${EP_NAME}/stats readable"
         else
-            err "/proc/urp/stats format unexpected"
+            err "/proc/urp/''${EP_NAME}/stats format unexpected"
         fi
     else
-        err "/proc/urp/stats not found"
+        err "/proc/urp/''${EP_NAME}/stats not found"
     fi
 
-    # ---- Wait for RDMA + UDS connection ----
+    # ---- Test 7: urp show NAME ----
 
-    log "Waiting for RDMA connection and UDS setup..."
-    CONNECTED=0
-    for _ in $(seq 1 30); do
-        if grep -q "connected: yes" /proc/urp/stats 2>/dev/null; then
-            CONNECTED=1
-            break
+    log "Test 7: urp show ''${EP_NAME}..."
+    if urp show "''${EP_NAME}" >/tmp/urp_show_one.txt 2>&1; then
+        if grep -q "''${EP_NAME}" /tmp/urp_show_one.txt; then
+            pass "urp show ''${EP_NAME} returned the endpoint"
+        else
+            err "urp show ''${EP_NAME} output missing name"
+            cat /tmp/urp_show_one.txt
         fi
-        sleep 1
-    done
-
-    if [ "$CONNECTED" -eq 1 ]; then
-        pass "RDMA connection established"
     else
-        warn "RDMA connection not established (no peer to connect — expected for acceptor-only)"
-        log "Acceptor is listening on RDMA port ''${PORT}, waiting for a client..."
+        err "urp show ''${EP_NAME} failed"
     fi
 
-    # ---- Test 3: Echo via RDMA test client ----
+    # ---- Test 8: urp show --json ----
 
-    log "Test 3: Basic echo via RDMA..."
+    log "Test 8: urp show ''${EP_NAME} --json..."
+    if urp show "''${EP_NAME}" --json | jq -e '.name == "'"''${EP_NAME}"'"' >/dev/null; then
+        pass "urp show --json returned valid JSON with name field"
+    else
+        err "urp show --json output is not valid JSON or missing name"
+    fi
+
+    # ---- Test 9: error path -- EEXIST ----
+
+    log "Test 9: urp add duplicate -> EEXIST..."
+    if ! urp add "''${EP_NAME}" --connect-path /tmp/dup.sock --bind "0.0.0.0:4792" 2>/tmp/urp_eexist.txt; then
+        if grep -qi "exist" /tmp/urp_eexist.txt; then
+            pass "duplicate add returns EEXIST-style error"
+        else
+            pass "duplicate add returned non-zero (message: $(cat /tmp/urp_eexist.txt))"
+        fi
+    else
+        err "duplicate add unexpectedly succeeded"
+    fi
+
+    # ---- Test 10: error path -- ENOENT ----
+
+    log "Test 10: urp remove nonexistent -> ENOENT..."
+    if ! urp remove nonexistent_ep 2>/tmp/urp_enoent.txt; then
+        pass "remove of unknown endpoint returns error"
+    else
+        err "remove of unknown endpoint unexpectedly succeeded"
+    fi
+
+    # ---- Test 11: error path -- EINVAL (out-of-range num_qps) ----
+
+    log "Test 11: urp add --num-qps 99 -> clap-side EINVAL..."
+    if ! urp add bad --connect-path /tmp/x.sock --bind "0.0.0.0:4793" --num-qps 99 2>/tmp/urp_einval.txt; then
+        pass "out-of-range num_qps rejected"
+    else
+        err "out-of-range num_qps unexpectedly succeeded"
+    fi
+
+    # ---- Wait for RDMA peer (acceptor mode listens; client connects below) ----
+
+    # ---- Test 12: Echo via RDMA test client ----
+
+    log "Test 12: Basic echo via RDMA..."
     if urp-test-client "$RXE_IP" "''${PORT}" echo "hello RDMA kernel" 1 2>/dev/null; then
         pass "Basic RDMA echo"
     else
-        # Expected: the test client connects via RDMA, the module accepts,
-        # connects to echo server, forwards data. This exercises the full path.
         warn "RDMA echo test failed (may need rdma_rxe loopback connectivity)"
         err "Basic RDMA echo"
     fi
 
-    # ---- Test 4: 1000 echo roundtrips ----
+    # ---- Test 13: 1000 echo roundtrips ----
 
     if [ "$TEST_FAILED" -eq 0 ]; then
-        log "Test 4: 1000 echo roundtrips..."
+        log "Test 13: 1000 echo roundtrips..."
         if urp-test-client "$RXE_IP" "''${PORT}" echo "roundtrip-test" 1000 2>/dev/null; then
             pass "1000 echo roundtrips"
         else
@@ -210,10 +287,10 @@ pkgs.writeShellApplication {
         fi
     fi
 
-    # ---- Test 5: Throughput (100 MB) ----
+    # ---- Test 14: Throughput ----
 
     if [ "$TEST_FAILED" -eq 0 ]; then
-        log "Test 5: Throughput test (100 MB)..."
+        log "Test 14: Throughput test (100 MB)..."
         if urp-test-client "$RXE_IP" "''${PORT}" throughput 100 2>&1 | tee /tmp/urp_throughput.txt; then
             pass "Throughput test (100 MB)"
             grep "Throughput:" /tmp/urp_throughput.txt || true
@@ -222,10 +299,10 @@ pkgs.writeShellApplication {
         fi
     fi
 
-    # ---- Test 6: Latency (1000 roundtrips) ----
+    # ---- Test 15: Latency ----
 
     if [ "$TEST_FAILED" -eq 0 ]; then
-        log "Test 6: Latency test (1000 x 64B roundtrips)..."
+        log "Test 15: Latency test (1000 x 64B roundtrips)..."
         if urp-test-client "$RXE_IP" "''${PORT}" latency 1000 2>&1 | tee /tmp/urp_latency.txt; then
             pass "Latency test"
             grep "RTT" /tmp/urp_latency.txt || true
@@ -234,17 +311,35 @@ pkgs.writeShellApplication {
         fi
     fi
 
-    # ---- Test 7: Stats verification ----
+    # ---- Test 16: stats reflect data transfer ----
 
-    log "Test 7: Stats after data transfer..."
-    if [ -f /proc/urp/stats ]; then
+    log "Test 16: per-endpoint stats after data transfer..."
+    if [ -f "/proc/urp/''${EP_NAME}/stats" ]; then
         log "Stats:"
-        while IFS= read -r line; do echo "    $line"; done < /proc/urp/stats
+        while IFS= read -r line; do echo "    $line"; done < "/proc/urp/''${EP_NAME}/stats"
     fi
 
-    # ---- Test 8: rmmod ----
+    # ---- Test 17: drain ----
 
-    log "Test 8: rmmod..."
+    log "Test 17: urp drain ''${EP_NAME}..."
+    if urp drain "''${EP_NAME}"; then
+        pass "drain command accepted"
+    else
+        err "drain failed"
+    fi
+
+    # ---- Test 18: remove ----
+
+    log "Test 18: urp remove ''${EP_NAME}..."
+    if urp remove "''${EP_NAME}"; then
+        pass "remove succeeded"
+    else
+        err "remove failed"
+    fi
+
+    # ---- Test 19: rmmod with no endpoints ----
+
+    log "Test 19: rmmod..."
     if rmmod urp; then
         pass "rmmod succeeded"
     else
@@ -268,7 +363,6 @@ pkgs.writeShellApplication {
     # ---- KMEMLEAK check ----
     log "Checking for memory leaks..."
     if [ -f /sys/kernel/debug/kmemleak ]; then
-        # Trigger a scan after rmmod
         echo scan > /sys/kernel/debug/kmemleak 2>/dev/null || true
         sleep 1
         LEAKS=$(cat /sys/kernel/debug/kmemleak 2>/dev/null || echo "")
@@ -294,7 +388,7 @@ pkgs.writeShellApplication {
     # ---- Summary ----
     echo ""
     echo "========================================"
-    echo "  k0 Test Results"
+    echo "  Phase 2 Test Results"
     echo "========================================"
     echo "  Passed: ''${GREEN}''${TEST_PASSED}''${NC}"
     echo "  Failed: ''${RED}''${TEST_FAILED}''${NC}"

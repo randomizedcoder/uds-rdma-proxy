@@ -2,7 +2,11 @@
 /*
  * UDS-RDMA Proxy (urp) internal header
  *
- * Phase k0: single endpoint, single QP, no credits, no reorder.
+ * Phase 2: multi-endpoint via GENL. Endpoints are stored in a global
+ * rhashtable keyed by name. Configuration arrives via netlink, not
+ * module_param. Stream multiplexing (multiple connections per endpoint)
+ * remains Phase 3 work; k0 single-connection model still applies inside
+ * each endpoint.
  */
 #ifndef _URP_H
 #define _URP_H
@@ -12,6 +16,7 @@
 #include <linux/kthread.h>
 #include <linux/net.h>
 #include <linux/un.h>
+#include <linux/in6.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/spinlock.h>
@@ -19,22 +24,22 @@
 #include <linux/atomic.h>
 #include <linux/workqueue.h>
 #include <linux/completion.h>
+#include <linux/mutex.h>
+#include <linux/rhashtable.h>
+#include <linux/rcupdate.h>
 
 #include <rdma/ib_verbs.h>
 #include <rdma/rdma_cm.h>
 
 #include "include/uapi/linux/urp.h"
 
-/* Buffer pool sizing */
+/* Buffer pool sizing -- defaults; per-endpoint values override at create */
 #define URP_NUM_BUFS		64
 #define URP_BUF_SIZE		4096	/* payload + header */
 #define URP_MAX_PAYLOAD		(URP_BUF_SIZE - URP_FRAME_HEADER_SIZE)
 #define URP_CQ_ENTRIES		(URP_NUM_BUFS * 2)	/* send + recv */
 #define URP_SQ_DEPTH		URP_NUM_BUFS
 #define URP_RQ_DEPTH		URP_NUM_BUFS
-
-/* Module parameter path length */
-#define URP_PATH_MAX		108	/* sizeof(struct sockaddr_un.sun_path) */
 
 /*
  * struct urp_buffer - DMA-mapped buffer for RDMA send/recv
@@ -83,29 +88,35 @@ struct urp_connection {
 };
 
 /*
- * struct urp_endpoint - top-level module state
- * @listen_sock:   UDS listening socket
- * @accept_thread: kthread running the accept loop
- * @conn:          current connection (k0: only one)
+ * struct urp_endpoint - one configured proxy endpoint
  *
- * RDMA resources:
- * @cm_id:     RDMA CM identifier
- * @pd:        protection domain
- * @send_cq:   send completion queue
- * @recv_cq:   receive completion queue
- * @qp:        queue pair
- *
- * Buffer pool:
- * @bufs:       array of all buffers
- * @free_list:  available buffers
- * @free_lock:  protects free_list
- *
- * State:
- * @stats:      /proc counters
- * @cm_done:    RDMA CM event completion
- * @connected:  RDMA connection is up
+ * Multiple endpoints exist concurrently; lookup is by name via the global
+ * urp_endpoints rhashtable. Lifecycle transitions are serialized by @lock;
+ * teardown uses kfree_rcu so dump walks see consistent state.
  */
 struct urp_endpoint {
+	/* Identity / configuration -- set at create, immutable except where noted */
+	char			name[URP_NAME_MAX];	/* lookup key */
+	char			listen_path[URP_PATH_MAX_LEN];
+	char			connect_path[URP_PATH_MAX_LEN];
+	char			rdma_device[URP_DEVICE_MAX];	/* "" = auto */
+	struct sockaddr_in6	peer_addr;
+	struct sockaddr_in6	bind_addr;
+	bool			has_peer_addr;
+	bool			has_bind_addr;
+	u32			num_qps;		/* mutable via SET */
+	u32			buffer_count;		/* mutable via SET */
+	u32			buffer_size;
+	u8			password[URP_PASSWORD_MAX];	/* mutable via SET, write-only */
+	bool			has_password;
+
+	/* Lifecycle */
+	enum urp_endpoint_state	state;
+	struct mutex		lock;			/* serializes state transitions */
+	struct rhash_head	ht_node;		/* urp_endpoints rhashtable linkage */
+	struct rcu_head		rcu;			/* deferred free */
+	bool			is_initiator;		/* derived from listen_path != "" */
+
 	/* UDS side */
 	struct socket		*listen_sock;
 	struct task_struct	*accept_thread;
@@ -113,7 +124,7 @@ struct urp_endpoint {
 
 	/* RDMA side */
 	struct rdma_cm_id	*cm_id;		/* active connection (or listener before connect) */
-	struct rdma_cm_id	*listen_id;	/* acceptor: listener CM ID (kept for cleanup) */
+	struct rdma_cm_id	*listen_id;	/* acceptor: listener CM ID kept for cleanup */
 	struct ib_pd		*pd;
 	struct ib_cq		*send_cq;
 	struct ib_cq		*recv_cq;
@@ -126,48 +137,67 @@ struct urp_endpoint {
 	spinlock_t		send_lock;
 	spinlock_t		recv_lock;
 
-	/* State */
+	/* Runtime state */
 	struct urp_stats	stats;
 	struct completion	cm_done;
 	int			cm_status;
 	bool			connected;
-	bool			is_initiator;
-	char			uds_path[URP_PATH_MAX];
 
 	/* RX work */
 	struct work_struct	rx_work;
 	struct workqueue_struct	*rx_wq;
+
+	/* /proc/urp/<name>/stats entry (set by urp_endpoint_proc_create) */
+	struct proc_dir_entry	*proc_dir;
 };
 
-/* Global endpoint (k0: single instance) */
-extern struct urp_endpoint *urp_ep;
+/* Module-global endpoint store (defined in urp_endpoint.c) */
+extern struct rhashtable	urp_endpoints;
+extern bool			urp_endpoints_inited;
+
+/* urp_endpoint.c -- lifecycle */
+int  urp_endpoint_table_init(void);
+void urp_endpoint_table_destroy(void);
+int  urp_endpoint_create(struct urp_endpoint *cfg, struct urp_endpoint **out);
+int  urp_endpoint_activate(struct urp_endpoint *ep);
+void urp_endpoint_drain(struct urp_endpoint *ep);
+void urp_endpoint_destroy(struct urp_endpoint *ep);
+struct urp_endpoint *urp_endpoint_lookup(const char *name);
+void urp_endpoint_drain_all(void);
 
 /* urp_socket.c */
-int urp_socket_init(struct urp_endpoint *ep, const char *path);
+int  urp_socket_init(struct urp_endpoint *ep, const char *path);
 void urp_socket_cleanup(struct urp_endpoint *ep);
-int urp_connect_uds(struct urp_endpoint *ep, const char *path);
+int  urp_connect_uds(struct urp_endpoint *ep, const char *path);
 
 /* urp_rdma.c */
-int urp_rdma_init(struct urp_endpoint *ep, const char *peer_addr,
-		  int peer_port, int bind_port, bool is_initiator);
+int  urp_rdma_init(struct urp_endpoint *ep, const char *peer_addr,
+		   int peer_port, int bind_port, bool is_initiator);
 void urp_rdma_cleanup(struct urp_endpoint *ep);
 struct urp_buffer *urp_buf_alloc_send(struct urp_endpoint *ep);
 void urp_buf_free_send(struct urp_endpoint *ep, struct urp_buffer *buf);
 struct urp_buffer *urp_buf_alloc_recv(struct urp_endpoint *ep);
 void urp_buf_free_recv(struct urp_endpoint *ep, struct urp_buffer *buf);
-int urp_post_recv(struct urp_endpoint *ep, struct urp_buffer *buf);
-int urp_post_recv_all(struct urp_endpoint *ep);
+int  urp_post_recv(struct urp_endpoint *ep, struct urp_buffer *buf);
+int  urp_post_recv_all(struct urp_endpoint *ep);
 
 /* urp_pump.c */
-int urp_pump_start(struct urp_endpoint *ep);
+int  urp_pump_start(struct urp_endpoint *ep);
 void urp_pump_stop(struct urp_endpoint *ep);
 
-/* CQ completion callbacks (urp_rdma.c) — used by pump when posting sends */
+/* CQ completion callbacks (urp_rdma.c) -- used by pump when posting sends */
 void urp_send_done(struct ib_cq *cq, struct ib_wc *wc);
 
 /* urp_proc.c */
-int urp_proc_init(void);
+int  urp_proc_init(void);
 void urp_proc_cleanup(void);
+int  urp_endpoint_proc_create(struct urp_endpoint *ep);
+void urp_endpoint_proc_remove(struct urp_endpoint *ep);
+
+/* urp_netlink.c */
+int  urp_genl_register(void);
+void urp_genl_unregister(void);
+void urp_send_event(struct urp_endpoint *ep);
 
 /* Frame encode/decode (inline, matches shared Rust crate wire format) */
 

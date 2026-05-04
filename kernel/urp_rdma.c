@@ -377,8 +377,8 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 		 * urp_recv_done drops data (conn.active is still false).
 		 * The TX pump blocks on kernel_recvmsg until echo data arrives,
 		 * so it won't attempt ib_post_send before the QP is ready. */
-		if (ep->uds_path[0]) {
-			ret = urp_connect_uds(ep, ep->uds_path);
+		if (ep->connect_path[0]) {
+			ret = urp_connect_uds(ep, ep->connect_path);
 			if (!ret)
 				ret = urp_pump_start(ep);
 			if (ret) {

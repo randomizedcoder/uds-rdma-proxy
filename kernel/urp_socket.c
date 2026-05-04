@@ -98,9 +98,14 @@ int urp_connect_uds(struct urp_endpoint *ep, const char *path)
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
-	strscpy(addr.sun_path, path, sizeof(addr.sun_path));
+	/*
+	 * sized_strscpy() rather than strscpy(): kernel 7.0+ requires both
+	 * args to strscpy() to be typed cstrings (arrays / string literals).
+	 * @path is a const char * parameter so the cstr type check trips.
+	 */
+	sized_strscpy(addr.sun_path, path, sizeof(addr.sun_path));
 
-	ret = kernel_connect(sock, (struct sockaddr *)&addr,
+	ret = kernel_connect(sock, (struct sockaddr_unsized *)&addr,
 			     offsetof(struct sockaddr_un, sun_path) + strlen(path) + 1,
 			     0);
 	if (ret) {
@@ -135,9 +140,9 @@ static int urp_listen_uds(struct urp_endpoint *ep, const char *path)
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
-	strscpy(addr.sun_path, path, sizeof(addr.sun_path));
+	sized_strscpy(addr.sun_path, path, sizeof(addr.sun_path));
 
-	ret = kernel_bind(sock, (struct sockaddr *)&addr,
+	ret = kernel_bind(sock, (struct sockaddr_unsized *)&addr,
 			  offsetof(struct sockaddr_un, sun_path) + strlen(path) + 1);
 	if (ret) {
 		pr_err("urp: bind to %s failed: %d\n", path, ret);
@@ -170,7 +175,7 @@ static int urp_listen_uds(struct urp_endpoint *ep, const char *path)
 
 int urp_socket_init(struct urp_endpoint *ep, const char *path)
 {
-	if (strlen(path) >= URP_PATH_MAX) {
+	if (strlen(path) >= URP_PATH_MAX_LEN) {
 		pr_err("urp: path too long: %s\n", path);
 		return -ENAMETOOLONG;
 	}
@@ -178,9 +183,12 @@ int urp_socket_init(struct urp_endpoint *ep, const char *path)
 	if (ep->is_initiator)
 		return urp_listen_uds(ep, path);
 
-	/* Acceptor: just store the path. UDS connect + pump start happen in
-	 * the RDMA CM ESTABLISHED handler to avoid racing with recv completions. */
-	strscpy(ep->uds_path, path, sizeof(ep->uds_path));
+	/*
+	 * Acceptor: nothing to do here. The path is already stored on the
+	 * endpoint as ep->connect_path; the UDS connect + pump start happen in
+	 * the RDMA CM ESTABLISHED handler (urp_rdma.c) to avoid racing with
+	 * recv completions.
+	 */
 	pr_info("urp: acceptor waiting for RDMA connection (connect_path=%s)\n", path);
 	return 0;
 }
