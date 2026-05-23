@@ -207,9 +207,13 @@ int urp_endpoint_activate(struct urp_endpoint *ep)
 	if (ret)
 		goto unlock;
 
-	ret = urp_rdma_init(ep, peer_ip, peer_port, bind_port, ep->is_initiator);
+	ret = urp_qps_init(ep);
 	if (ret)
 		goto err_proc;
+
+	ret = urp_rdma_init(ep, peer_ip, peer_port, bind_port, ep->is_initiator);
+	if (ret)
+		goto err_qps;
 
 	ret = urp_socket_init(ep, uds_path);
 	if (ret)
@@ -222,6 +226,8 @@ int urp_endpoint_activate(struct urp_endpoint *ep)
 
 err_rdma:
 	urp_rdma_cleanup(ep);
+err_qps:
+	urp_qps_destroy(ep);
 err_proc:
 	urp_endpoint_proc_remove(ep);
 unlock:
@@ -251,6 +257,7 @@ void urp_endpoint_drain(struct urp_endpoint *ep)
 	urp_pump_stop(ep);
 	urp_socket_cleanup(ep);
 	urp_rdma_cleanup(ep);
+	urp_qps_destroy(ep);
 	urp_endpoint_proc_remove(ep);
 
 	ep->state = URP_STATE_STOPPED;

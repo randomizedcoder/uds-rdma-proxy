@@ -27,6 +27,7 @@ static int urp_tx_thread_fn(void *data)
 
 	while (!kthread_should_stop() && conn->active) {
 		struct urp_buffer *buf;
+		struct urp_qp *qps;
 		struct msghdr msg = {};
 		struct kvec iov;
 		int ret;
@@ -74,6 +75,19 @@ static int urp_tx_thread_fn(void *data)
 					      URP_FRAME_HEADER_SIZE + len,
 					      DMA_TO_DEVICE);
 
+		/* Select a QP for this frame (round-robin across all
+		 * connected QPs). With num_qps=1 this always picks qps[0];
+		 * the abstraction exists so Step 2b's multi-cm-id work and
+		 * Step 4's per-QP credit gate can plug in here without
+		 * touching the pump.
+		 */
+		qps = urp_qp_select_round_robin(ep);
+		if (!qps) {
+			urp_buf_free_send(ep, buf);
+			schedule_timeout_interruptible(msecs_to_jiffies(1));
+			continue;
+		}
+
 		/* Post RDMA send */
 		{
 			struct ib_send_wr wr = {};
@@ -88,7 +102,7 @@ static int urp_tx_thread_fn(void *data)
 			wr.opcode = IB_WR_SEND;
 			wr.send_flags = IB_SEND_SIGNALED;
 
-			ret = ib_post_send(ep->qp, &wr, &bad_wr);
+			ret = ib_post_send(qps->qp, &wr, &bad_wr);
 			if (ret) {
 				pr_err("urp: ib_post_send failed: %d\n", ret);
 				urp_buf_free_send(ep, buf);

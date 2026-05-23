@@ -73,6 +73,24 @@ struct urp_stats {
 	atomic64_t	connections;
 };
 
+struct urp_endpoint;	/* forward decl for struct urp_qp */
+
+/*
+ * struct urp_qp - per-QP runtime state
+ *
+ * One entry per QP in ep->qps[]. Holds the verbs QP handle (set after
+ * rdma_create_qp), connectedness, and a back-pointer to the owning
+ * endpoint for CM-event dispatch. Phase 3a Step 4 will add credit
+ * tracking; Phase 3b will add probe state (RTT EWMA, consecutive_misses).
+ */
+struct urp_qp {
+	struct urp_endpoint	*ep;		/* back-pointer */
+	struct rdma_cm_id	*cm_id;		/* per-QP CM id (Step 2b); aliases ep->cm_id in 2a */
+	struct ib_qp		*qp;
+	u32			index;		/* position in ep->qps[] */
+	bool			established;	/* set on RDMA_CM_EVENT_ESTABLISHED */
+};
+
 /*
  * struct urp_connection - per-UDS-connection state (k0: single connection)
  * @uds_sock:   accepted UDS socket
@@ -123,12 +141,16 @@ struct urp_endpoint {
 	struct urp_connection	conn;
 
 	/* RDMA side */
-	struct rdma_cm_id	*cm_id;		/* active connection (or listener before connect) */
+	struct rdma_cm_id	*cm_id;		/* active connection (or listener before connect); Step 2b will move this into ep->qps[i].cm_id */
 	struct rdma_cm_id	*listen_id;	/* acceptor: listener CM ID kept for cleanup */
 	struct ib_pd		*pd;
 	struct ib_cq		*send_cq;
 	struct ib_cq		*recv_cq;
-	struct ib_qp		*qp;
+
+	/* Multi-QP state (Phase 3a Step 2) */
+	struct urp_qp	*qps;		/* array of num_qps entries; allocated in activate */
+	atomic_t		qps_connected;	/* count of QPs in ESTABLISHED state */
+	atomic_t		rr_counter;	/* round-robin selector cursor */
 
 	/* Buffer pool */
 	struct urp_buffer	bufs[URP_NUM_BUFS];
@@ -180,6 +202,12 @@ struct urp_buffer *urp_buf_alloc_recv(struct urp_endpoint *ep);
 void urp_buf_free_recv(struct urp_endpoint *ep, struct urp_buffer *buf);
 int  urp_post_recv(struct urp_endpoint *ep, struct urp_buffer *buf);
 int  urp_post_recv_all(struct urp_endpoint *ep);
+
+/* urp_qp.c -- per-QP state and selection (Phase 3a Step 2) */
+int  urp_qps_init(struct urp_endpoint *ep);
+void urp_qps_destroy(struct urp_endpoint *ep);
+struct urp_qp *urp_qp_select_round_robin(struct urp_endpoint *ep);
+int  urp_qp_index_of(struct urp_endpoint *ep, struct ib_qp *qp);
 
 /* urp_pump.c */
 int  urp_pump_start(struct urp_endpoint *ep);

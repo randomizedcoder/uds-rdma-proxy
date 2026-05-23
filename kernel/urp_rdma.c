@@ -156,7 +156,7 @@ int urp_post_recv(struct urp_endpoint *ep, struct urp_buffer *buf)
 	wr.sg_list = &buf->sge;
 	wr.num_sge = 1;
 
-	return ib_post_recv(ep->qp, &wr, &bad_wr);
+	return ib_post_recv(ep->qps[0].qp, &wr, &bad_wr);
 }
 
 int urp_post_recv_all(struct urp_endpoint *ep)
@@ -212,8 +212,14 @@ static int urp_create_qp(struct urp_endpoint *ep)
 	attr.sq_sig_type = IB_SIGNAL_ALL_WR;
 
 	ret = rdma_create_qp(ep->cm_id, ep->pd, &attr);
-	if (!ret)
-		ep->qp = ep->cm_id->qp;
+	if (!ret) {
+		/* Phase 3a Step 2: single-cm-id scaffold still binds the one
+		 * QP to slot 0. Step 2b will iterate ep->qps[] with one cm_id
+		 * per QP and populate each slot's qp + cm_id independently.
+		 */
+		ep->qps[0].qp = ep->cm_id->qp;
+		ep->qps[0].cm_id = ep->cm_id;
+	}
 	return ret;
 }
 
@@ -357,6 +363,10 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 
 	case RDMA_CM_EVENT_ESTABLISHED:
 		ep->connected = true;
+		if (ep->qps) {
+			ep->qps[0].established = true;
+			atomic_inc(&ep->qps_connected);
+		}
 		complete(&ep->cm_done);
 		pr_info("urp: RDMA connection established\n");
 		break;
@@ -427,6 +437,18 @@ int urp_rdma_init(struct urp_endpoint *ep, const char *peer_addr,
 	struct sockaddr_in addr;
 	int ret;
 
+	/*
+	 * Phase 3a Step 2 scaffold: the per-QP arrays are allocated and
+	 * urp_qp.c selectors / index_of work for any num_qps, but the
+	 * rdma_cm flow below still uses a single cm_id. Step 2b will
+	 * replace the single rdma_create_id call with one per QP.
+	 */
+	if (ep->num_qps != 1) {
+		pr_err("urp: num_qps=%u not yet supported (Step 2b lands multi-cm-id)\n",
+		       ep->num_qps);
+		return -EOPNOTSUPP;
+	}
+
 	ep->cm_id = rdma_create_id(&init_net, urp_cm_handler, ep,
 				   RDMA_PS_TCP, IB_QPT_RC);
 	if (IS_ERR(ep->cm_id)) {
@@ -487,10 +509,12 @@ void urp_rdma_cleanup(struct urp_endpoint *ep)
 		ep->connected = false;
 	}
 
-	if (ep->qp) {
-		ib_drain_qp(ep->qp);
+	if (ep->qps && ep->qps[0].qp) {
+		ib_drain_qp(ep->qps[0].qp);
 		rdma_destroy_qp(ep->cm_id);
-		ep->qp = NULL;
+		ep->qps[0].qp = NULL;
+		ep->qps[0].cm_id = NULL;
+		ep->qps[0].established = false;
 	}
 
 	if (ep->send_cq) {
