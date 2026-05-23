@@ -1,10 +1,12 @@
 # Project Status
 
-_Last updated: 2026-05-04_
+_Last updated: 2026-05-23_
 
 ## Current branch
 
-`phase1-k0-kernel-module` — 1 commit ahead of `origin/phase1-k0-kernel-module`.
+`phase3a-k1-data-path` — cut from `c2eea2e` (the prior `phase1-k0-kernel-module`
+HEAD). The historical branch `phase1-k0-kernel-module` still exists locally and
+carries phases 0, 1, 2, and 3a-Step-1 commits despite its name.
 
 ## Where we are
 
@@ -12,13 +14,13 @@ _Last updated: 2026-05-04_
 |---|---|---|
 | **0** — Skeleton | `docs/KERNEL-MODULE-PLAN.md` §0 | ✅ Committed (`3a32ffc`) |
 | **1 — k0** RDMA echo data path | `docs/KERNEL-MODULE-PLAN.md` §1 | ✅ Committed (`d440794`, `a986fe7`, `a600b17`) |
-| **2** — GENL control plane | `docs/PHASE-2-PLAN.md` (per-session plan file) | ✅ **Implementation complete; uncommitted in working tree** |
-| **3a** — k1 data path | `docs/.../floofy-stirring-donut.md` (active plan) | 🚧 **Step 1 of 10 complete; in working tree** |
+| **2** — GENL control plane | `docs/KERNEL-MODULE-IMPLEMENTATION.md` §Phase 2 | ✅ Committed (`067829e`) |
+| **3a** — k1 data path | `~/.claude/profiles/siden/plans/floofy-stirring-donut.md` + `~/.claude/profiles/runpod/plans/this-repo-has-a-abundant-fern.md` | 🚧 **Steps 1, 2 done (`c2eea2e`, `9dd0a70`); Steps 2b–10 pending** |
 | 3b — probes / PSK / extended observability | (deferred) | not started |
 | 3c — KUnit hardening + soak | (deferred) | not started |
 | 4 / 5 / 6 | per `docs/KERNEL-MODULE-PLAN.md` | not started |
 
-## Phase 2 deliverables (currently uncommitted)
+## Phase 2 deliverables (now committed in `067829e`)
 
 GENL control plane: `urp add / show / remove / drain / set / monitor / stats` CLI driving the kernel module via a generic netlink family. 19/19 integration tests pass in the QEMU VM.
 
@@ -36,7 +38,7 @@ Two notable bugfixes captured in IMPLEMENTATION.md:
 1. CLI segfault → kernel `BUG_ON` at `rhashtable.h:968`. `rhashtable_lookup_insert_fast` BUGs when `obj_hashfn` is set; converted to fixed-key default hashing across the full 16-byte zero-padded `name` field.
 2. CLI `--name` mismatch with test invocation pattern. Removed `#[arg(long)]` from `name` in `add`/`set` so the test script's positional invocation works.
 
-## Phase 3a Step 1 deliverables (currently uncommitted)
+## Phase 3a Step 1 deliverables (now committed in `c2eea2e`)
 
 Rust→kernel FFI prerequisite. Sets up the staticlib build path that Step 5 will consume when wiring up the optional Rust-backed reorder buffer (`CONFIG_URP_REORDER_RUST=y`).
 
@@ -55,23 +57,30 @@ Verified via Nix (no system Rust used):
 - `nix build .#checks.x86_64-linux.protocol-tests` → passes.
 - `nix build .#checks.x86_64-linux.kernel-module-build` → passes (urp.ko unchanged in default config).
 
-## Phase 3a Steps 2–10 — pending
+## Phase 3a Steps 2–10 — progress
 
-Tracked in tasks #51–#59. Plan doc: `~/.claude/profiles/work/plans/floofy-stirring-donut.md`.
+| Step | Subject | Commit | Status |
+|------|---------|--------|--------|
+| 2 | Multi-QP scaffold + round-robin selection | `9dd0a70` | done |
+| 2b | Actual N-QP multi-cm-id allocation | — | pending |
+| 3 | Shared Receive Queue (SRQ) | — | pending |
+| 4 | Per-QP credit flow control | — | pending |
+| 5 | Reorder buffer (C default + Rust opt-in) | — | pending |
+| 6 | Stream multiplexing core | — | pending |
+| 7 | Stream lifecycle (SYN/FIN/RST + half-close) | — | pending |
+| 8 | GENL emitters wire up real state | — | pending |
+| 9 | Integration test expansion + bench harness | — | pending |
+| 10 | Tracker polish + benchmark table | — | pending |
 
-| Step | Task ID | Subject |
-|---|---|---|
-| 2 | #51 | Multi-QP allocation + round-robin selection |
-| 3 | #52 | Shared Receive Queue (SRQ) |
-| 4 | #53 | Per-QP credit flow control |
-| 5 | #54 | Reorder buffer (C default + Rust opt-in) |
-| 6 | #55 | Stream multiplexing core |
-| 7 | #56 | Stream lifecycle (SYN/FIN/RST + half-close) |
-| 8 | #57 | GENL emitters wire up real state |
-| 9 | #58 | Integration test expansion + bench harness |
-| 10 | #59 | Update implementation tracker |
+User-confirmed cadence: one commit per step (so Step 2's commit is not fully
+e2e runnable on its own with `num_qps > 1` — Step 2b lifts the
+`-EOPNOTSUPP` guard). The current `phase3a-k1-data-path` branch's HEAD
+(Step 2) still passes the full 19/19 `test-kmod-k0` suite because every
+existing test uses the default `num_qps = 1`.
 
-Per the plan, Steps 2–4 will ship as one commit (multi-QP scaffold + SRQ + credits — single-stream e2e at that point), Steps 5–7 as the next (reorder + streams + lifecycle — k1 functional milestone), Step 8 wires up observability, Step 9 expands tests + bench, Step 10 updates the tracker.
+The full step-by-step file-level plan remains at
+`~/.claude/profiles/siden/plans/floofy-stirring-donut.md`; the active
+session plan is `~/.claude/profiles/runpod/plans/this-repo-has-a-abundant-fern.md`.
 
 ## Working-tree hygiene notes
 

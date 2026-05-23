@@ -2,7 +2,7 @@
 
 Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.md).
 
-**Last updated**: 2026-05-03 (Phase 2 complete -- 19/19 integration tests pass in QEMU VM)
+**Last updated**: 2026-05-23 (Phase 3a Step 2 committed as `9dd0a70`)
 
 ---
 
@@ -11,9 +11,10 @@ Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.
 | # | Phase | Status | Completion |
 |---|-------|--------|------------|
 | 0 | [Prerequisites](#phase-0-prerequisites) | Complete | 6/7 |
-| 1 | [k0 -- Proof of Concept](#phase-1-k0----proof-of-concept) | In Progress | 7/9 |
-| 2 | [urp CLI + GENL](#phase-2-urp-cli--genl-interface) | Complete | 8/9 |
-| 3 | [k1 -- Functional](#phase-3-k1----functional) | Not Started | 0/14 |
+| 1 | [k0 -- Proof of Concept](#phase-1-k0----proof-of-concept) | Complete | 7/9 (sanitizer items deferred) |
+| 2 | [urp CLI + GENL](#phase-2-urp-cli--genl-interface) | Complete (`067829e`) | 8/9 |
+| 3a | [k1 Data Path](#phase-3a-k1-data-path) | In Progress | 1/9 |
+| 3 | [k1 -- Functional](#phase-3-k1----functional) | In Progress (via 3a) | 0/14 |
 | 4 | [k2 -- Optimized](#phase-4-k2----optimized) | Not Started | 0/8 |
 | 5 | [MicroVM Integration](#phase-5-microvm-integration) | Not Started | 0/8 |
 
@@ -352,9 +353,55 @@ the result; tracked for a follow-up cleanup pass.
 
 ---
 
+## Phase 3a: k1 Data Path
+
+**Status**: In Progress -- on branch `phase3a-k1-data-path` (cut from `c2eea2e`).
+
+Phase 3 from `KERNEL-MODULE-PLAN.md` covers k1 functional in one big bucket
+(14 deliverables). For execution we split it: **3a = data path** (multi-QP,
+SRQ, credits, reorder, stream mux, lifecycle, GENL emitters); **3b** = probes
++ PSK auth + extended observability; **3c** = full KUnit + soak. The detailed
+sub-plan lives in `~/.claude/profiles/siden/plans/floofy-stirring-donut.md`.
+
+### Step Status
+
+| Step | Subject | Commit | Notes |
+|------|---------|--------|-------|
+| 1 | Rust->kernel FFI staticlib prerequisite | `c2eea2e` | staticlib + `kernel/include/urp_ffi.h` + `nix/urp-protocol-ffi.nix`. Consumed by Step 5 (Rust reorder backend). |
+| 2 | Multi-QP scaffold + round-robin selection | `9dd0a70` | `struct urp_qp`, `urp_qps_init/destroy/select_round_robin/index_of` in new `kernel/urp_qp.c`. Endpoint owns `ep->qps[]`. Single-cm-id flow preserved; `num_qps > 1` returns `-EOPNOTSUPP` until Step 2b. 19/19 `test-kmod-k0` still pass. |
+| 2b | Actual N-QP multi-cm-id allocation | pending | Replaces the `-EOPNOTSUPP` guard. N parallel `rdma_cm_id`s; data-path-ready gate fires when all reach `ESTABLISHED`. |
+| 3 | Shared Receive Queue (SRQ) | pending | `kernel/urp_srq.c`. |
+| 4 | Per-QP credit flow control | pending | `kernel/urp_credit.{c,h}`, 1:1 with `uds_rdma_protocol::credit::CreditState`. |
+| 5 | Reorder buffer (C rbtree default + Rust opt-in) | pending | `kernel/urp_reorder.{c,h}` + `urp_reorder_rust.c` + `kernel/Kconfig`. |
+| 6 | Stream multiplexing core | pending | `kernel/urp_stream.c`, per-stream rhashtable. |
+| 7 | Stream lifecycle (SYN/FIN/RST + half-close) | pending | Flag handling + UDS half-close. |
+| 8 | GENL emitters wire up real state | pending | Real per-QP / per-stream nested blocks; aggregate stats. |
+| 9 | Integration tests + bench harness | pending | Tests grow from 19 to ~30; new `nix/urp-bench.nix` for C-vs-Rust reorder comparison. |
+| 10 | Tracker polish + benchmark table | pending | Final docs pass + C-vs-Rust numbers. |
+
+### Variations from Plan
+
+1. **Step 2 split into 2a (scaffold, this commit) and 2b (actual multi-cm-id)**
+   to keep the diff size and review surface manageable per the user's
+   "one commit per step" preference. The plan's `urp_qp_alloc_all`
+   signature is preserved structurally; Step 2b will iterate `ep->qps[]`
+   and create one `rdma_cm_id` per QP.
+2. **`struct urp_qp_state` renamed to `struct urp_qp`** -- the UAPI
+   already defines `enum urp_qp_state` (qualifying/active/draining/
+   removed), which is a different concept and shares the C tag namespace.
+   Naming the per-QP runtime struct `urp_qp` avoids the collision.
+3. **`nix/urp-cli.nix` source filter** -- the c2eea2e commit added the
+   `uds-rdma-protocol-ffi` crate but only updated `nix/checks.nix`'s
+   filter, not `nix/urp-cli.nix`'s. `urp-cli` (and transitively
+   `urp-vm` / `test-kmod-k0`) failed to build until the filter was
+   extended in `e63db81`. Logged here so a future Phase 3a Step 5 doesn't
+   re-trip the same issue when wiring up the FFI staticlib.
+
+---
+
 ## Phase 3: k1 -- Functional
 
-**Status**: Not Started
+**Status**: In Progress (tracked under Phase 3a above for the data-path subset)
 
 ### Deliverables
 
