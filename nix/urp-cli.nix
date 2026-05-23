@@ -14,6 +14,7 @@ let
       (type == "directory" && (
         baseName == "crates" ||
         baseName == "uds-rdma-protocol" ||
+        baseName == "uds-rdma-protocol-ffi" ||
         baseName == "urp-cli" ||
         baseName == "src" ||
         baseName == "commands"
