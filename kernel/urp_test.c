@@ -195,6 +195,287 @@ static void test_buf_list_exhaustion(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, list_empty(&free_list));
 }
 
+/* ---- Credit-state tests (Phase 3a Step 9; mirrors the 8 Rust
+ *      uds_rdma_protocol::credit unit tests) ---- */
+
+static void test_credit_initial_state(struct kunit *test)
+{
+	struct urp_credit cs;
+
+	urp_credit_init(&cs, 128);
+	KUNIT_EXPECT_EQ(test, cs.send_credits, (u16)128);
+	KUNIT_EXPECT_EQ(test, cs.initial_credits, (u16)128);
+	KUNIT_EXPECT_EQ(test, cs.credits_to_grant, (u16)0);
+	KUNIT_EXPECT_EQ(test, cs.threshold, (u16)32);	/* 128 / 4 */
+	KUNIT_EXPECT_TRUE(test, urp_credit_can_send(&cs));
+	KUNIT_EXPECT_FALSE(test, urp_credit_should_grant(&cs));
+}
+
+static void test_credit_consume_all(struct kunit *test)
+{
+	struct urp_credit cs;
+	int i;
+
+	urp_credit_init(&cs, 128);
+	for (i = 0; i < 128; i++) {
+		KUNIT_EXPECT_TRUE(test, urp_credit_can_send(&cs));
+		KUNIT_EXPECT_EQ(test, urp_credit_consume(&cs), 0);
+	}
+	KUNIT_EXPECT_FALSE(test, urp_credit_can_send(&cs));
+	KUNIT_EXPECT_EQ(test, cs.send_credits, (u16)0);
+}
+
+static void test_credit_consume_below_zero(struct kunit *test)
+{
+	struct urp_credit cs;
+
+	urp_credit_init(&cs, 1);
+	KUNIT_EXPECT_EQ(test, urp_credit_consume(&cs), 0);
+	KUNIT_EXPECT_EQ(test, urp_credit_consume(&cs), -EAGAIN);
+}
+
+static void test_credit_grant_restores(struct kunit *test)
+{
+	struct urp_credit cs;
+	int i;
+
+	urp_credit_init(&cs, 10);
+	for (i = 0; i < 10; i++)
+		urp_credit_consume(&cs);
+	KUNIT_EXPECT_FALSE(test, urp_credit_can_send(&cs));
+	urp_credit_grant(&cs, 5);
+	KUNIT_EXPECT_TRUE(test, urp_credit_can_send(&cs));
+	KUNIT_EXPECT_EQ(test, cs.send_credits, (u16)5);
+}
+
+static void test_credit_record_recv_threshold(struct kunit *test)
+{
+	struct urp_credit cs;
+	int i;
+
+	urp_credit_init(&cs, 128);	/* threshold = 32 */
+	for (i = 0; i < 31; i++)
+		urp_credit_record_recv(&cs);
+	KUNIT_EXPECT_FALSE(test, urp_credit_should_grant(&cs));
+	KUNIT_EXPECT_EQ(test, urp_credit_pending_grants(&cs), (u16)31);
+
+	urp_credit_record_recv(&cs);
+	KUNIT_EXPECT_TRUE(test, urp_credit_should_grant(&cs));
+	KUNIT_EXPECT_EQ(test, urp_credit_pending_grants(&cs), (u16)32);
+}
+
+static void test_credit_take_grants_resets(struct kunit *test)
+{
+	struct urp_credit cs;
+	int i;
+
+	urp_credit_init(&cs, 128);
+	for (i = 0; i < 40; i++)
+		urp_credit_record_recv(&cs);
+	KUNIT_EXPECT_EQ(test, urp_credit_take_grants(&cs), (u16)40);
+	KUNIT_EXPECT_EQ(test, urp_credit_pending_grants(&cs), (u16)0);
+	KUNIT_EXPECT_FALSE(test, urp_credit_should_grant(&cs));
+}
+
+static void test_credit_initial_one(struct kunit *test)
+{
+	struct urp_credit cs;
+
+	urp_credit_init(&cs, 1);
+	KUNIT_EXPECT_EQ(test, cs.threshold, (u16)0);	/* 1 / 4 = 0 */
+	KUNIT_EXPECT_TRUE(test, urp_credit_should_grant(&cs));
+	urp_credit_consume(&cs);
+	KUNIT_EXPECT_FALSE(test, urp_credit_can_send(&cs));
+}
+
+static void test_credit_initial_zero(struct kunit *test)
+{
+	struct urp_credit cs;
+
+	urp_credit_init(&cs, 0);
+	KUNIT_EXPECT_FALSE(test, urp_credit_can_send(&cs));
+	KUNIT_EXPECT_TRUE(test, urp_credit_should_grant(&cs));
+	KUNIT_EXPECT_EQ(test, cs.send_credits, (u16)0);
+}
+
+/* ---- Reorder buffer tests (Phase 3a Step 9; mirrors the 8 Rust
+ *      uds_rdma_protocol::reorder unit tests against the C backend) ---- */
+
+static void test_reorder_in_order(struct kunit *test)
+{
+	struct urp_reorder *rb = urp_reorder_alloc(0, 64);
+	u8 payload[8];
+	u64 seq;
+	size_t len;
+	u32 i;
+
+	KUNIT_ASSERT_NOT_NULL(test, rb);
+
+	for (i = 0; i < 3; i++) {
+		u8 b = (u8)i;
+
+		KUNIT_EXPECT_EQ(test, urp_reorder_insert(rb, i, &b, 1), 0);
+		len = sizeof(payload);
+		KUNIT_EXPECT_EQ(test, urp_reorder_drain_next(rb, &seq, payload, &len), 0);
+		KUNIT_EXPECT_EQ(test, seq, (u64)i);
+		KUNIT_EXPECT_EQ(test, len, (size_t)1);
+		KUNIT_EXPECT_EQ(test, payload[0], (u8)i);
+	}
+	KUNIT_EXPECT_EQ(test, urp_reorder_next_expected(rb), (u64)3);
+
+	urp_reorder_free(rb);
+}
+
+static void test_reorder_out_of_order(struct kunit *test)
+{
+	struct urp_reorder *rb = urp_reorder_alloc(0, 64);
+	u8 payload[8];
+	u8 b;
+	u64 seq;
+	size_t len = sizeof(payload);
+
+	KUNIT_ASSERT_NOT_NULL(test, rb);
+
+	/* Insert seq 2 first -- buffered, no drain */
+	b = 2;
+	KUNIT_EXPECT_EQ(test, urp_reorder_insert(rb, 2, &b, 1), 0);
+	KUNIT_EXPECT_EQ(test, urp_reorder_drain_next(rb, &seq, payload, &len), -ENOENT);
+	KUNIT_EXPECT_EQ(test, urp_reorder_gap_count(rb), (size_t)1);
+
+	/* Insert seq 0 -- drains immediately */
+	b = 0;
+	KUNIT_EXPECT_EQ(test, urp_reorder_insert(rb, 0, &b, 1), 0);
+	len = sizeof(payload);
+	KUNIT_EXPECT_EQ(test, urp_reorder_drain_next(rb, &seq, payload, &len), 0);
+	KUNIT_EXPECT_EQ(test, seq, (u64)0);
+
+	/* Insert seq 1 -- drains 1 then 2 */
+	b = 1;
+	KUNIT_EXPECT_EQ(test, urp_reorder_insert(rb, 1, &b, 1), 0);
+	len = sizeof(payload);
+	KUNIT_EXPECT_EQ(test, urp_reorder_drain_next(rb, &seq, payload, &len), 0);
+	KUNIT_EXPECT_EQ(test, seq, (u64)1);
+	len = sizeof(payload);
+	KUNIT_EXPECT_EQ(test, urp_reorder_drain_next(rb, &seq, payload, &len), 0);
+	KUNIT_EXPECT_EQ(test, seq, (u64)2);
+	KUNIT_EXPECT_EQ(test, urp_reorder_next_expected(rb), (u64)3);
+
+	urp_reorder_free(rb);
+}
+
+static void test_reorder_duplicate(struct kunit *test)
+{
+	struct urp_reorder *rb = urp_reorder_alloc(0, 64);
+	u8 b = 2;
+
+	KUNIT_ASSERT_NOT_NULL(test, rb);
+
+	KUNIT_EXPECT_EQ(test, urp_reorder_insert(rb, 2, &b, 1), 0);
+	KUNIT_EXPECT_EQ(test, urp_reorder_insert(rb, 2, &b, 1), -EEXIST);
+
+	urp_reorder_free(rb);
+}
+
+static void test_reorder_already_delivered(struct kunit *test)
+{
+	struct urp_reorder *rb = urp_reorder_alloc(0, 64);
+	u8 b = 0;
+	u8 payload[4];
+	u64 seq;
+	size_t len = sizeof(payload);
+
+	KUNIT_ASSERT_NOT_NULL(test, rb);
+	urp_reorder_insert(rb, 0, &b, 1);
+	urp_reorder_drain_next(rb, &seq, payload, &len);
+	/* Inserting seq 0 again should be rejected as duplicate */
+	KUNIT_EXPECT_EQ(test, urp_reorder_insert(rb, 0, &b, 1), -EEXIST);
+
+	urp_reorder_free(rb);
+}
+
+static void test_reorder_buffer_full(struct kunit *test)
+{
+	struct urp_reorder *rb = urp_reorder_alloc(0, 2);
+	u8 b;
+
+	KUNIT_ASSERT_NOT_NULL(test, rb);
+	b = 2; urp_reorder_insert(rb, 2, &b, 1);
+	b = 3; urp_reorder_insert(rb, 3, &b, 1);
+	b = 4;
+	KUNIT_EXPECT_EQ(test, urp_reorder_insert(rb, 4, &b, 1), -ENOBUFS);
+	/* But the in-order seq still works (drains immediately) */
+	b = 0;
+	KUNIT_EXPECT_EQ(test, urp_reorder_insert(rb, 0, &b, 1), 0);
+
+	urp_reorder_free(rb);
+}
+
+/* ---- QP round-robin selection tests (Phase 3a Step 9) ---- */
+
+static void test_qp_select_round_robin_determinism(struct kunit *test)
+{
+	struct urp_endpoint ep = {};
+	struct urp_qp qps[4] = {};
+	struct urp_qp *picked;
+	u32 i;
+
+	ep.num_qps = 4;
+	ep.qps = qps;
+	for (i = 0; i < 4; i++) {
+		qps[i].ep = &ep;
+		qps[i].index = i;
+		qps[i].established = true;
+		qps[i].qp = (struct ib_qp *)(unsigned long)(i + 1);
+	}
+	atomic_set(&ep.rr_counter, 0);
+
+	for (i = 0; i < 8; i++) {
+		picked = urp_qp_select_round_robin(&ep);
+		KUNIT_ASSERT_NOT_NULL(test, picked);
+		KUNIT_EXPECT_EQ(test, picked->index, (i + 1) % 4);
+	}
+}
+
+static void test_qp_select_skips_unestablished(struct kunit *test)
+{
+	struct urp_endpoint ep = {};
+	struct urp_qp qps[3] = {};
+	struct urp_qp *picked;
+	u32 i;
+
+	ep.num_qps = 3;
+	ep.qps = qps;
+	for (i = 0; i < 3; i++) {
+		qps[i].ep = &ep;
+		qps[i].index = i;
+		qps[i].qp = (struct ib_qp *)(unsigned long)(i + 1);
+	}
+	/* Only QP 1 is established */
+	qps[1].established = true;
+	atomic_set(&ep.rr_counter, 0);
+
+	for (i = 0; i < 5; i++) {
+		picked = urp_qp_select_round_robin(&ep);
+		KUNIT_ASSERT_NOT_NULL(test, picked);
+		KUNIT_EXPECT_EQ(test, picked->index, (u32)1);
+	}
+}
+
+static void test_qp_select_returns_null_when_none_ready(struct kunit *test)
+{
+	struct urp_endpoint ep = {};
+	struct urp_qp qps[2] = {};
+	struct urp_qp *picked;
+
+	ep.num_qps = 2;
+	ep.qps = qps;
+	qps[0].ep = qps[1].ep = &ep;
+	atomic_set(&ep.rr_counter, 0);
+
+	picked = urp_qp_select_round_robin(&ep);
+	KUNIT_EXPECT_NULL(test, picked);
+}
+
 /* ---- Test suite registration ---- */
 
 static struct kunit_case urp_test_cases[] = {
@@ -210,6 +491,23 @@ static struct kunit_case urp_test_cases[] = {
 	KUNIT_CASE(test_buf_list_init),
 	KUNIT_CASE(test_buf_list_alloc_free),
 	KUNIT_CASE(test_buf_list_exhaustion),
+	/* Phase 3a Step 9 additions */
+	KUNIT_CASE(test_credit_initial_state),
+	KUNIT_CASE(test_credit_consume_all),
+	KUNIT_CASE(test_credit_consume_below_zero),
+	KUNIT_CASE(test_credit_grant_restores),
+	KUNIT_CASE(test_credit_record_recv_threshold),
+	KUNIT_CASE(test_credit_take_grants_resets),
+	KUNIT_CASE(test_credit_initial_one),
+	KUNIT_CASE(test_credit_initial_zero),
+	KUNIT_CASE(test_reorder_in_order),
+	KUNIT_CASE(test_reorder_out_of_order),
+	KUNIT_CASE(test_reorder_duplicate),
+	KUNIT_CASE(test_reorder_already_delivered),
+	KUNIT_CASE(test_reorder_buffer_full),
+	KUNIT_CASE(test_qp_select_round_robin_determinism),
+	KUNIT_CASE(test_qp_select_skips_unestablished),
+	KUNIT_CASE(test_qp_select_returns_null_when_none_ready),
 	{}
 };
 
