@@ -2,7 +2,7 @@
 
 Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.md).
 
-**Last updated**: 2026-05-23 (Phase 3a Steps 2, 2b, 3 committed; HEAD `0fba325`)
+**Last updated**: 2026-05-23 (Phase 3a Steps 2, 2b, 3, 4 committed; HEAD `728db70`)
 
 ---
 
@@ -13,7 +13,7 @@ Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.
 | 0 | [Prerequisites](#phase-0-prerequisites) | Complete | 6/7 |
 | 1 | [k0 -- Proof of Concept](#phase-1-k0----proof-of-concept) | Complete | 7/9 (sanitizer items deferred) |
 | 2 | [urp CLI + GENL](#phase-2-urp-cli--genl-interface) | Complete (`067829e`) | 8/9 |
-| 3a | [k1 Data Path](#phase-3a-k1-data-path) | In Progress | 3/9 |
+| 3a | [k1 Data Path](#phase-3a-k1-data-path) | In Progress | 4/9 |
 | 3 | [k1 -- Functional](#phase-3-k1----functional) | In Progress (via 3a) | 0/14 |
 | 4 | [k2 -- Optimized](#phase-4-k2----optimized) | Not Started | 0/8 |
 | 5 | [MicroVM Integration](#phase-5-microvm-integration) | Not Started | 0/8 |
@@ -371,7 +371,8 @@ sub-plan lives in `~/.claude/profiles/siden/plans/floofy-stirring-donut.md`.
 | 2 | Multi-QP scaffold + round-robin selection | `9dd0a70` | `struct urp_qp`, `urp_qps_init/destroy/select_round_robin/index_of` in new `kernel/urp_qp.c`. Endpoint owns `ep->qps[]`. Single-cm-id flow preserved; `num_qps > 1` returns `-EOPNOTSUPP` until Step 2b. 19/19 `test-kmod-k0` still pass. |
 | 2b | Actual N-QP multi-cm-id allocation | `f9f49b4` | Per-QP `rdma_cm_id`s via `struct urp_cm_ctx`. Initiator loops `num_qps` resolves; acceptor's listener fans out to N CONNECT_REQUESTs via slot allocator. Shared PD + CQs sized by `URP_CQ_ENTRIES * num_qps`. Test 12-15 (connect/disconnect/reconnect) exposed a latent flush-completion buffer leak that was masked in k0 by reinit-on-every-CONNECT_REQUEST; fixed by always returning buffers to the pool from send/recv_done. |
 | 3 | Shared Receive Queue (SRQ) | `0fba325` | `kernel/urp_srq.c`. Per-endpoint SRQ shared by all QPs; per-QP RQ collapsed (`max_recv_wr = 0`, `qp_init_attr.srq = ep->srq`). Initial fill + repost-on-completion both go through `ib_post_srq_recv`. |
-| 4 | Per-QP credit flow control | pending | `kernel/urp_credit.{c,h}`, 1:1 with `uds_rdma_protocol::credit::CreditState`. |
+| 4 | Per-QP credit flow control (scaffold) | `728db70` | `kernel/urp_credit.{c,h}` 1:1 C port of `uds_rdma_protocol::credit::CreditState`. `struct urp_qp.credit` initialized in `urp_qps_init` with `URP_NUM_BUFS/2` initial credits. Not yet wired into TX/RX -- Step 4b. |
+| 4b | Wire credit gate into TX/RX paths | pending | TX `consume`-then-block via per-QP wait queue; RX `record_recv` + `should_grant` -> emit CONTROL/CREDIT frame; RX of CREDIT frame -> `grant`. Requires CREDIT-aware peer (extension to `urp-test-client` or a new bench harness). |
 | 5 | Reorder buffer (C rbtree default + Rust opt-in) | pending | `kernel/urp_reorder.{c,h}` + `urp_reorder_rust.c` + `kernel/Kconfig`. |
 | 6 | Stream multiplexing core | pending | `kernel/urp_stream.c`, per-stream rhashtable. |
 | 7 | Stream lifecycle (SYN/FIN/RST + half-close) | pending | Flag handling + UDS half-close. |
