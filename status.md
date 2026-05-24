@@ -15,7 +15,7 @@ carries phases 0, 1, 2, and 3a-Step-1 commits despite its name.
 | **0** — Skeleton | `docs/KERNEL-MODULE-PLAN.md` §0 | ✅ Committed (`3a32ffc`) |
 | **1 — k0** RDMA echo data path | `docs/KERNEL-MODULE-PLAN.md` §1 | ✅ Committed (`d440794`, `a986fe7`, `a600b17`) |
 | **2** — GENL control plane | `docs/KERNEL-MODULE-IMPLEMENTATION.md` §Phase 2 | ✅ Committed (`067829e`) |
-| **3a** — k1 data path | `~/.claude/profiles/siden/plans/floofy-stirring-donut.md` + `~/.claude/profiles/runpod/plans/this-repo-has-a-abundant-fern.md` | 🚧 **Steps 1, 2, 2b, 3, 4 done (`c2eea2e`, `9dd0a70`, `f9f49b4`, `0fba325`, `728db70`); Steps 4b/5–10 pending** |
+| **3a** — k1 data path | `~/.claude/profiles/siden/plans/floofy-stirring-donut.md` + `~/.claude/profiles/runpod/plans/this-repo-has-a-abundant-fern.md` | 🚧 **Steps 1, 2, 2b, 3, 4, 5 done (`c2eea2e`, `9dd0a70`, `f9f49b4`, `0fba325`, `728db70`, `3737132`); Steps 4b/5b/6–10 pending** |
 | 3b — probes / PSK / extended observability | (deferred) | not started |
 | 3c — KUnit hardening + soak | (deferred) | not started |
 | 4 / 5 / 6 | per `docs/KERNEL-MODULE-PLAN.md` | not started |
@@ -66,7 +66,8 @@ Verified via Nix (no system Rust used):
 | 3 | Shared Receive Queue (SRQ) | `0fba325` | done |
 | 4 | Per-QP credit flow control (scaffold) | `728db70` | done |
 | 4b | Wire credit gate into TX/RX paths | — | pending (needs CREDIT-aware peer) |
-| 5 | Reorder buffer (C default + Rust opt-in) | — | pending |
+| 5 | Reorder buffer (C rbtree backend) | `3737132` | done |
+| 5b | Rust reorder backend wiring | — | pending |
 | 6 | Stream multiplexing core | — | pending |
 | 7 | Stream lifecycle (SYN/FIN/RST + half-close) | — | pending |
 | 8 | GENL emitters wire up real state | — | pending |
