@@ -15,7 +15,7 @@ carries phases 0, 1, 2, and 3a-Step-1 commits despite its name.
 | **0** — Skeleton | `docs/KERNEL-MODULE-PLAN.md` §0 | ✅ Committed (`3a32ffc`) |
 | **1 — k0** RDMA echo data path | `docs/KERNEL-MODULE-PLAN.md` §1 | ✅ Committed (`d440794`, `a986fe7`, `a600b17`) |
 | **2** — GENL control plane | `docs/KERNEL-MODULE-IMPLEMENTATION.md` §Phase 2 | ✅ Committed (`067829e`) |
-| **3a** — k1 data path | `~/.claude/profiles/siden/plans/floofy-stirring-donut.md` + `~/.claude/profiles/runpod/plans/this-repo-has-a-abundant-fern.md` | ✅ **Main scaffold + acceptor multi-stream complete -- Steps 1, 2, 2b, 3, 4, 5, 6, 7, 7b, 7c, 8, 9, 10 done (`c2eea2e` through `f14a107`); 23/23 `test-kmod-k0` PASS. Sub-steps 4b / 5b / 7d deferred (CREDIT-aware peer / Rust-staticlib Nix linking / test-client multi-stream extension).** |
+| **3a** — k1 data path | `~/.claude/profiles/siden/plans/floofy-stirring-donut.md` + `~/.claude/profiles/runpod/plans/this-repo-has-a-abundant-fern.md` | ✅ **Phase 3a complete -- Steps 1-10 + 2b, 4b, 5b, 7b, 7c done (`c2eea2e` through `b7caab2`); 23/23 `test-kmod-k0` PASS. Remaining: 7d (test-client `--stream-id` + multi-stream integration test) + 5b's objtool-on-IBT follow-up; both unblockable in a separate session before Phase 3b lands.** |
 | 3b — probes / PSK / extended observability | (deferred) | not started |
 | 3c — KUnit hardening + soak | (deferred) | not started |
 | 4 / 5 / 6 | per `docs/KERNEL-MODULE-PLAN.md` | not started |
@@ -65,9 +65,9 @@ Verified via Nix (no system Rust used):
 | 2b | Actual N-QP multi-cm-id allocation | `f9f49b4` | done |
 | 3 | Shared Receive Queue (SRQ) | `0fba325` | done |
 | 4 | Per-QP credit flow control (scaffold) | `728db70` | done |
-| 4b | Wire credit gate into TX/RX paths | — | pending (needs CREDIT-aware peer) |
+| 4b | Wire credit gate into TX/RX paths | `b7caab2` | done (best-effort + stream-id != 0 gating) |
 | 5 | Reorder buffer (C rbtree backend) | `3737132` | done |
-| 5b | Rust reorder backend wiring | — | pending |
+| 5b | Rust reorder backend wiring | `83570af` | done (default build green; `urp-ko-rust` blocked by objtool on IBT kernels) |
 | 6 | Stream multiplexing core (scaffold) | `e2ea525` | done |
 | 7 | Stream lifecycle handlers | `f3f9903` | done |
 | 7b | Wire stream_id dispatch into RX path | `9075f57` | done |

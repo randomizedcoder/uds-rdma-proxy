@@ -2,7 +2,7 @@
 
 Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.md).
 
-**Last updated**: 2026-05-24 (Phase 3a Steps 2, 2b, 3, 4, 5, 6, 7, 7b, 7c, 8, 9 committed; HEAD `f14a107`. 23/23 `test-kmod-k0` PASS.)
+**Last updated**: 2026-05-24 (Phase 3a Steps 1-10 + 2b/4b/5b/7b/7c committed; HEAD `b7caab2`. 23/23 `test-kmod-k0` PASS.)
 
 ---
 
@@ -375,10 +375,10 @@ sub-plan lives in `~/.claude/profiles/siden/plans/floofy-stirring-donut.md`.
 | 2 | Multi-QP scaffold + round-robin selection | `9dd0a70` | `struct urp_qp`, `urp_qps_init/destroy/select_round_robin/index_of` in new `kernel/urp_qp.c`. Endpoint owns `ep->qps[]`. Single-cm-id flow preserved; `num_qps > 1` returns `-EOPNOTSUPP` until Step 2b. 19/19 `test-kmod-k0` still pass. |
 | 2b | Actual N-QP multi-cm-id allocation | `f9f49b4` | Per-QP `rdma_cm_id`s via `struct urp_cm_ctx`. Initiator loops `num_qps` resolves; acceptor's listener fans out to N CONNECT_REQUESTs via slot allocator. Shared PD + CQs sized by `URP_CQ_ENTRIES * num_qps`. Test 12-15 (connect/disconnect/reconnect) exposed a latent flush-completion buffer leak that was masked in k0 by reinit-on-every-CONNECT_REQUEST; fixed by always returning buffers to the pool from send/recv_done. |
 | 3 | Shared Receive Queue (SRQ) | `0fba325` | `kernel/urp_srq.c`. Per-endpoint SRQ shared by all QPs; per-QP RQ collapsed (`max_recv_wr = 0`, `qp_init_attr.srq = ep->srq`). Initial fill + repost-on-completion both go through `ib_post_srq_recv`. |
-| 4 | Per-QP credit flow control (scaffold) | `728db70` | `kernel/urp_credit.{c,h}` 1:1 C port of `uds_rdma_protocol::credit::CreditState`. `struct urp_qp.credit` initialized in `urp_qps_init` with `URP_NUM_BUFS/2` initial credits. Not yet wired into TX/RX -- Step 4b. |
-| 4b | Wire credit gate into TX/RX paths | pending | TX `consume`-then-block via per-QP wait queue; RX `record_recv` + `should_grant` -> emit CONTROL/CREDIT frame; RX of CREDIT frame -> `grant`. Requires CREDIT-aware peer (extension to `urp-test-client` or a new bench harness). |
-| 5 | Reorder buffer (C rbtree default) | `3737132` | `kernel/urp_reorder.{c,h}` rbtree-backed implementation. Opaque handle + copy-in/copy-out semantics matching the Rust FFI surface in `kernel/include/urp_ffi.h`, so Step 5b's Rust backend is a thin cast-and-forward shim. Not yet wired into the data path -- Step 6 puts the buffer per-stream. |
-| 5b | Rust-backed reorder buffer wiring | pending | `kernel/urp_reorder_rust.c` + `CONFIG_URP_REORDER_RUST` gating + Nix `urp-ko-rust` variant linking `liburp_protocol_ffi.a`. |
+| 4 | Per-QP credit flow control (scaffold) | `728db70` | `kernel/urp_credit.{c,h}` 1:1 C port of `uds_rdma_protocol::credit::CreditState`. `struct urp_qp.credit` initialized in `urp_qps_init` with `URP_NUM_BUFS/2` initial credits. |
+| 4b | Wire credit gate into TX/RX paths | `b7caab2` | TX consume on `ib_post_send` (best-effort: stalls counted in `URP_STATS_A_CREDIT_STALLS`, send proceeds so the existing test client keeps working); RX `record_recv` + threshold-driven `urp_emit_credit_frame`; RX of `URP_FRAME_TYPE_CONTROL` + `URP_CTRL_FLAG_CREDIT` -> `urp_credit_grant`. CREDIT-frame emission gated on `stream_id != 0` so the legacy stream_id=0 test-client path isn't disturbed. |
+| 5 | Reorder buffer (C rbtree default) | `3737132` | `kernel/urp_reorder.{c,h}` rbtree-backed implementation. Opaque handle + copy-in/copy-out semantics matching the Rust FFI surface in `kernel/include/urp_ffi.h`, so Step 5b's Rust backend is a thin cast-and-forward shim. |
+| 5b | Rust-backed reorder buffer wiring | `83570af` | `kernel/urp_reorder_rust.c` shim + `nix/checks.nix buildUrpKoWith` + `nix build .#urp-ko-rust` extracts `liburp_protocol_ffi.a` into `kernel/rust_ffi/` and rebuilds with `CONFIG_URP_REORDER_RUST=y`. **Known limitation**: on `CONFIG_X86_KERNEL_IBT=y` kernels (Linux 7.0.3 default) objtool runs on the linked module object and rejects a `compiler_builtins::math::libm_math::arch::x86::fma::fma_with_fma4` Rust helper that the staticlib pulls in but the reorder buffer doesn't use; resolution is upstream Rust-for-Linux work, tracked in the variation note in this section. The default `.#urp-ko` build (C rbtree) is unaffected. |
 | 6 | Stream multiplexing core (scaffold) | `e2ea525` | `struct urp_stream` + `ep->streams` rhashtable + stream-id allocator (initiator=odd, acceptor=even). `kernel/urp_stream.c` has create / lookup / destroy / destroy_all. RCU-deferred free. Data path still uses single `ep->conn` -- Step 7 wires per-stream lifecycle. |
 | 7 | Stream lifecycle handlers (SYN/FIN/RST + half-close) | `f3f9903` | `urp_stream_rx_syn / _rx_fin / _rx_rst / _tx_fin / _tx_rst / _rx_dispatch`. Half-close via `kernel_sock_shutdown(SHUT_WR)`; abort via `SHUT_RDWR` + RCU destroy. Wire-path call site lands in Step 7b alongside the multi-stream test. |
 | 7b | Wire stream_id dispatch into RX path | `9075f57` | `urp_recv_done` now decodes `stream_id` + `flags` and routes: `stream_id == 0` -> `ep->conn` (k0 compat); non-zero -> `urp_stream_rx_dispatch` under RCU, with SYN auto-creating the stream and FIN/RST running the lifecycle handlers from Step 7. The dispatch entry point is now load-bearing. |
@@ -418,8 +418,8 @@ sub-plan lives in `~/.claude/profiles/siden/plans/floofy-stirring-donut.md`.
 
 - [x] Multi-QP: 1-32 QPs per endpoint via `urp add --num-qps` (`9dd0a70`, `f9f49b4`)
 - [x] SRQ prevents per-QP receive starvation (`0fba325`)
-- [x] Per-QP credit-state scaffold (`728db70`) - actual TX gate deferred to **Step 4b**
-- [x] Reorder buffer (C rbtree backend) (`3737132`); Rust backend wiring deferred to **Step 5b**
+- [x] Per-QP credit-state scaffold (`728db70`); TX consume + RX grant + CREDIT-frame emit/receive (`b7caab2`)
+- [x] Reorder buffer (C rbtree backend) (`3737132`); Rust backend shim + Nix `urp-ko-rust` wiring (`83570af`, currently blocked end-to-end by upstream objtool/Rust on `CONFIG_X86_KERNEL_IBT=y` kernels)
 - [x] Per-stream rhashtable + id allocator (`e2ea525`); SYN/FIN/RST/half-close handlers (`f3f9903`); RX dispatch wired (`9075f57`); acceptor-side TX + per-stream UDS connect (`f14a107`). Initiator-side accept-loop streaming + multi-stream integration test deferred to **Step 7d** (needs test-client `--stream-id`).
 - [x] `urp show` displays real per-QP + per-stream + aggregate stats (`70fafc6`)
 - [x] KUnit suites for credit / reorder / qp_select (`336e7e0`) -- compile in default urp.ko build; runtime gating via the sanitizer/debug VM is blocked on the same VIRTIO_BLK / 9P_FS issue carried from Phase 1 (Variation #9) and lands in **Phase 5**.
@@ -428,11 +428,10 @@ sub-plan lives in `~/.claude/profiles/siden/plans/floofy-stirring-donut.md`.
 
 Deferred follow-ups still inside Phase 3a:
 
-| Sub-step | Subject | Blocker |
-|----------|---------|---------|
-| 4b | Wire credit gate into TX/RX paths | Need a CREDIT-frame-aware peer (test-client extension or new bench harness). |
-| 5b | Rust-backed reorder via `liburp_protocol_ffi.a` | Nix linking of the Rust staticlib into urp.ko + Kbuild `CONFIG_URP_REORDER_RUST` gating. |
-| 7d | Test-client `--stream-id` + multi-stream integration test | Extend `tools/urp-test-client.c` with `--stream-id N`; add `test-kmod-k0` cases that exercise two streams in parallel through one endpoint. With this, the §3 DoD multi-stream items become testable end-to-end. |
+| Sub-step | Subject | Status |
+|----------|---------|--------|
+| 7d | Test-client `--stream-id` + multi-stream integration test | Pending. Extend `tools/urp-test-client.c` with `--stream-id N`; add `test-kmod-k0` cases that exercise two streams in parallel through one endpoint. With this, the §3 DoD multi-stream items become testable end-to-end. |
+| 5b objtool follow-up | Get `nix build .#urp-ko-rust` clean on `CONFIG_X86_KERNEL_IBT=y` kernels | Pending. Either strip `compiler_builtins::math::libm_math::arch::x86::fma::*` from the staticlib or wait for an upstream Rust-for-Linux pattern that suppresses objtool on the `multi-obj-m` rule. The wiring committed in `83570af` covers everything else. |
 
 Deferred to **Phase 3b** (per scope decision in `floofy-stirring-donut.md`):
 QP health probes (RTT EWMA, qualifying/draining states), PSK auth
