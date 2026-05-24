@@ -371,8 +371,17 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 	if (ret < 0) {
 		pr_err("urp: kernel_sendmsg failed: %d\n", ret);
 	} else {
+		int qp_idx;
+
 		atomic64_add(payload_len, &ep->stats.rx_bytes);
 		atomic64_inc(&ep->stats.rx_frames);
+		/* Step 8: per-QP RX counters. wc->qp identifies the source
+		 * QP; linear scan is fine for the supported num_qps range. */
+		qp_idx = urp_qp_index_of(ep, wc->qp);
+		if (qp_idx >= 0) {
+			atomic64_add(payload_len, &ep->qps[qp_idx].rx_bytes);
+			atomic64_inc(&ep->qps[qp_idx].rx_frames);
+		}
 	}
 
 repost:

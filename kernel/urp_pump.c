@@ -113,6 +113,9 @@ static int urp_tx_thread_fn(void *data)
 
 		atomic64_add(len, &ep->stats.tx_bytes);
 		atomic64_inc(&ep->stats.tx_frames);
+		/* Step 8: per-QP counters surfaced via GENL */
+		atomic64_add(len, &qps->tx_bytes);
+		atomic64_inc(&qps->tx_frames);
 	}
 
 	pr_info("urp: TX pump stopped\n");

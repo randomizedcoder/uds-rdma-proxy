@@ -114,40 +114,107 @@ static int urp_fill_endpoint(struct sk_buff *skb, struct urp_endpoint *ep,
 		goto cancel;
 
 	if (verbose) {
-		struct nlattr *qps, *qp, *streams, *stats;
+		struct nlattr *qps_nest, *streams_nest, *stats_nest;
+		u32 active_streams = 0;
+		u32 i;
 
-		/* QPS: phase 2 reports the single k0 QP. */
-		qps = nla_nest_start(skb, URP_ENDPOINT_A_QPS);
-		if (!qps)
+		/* Per-QP nested blocks (Phase 3a Step 8). One entry per QP
+		 * in ep->qps[] -- the array is allocated by urp_qps_init at
+		 * activate time. */
+		qps_nest = nla_nest_start(skb, URP_ENDPOINT_A_QPS);
+		if (!qps_nest)
 			goto cancel;
-		qp = nla_nest_start(skb, 1);
-		if (!qp)
-			goto cancel;
-		if (nla_put_u32(skb, URP_QP_A_INDEX, 0) ||
-		    nla_put_u8(skb, URP_QP_A_STATE,
-			       ep->connected ? URP_QP_STATE_ACTIVE
-					     : URP_QP_STATE_QUALIFYING) ||
-		    nla_put_u64_64bit(skb, URP_QP_A_RTT_NS, 0, 0) ||
-		    nla_put_u64_64bit(skb, URP_QP_A_TX_BYTES,
-				      atomic64_read(&ep->stats.tx_bytes), 0) ||
-		    nla_put_u64_64bit(skb, URP_QP_A_RX_BYTES,
-				      atomic64_read(&ep->stats.rx_bytes), 0) ||
-		    nla_put_u64_64bit(skb, URP_QP_A_TX_FRAMES,
-				      atomic64_read(&ep->stats.tx_frames), 0) ||
-		    nla_put_u64_64bit(skb, URP_QP_A_RX_FRAMES,
-				      atomic64_read(&ep->stats.rx_frames), 0))
-			goto cancel;
-		nla_nest_end(skb, qp);
-		nla_nest_end(skb, qps);
 
-		/* STREAMS: k0 has at most one stream, only present when active. */
-		streams = nla_nest_start(skb, URP_ENDPOINT_A_STREAMS);
-		if (!streams)
-			goto cancel;
-		if (ep->conn.active) {
-			struct nlattr *s = nla_nest_start(skb, 1);
+		if (ep->qps) {
+			for (i = 0; i < ep->num_qps; i++) {
+				struct urp_qp *q = &ep->qps[i];
+				struct nlattr *qp_entry;
+				u8 qp_state = q->established
+					? URP_QP_STATE_ACTIVE
+					: URP_QP_STATE_QUALIFYING;
 
-			if (!s)
+				qp_entry = nla_nest_start(skb, i + 1);
+				if (!qp_entry)
+					goto cancel;
+
+				if (nla_put_u32(skb, URP_QP_A_INDEX, q->index) ||
+				    nla_put_u8(skb, URP_QP_A_STATE, qp_state) ||
+				    /* RTT lands in Phase 3b with probes */
+				    nla_put_u64_64bit(skb, URP_QP_A_RTT_NS, 0, 0) ||
+				    nla_put_u64_64bit(skb, URP_QP_A_TX_BYTES,
+						      atomic64_read(&q->tx_bytes), 0) ||
+				    nla_put_u64_64bit(skb, URP_QP_A_RX_BYTES,
+						      atomic64_read(&q->rx_bytes), 0) ||
+				    nla_put_u64_64bit(skb, URP_QP_A_TX_FRAMES,
+						      atomic64_read(&q->tx_frames), 0) ||
+				    nla_put_u64_64bit(skb, URP_QP_A_RX_FRAMES,
+						      atomic64_read(&q->rx_frames), 0))
+					goto cancel;
+
+				nla_nest_end(skb, qp_entry);
+			}
+		}
+		nla_nest_end(skb, qps_nest);
+
+		/* Per-stream nested blocks (Phase 3a Step 8). Walks the
+		 * rhashtable under RCU; entries are added by Step 7b's
+		 * urp_stream_create call sites. With no active streams the
+		 * nest is emitted empty, which is intentional. */
+		streams_nest = nla_nest_start(skb, URP_ENDPOINT_A_STREAMS);
+		if (!streams_nest)
+			goto cancel;
+
+		if (ep->streams_inited) {
+			struct rhashtable_iter iter;
+			struct urp_stream *s;
+			u32 idx = 1;
+
+			rhashtable_walk_enter(&ep->streams, &iter);
+			rhashtable_walk_start(&iter);
+
+			while ((s = rhashtable_walk_next(&iter))) {
+				struct nlattr *s_entry;
+
+				if (IS_ERR(s))
+					continue;
+
+				s_entry = nla_nest_start(skb, idx++);
+				if (!s_entry) {
+					rhashtable_walk_stop(&iter);
+					rhashtable_walk_exit(&iter);
+					goto cancel;
+				}
+
+				if (nla_put_u32(skb, URP_STREAM_A_ID, s->id) ||
+				    nla_put_u8(skb, URP_STREAM_A_STATE, (u8)s->state) ||
+				    nla_put_u64_64bit(skb, URP_STREAM_A_TX_BYTES, 0, 0) ||
+				    nla_put_u64_64bit(skb, URP_STREAM_A_RX_BYTES, 0, 0) ||
+				    nla_put_u32(skb, URP_STREAM_A_REORDER_DEPTH,
+						(u32)urp_reorder_gap_count(s->reorder)) ||
+				    nla_put_u16(skb, URP_STREAM_A_CREDITS_LOCAL,
+						s->credit.send_credits) ||
+				    nla_put_u16(skb, URP_STREAM_A_CREDITS_REMOTE,
+						s->credit.credits_to_grant)) {
+					rhashtable_walk_stop(&iter);
+					rhashtable_walk_exit(&iter);
+					goto cancel;
+				}
+
+				nla_nest_end(skb, s_entry);
+				active_streams++;
+			}
+
+			rhashtable_walk_stop(&iter);
+			rhashtable_walk_exit(&iter);
+		}
+
+		/* k0 single-connection compat: surface the legacy ep->conn
+		 * as a synthetic stream while Step 7b hasn't yet migrated
+		 * UDS accepts to urp_stream_create. */
+		if (active_streams == 0 && ep->conn.active) {
+			struct nlattr *s_entry = nla_nest_start(skb, 1);
+
+			if (!s_entry)
 				goto cancel;
 			if (nla_put_u32(skb, URP_STREAM_A_ID, 0) ||
 			    nla_put_u8(skb, URP_STREAM_A_STATE,
@@ -160,16 +227,16 @@ static int urp_fill_endpoint(struct sk_buff *skb, struct urp_endpoint *ep,
 			    nla_put_u16(skb, URP_STREAM_A_CREDITS_LOCAL, 0) ||
 			    nla_put_u16(skb, URP_STREAM_A_CREDITS_REMOTE, 0))
 				goto cancel;
-			nla_nest_end(skb, s);
+			nla_nest_end(skb, s_entry);
+			active_streams = 1;
 		}
-		nla_nest_end(skb, streams);
+		nla_nest_end(skb, streams_nest);
 
-		/* Aggregate STATS */
-		stats = nla_nest_start(skb, URP_ENDPOINT_A_STATS);
-		if (!stats)
+		/* Aggregate stats */
+		stats_nest = nla_nest_start(skb, URP_ENDPOINT_A_STATS);
+		if (!stats_nest)
 			goto cancel;
-		if (nla_put_u32(skb, URP_STATS_A_ACTIVE_STREAMS,
-				ep->conn.active ? 1 : 0) ||
+		if (nla_put_u32(skb, URP_STATS_A_ACTIVE_STREAMS, active_streams) ||
 		    nla_put_u64_64bit(skb, URP_STATS_A_TX_BYTES,
 				      atomic64_read(&ep->stats.tx_bytes), 0) ||
 		    nla_put_u64_64bit(skb, URP_STATS_A_RX_BYTES,
@@ -178,13 +245,17 @@ static int urp_fill_endpoint(struct sk_buff *skb, struct urp_endpoint *ep,
 				      atomic64_read(&ep->stats.tx_frames), 0) ||
 		    nla_put_u64_64bit(skb, URP_STATS_A_RX_FRAMES,
 				      atomic64_read(&ep->stats.rx_frames), 0) ||
-		    nla_put_u64_64bit(skb, URP_STATS_A_CREDIT_STALLS, 0, 0) ||
-		    nla_put_u64_64bit(skb, URP_STATS_A_REORDER_INSERTIONS, 0, 0) ||
-		    nla_put_u64_64bit(skb, URP_STATS_A_REORDER_DROPS, 0, 0) ||
-		    nla_put_u64_64bit(skb, URP_STATS_A_BUFFER_ALLOC_FAILS, 0, 0) ||
+		    nla_put_u64_64bit(skb, URP_STATS_A_CREDIT_STALLS,
+				      atomic64_read(&ep->stats.credit_stalls), 0) ||
+		    nla_put_u64_64bit(skb, URP_STATS_A_REORDER_INSERTIONS,
+				      atomic64_read(&ep->stats.reorder_insertions), 0) ||
+		    nla_put_u64_64bit(skb, URP_STATS_A_REORDER_DROPS,
+				      atomic64_read(&ep->stats.reorder_drops), 0) ||
+		    nla_put_u64_64bit(skb, URP_STATS_A_BUFFER_ALLOC_FAILS,
+				      atomic64_read(&ep->stats.buffer_alloc_fails), 0) ||
 		    nla_put_u64_64bit(skb, URP_STATS_A_AUTH_FAILURES, 0, 0))
 			goto cancel;
-		nla_nest_end(skb, stats);
+		nla_nest_end(skb, stats_nest);
 	}
 
 	nla_nest_end(skb, nest);

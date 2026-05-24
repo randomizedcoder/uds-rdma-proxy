@@ -73,6 +73,12 @@ struct urp_stats {
 	atomic64_t	tx_frames;
 	atomic64_t	rx_frames;
 	atomic64_t	connections;
+	/* Phase 3a Step 8: aggregate diagnostic counters (RTT and
+	 * auth_failures stay 0 until Phase 3b probes/PSK land). */
+	atomic64_t	credit_stalls;
+	atomic64_t	reorder_insertions;
+	atomic64_t	reorder_drops;
+	atomic64_t	buffer_alloc_fails;
 };
 
 struct urp_endpoint;	/* forward decl for struct urp_qp */
@@ -99,6 +105,12 @@ struct urp_qp {
 	 * consume-and-block + grant-frame emission).
 	 */
 	struct urp_credit	credit;
+
+	/* Step 8: per-QP counters surfaced via GENL urp_fill_endpoint */
+	atomic64_t		tx_bytes;
+	atomic64_t		rx_bytes;
+	atomic64_t		tx_frames;
+	atomic64_t		rx_frames;
 };
 
 /*
