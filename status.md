@@ -15,7 +15,7 @@ carries phases 0, 1, 2, and 3a-Step-1 commits despite its name.
 | **0** — Skeleton | `docs/KERNEL-MODULE-PLAN.md` §0 | ✅ Committed (`3a32ffc`) |
 | **1 — k0** RDMA echo data path | `docs/KERNEL-MODULE-PLAN.md` §1 | ✅ Committed (`d440794`, `a986fe7`, `a600b17`) |
 | **2** — GENL control plane | `docs/KERNEL-MODULE-IMPLEMENTATION.md` §Phase 2 | ✅ Committed (`067829e`) |
-| **3a** — k1 data path | `~/.claude/profiles/siden/plans/floofy-stirring-donut.md` + `~/.claude/profiles/runpod/plans/this-repo-has-a-abundant-fern.md` | ✅ **Main scaffold + RX dispatch complete -- Steps 1, 2, 2b, 3, 4, 5, 6, 7, 7b, 8, 9, 10 done (`c2eea2e` through `9075f57`); 23/23 `test-kmod-k0` PASS. Sub-steps 4b / 5b / 7c deferred (CREDIT-aware peer / Rust-staticlib Nix linking / TX + UDS-accept multi-stream).** |
+| **3a** — k1 data path | `~/.claude/profiles/siden/plans/floofy-stirring-donut.md` + `~/.claude/profiles/runpod/plans/this-repo-has-a-abundant-fern.md` | ✅ **Main scaffold + acceptor multi-stream complete -- Steps 1, 2, 2b, 3, 4, 5, 6, 7, 7b, 7c, 8, 9, 10 done (`c2eea2e` through `f14a107`); 23/23 `test-kmod-k0` PASS. Sub-steps 4b / 5b / 7d deferred (CREDIT-aware peer / Rust-staticlib Nix linking / test-client multi-stream extension).** |
 | 3b — probes / PSK / extended observability | (deferred) | not started |
 | 3c — KUnit hardening + soak | (deferred) | not started |
 | 4 / 5 / 6 | per `docs/KERNEL-MODULE-PLAN.md` | not started |
@@ -71,7 +71,8 @@ Verified via Nix (no system Rust used):
 | 6 | Stream multiplexing core (scaffold) | `e2ea525` | done |
 | 7 | Stream lifecycle handlers | `f3f9903` | done |
 | 7b | Wire stream_id dispatch into RX path | `9075f57` | done |
-| 7c | TX + UDS-accept multi-stream wiring | — | pending |
+| 7c | TX + UDS multi-stream wiring (acceptor) | `f14a107` | done |
+| 7d | Test-client `--stream-id` + multi-stream test | — | pending |
 | 8 | GENL emitters wire up real state | `70fafc6` | done |
 | 9 | KUnit suites + multi-QP integration smoke | `336e7e0` | done (23/23 PASS) |
 | 10 | Tracker polish + DoD checklist | done (this row) | done |
