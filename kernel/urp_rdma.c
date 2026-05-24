@@ -363,13 +363,27 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 	}
 
 	/*
-	 * Phase 3a Step 7b: dispatch by stream_id. stream_id == 0 is the
-	 * k0/legacy single-connection path -- frames go to ep->conn.
-	 * Non-zero stream_ids look up a per-stream UDS socket; SYN-flagged
-	 * frames may auto-create the stream entry via urp_stream_rx_syn,
-	 * but until 7c wires UDS-accept-allocates-stream the per-stream
-	 * uds_sock stays NULL, so non-zero stream traffic is dropped
-	 * with a counter rather than crashing.
+	 * Step 4b: handle CONTROL/CREDIT frames -- peer is granting us
+	 * additional send credits on the QP this completion came in on.
+	 * Apply to the QP's credit state and we're done; no UDS delivery.
+	 */
+	if (urp_frame_decode_type(buf->data) == URP_FRAME_TYPE_CONTROL) {
+		int qp_idx = urp_qp_index_of(ep, wc->qp);
+		u16 grants = urp_frame_decode_credits(buf->data);
+		u8 cflags = urp_frame_decode_flags(buf->data);
+
+		if (qp_idx >= 0 && (cflags & URP_CTRL_FLAG_CREDIT))
+			urp_credit_grant(&ep->qps[qp_idx].credit, grants);
+		goto repost;
+	}
+
+	/*
+	 * Phase 3a Step 7b: dispatch DATA frames by stream_id. stream_id
+	 * == 0 is the k0/legacy single-connection path -- frames go to
+	 * ep->conn. Non-zero stream_ids look up a per-stream UDS socket;
+	 * SYN-flagged frames may auto-create the stream entry via
+	 * urp_stream_rx_syn (Step 7c on the acceptor side then opens the
+	 * per-stream UDS + starts that stream's TX pump).
 	 */
 	stream_id = urp_frame_decode_stream_id(buf->data);
 	flags = urp_frame_decode_flags(buf->data);
@@ -409,8 +423,39 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 		 * QP; linear scan is fine for the supported num_qps range. */
 		qp_idx = urp_qp_index_of(ep, wc->qp);
 		if (qp_idx >= 0) {
-			atomic64_add(payload_len, &ep->qps[qp_idx].rx_bytes);
-			atomic64_inc(&ep->qps[qp_idx].rx_frames);
+			struct urp_qp *qps = &ep->qps[qp_idx];
+
+			atomic64_add(payload_len, &qps->rx_bytes);
+			atomic64_inc(&qps->rx_frames);
+
+			/*
+			 * Step 4b: record_recv + threshold-driven CREDIT
+			 * frame emission. Peer sends DATA -> we count a
+			 * pending grant; once accumulated grants reach
+			 * threshold (initial_credits / 4) we emit a
+			 * CONTROL/CREDIT frame back to peer carrying the
+			 * granted count. Peers that don't speak credit
+			 * (the userspace test client) ignore the CREDIT
+			 * frame; URP-to-URP peers consume it via the
+			 * URP_FRAME_TYPE_CONTROL branch above.
+			 */
+			urp_credit_record_recv(&qps->credit);
+			/*
+			 * Only emit CREDIT frames toward peers that speak
+			 * the multi-stream protocol (non-zero stream_id).
+			 * Legacy stream_id == 0 traffic (userspace
+			 * urp-test-client and other non-URP peers) doesn't
+			 * expect them and posts only as many recv WRs as
+			 * its echo logic needs; an unsolicited CREDIT frame
+			 * there causes RNR on the peer.
+			 */
+			if (stream_id != 0 &&
+			    urp_credit_should_grant(&qps->credit)) {
+				u16 grants = urp_credit_take_grants(&qps->credit);
+
+				urp_emit_credit_frame(ep, qps, stream_id,
+						      grants);
+			}
 		}
 	}
 

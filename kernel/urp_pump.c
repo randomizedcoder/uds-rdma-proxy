@@ -88,6 +88,17 @@ static int urp_tx_thread_fn(void *data)
 			continue;
 		}
 
+		/*
+		 * Step 4b: per-QP credit consume. Best-effort -- if the
+		 * peer hasn't replenished us yet (no CREDIT frame
+		 * received), bump the stall counter and proceed anyway.
+		 * The RC layer's rnr_retry handles transient overshoot;
+		 * the credit accounting still tracks the imbalance so
+		 * `urp show` reports stalls / send_credits realistically.
+		 */
+		if (urp_credit_consume(&qps->credit) == -EAGAIN)
+			atomic64_inc(&ep->stats.credit_stalls);
+
 		/* Post RDMA send */
 		{
 			struct ib_send_wr wr = {};
@@ -225,6 +236,11 @@ static int urp_stream_tx_fn(void *data)
 			continue;
 		}
 
+		/* Step 4b: per-stream credit consume (best-effort, same
+		 * rules as the legacy ep->conn pump above). */
+		if (urp_credit_consume(&stream->credit) == -EAGAIN)
+			atomic64_inc(&ep->stats.credit_stalls);
+
 		{
 			struct ib_send_wr wr = {};
 			const struct ib_send_wr *bad_wr;
@@ -279,4 +295,54 @@ void urp_stream_pump_stop(struct urp_stream *stream)
 		kthread_stop(stream->tx_thread);
 		stream->tx_thread = NULL;
 	}
+}
+
+/*
+ * Emit a CONTROL/CREDIT frame to peer carrying @grants credits in the
+ * frame header. Phase 3a Step 4b. The frame has no payload; flags is
+ * URP_CTRL_FLAG_CREDIT, frame_type is URP_FRAME_TYPE_CONTROL,
+ * credits_granted is the granted amount. Stream id mirrors the QP the
+ * grant applies to (0 if endpoint-level legacy compat path).
+ *
+ * Best-effort: on no-buffer / no-QP we drop -- the peer can re-derive
+ * credit state from its own send counter (the protocol tolerates
+ * dropped CREDIT frames).
+ */
+int urp_emit_credit_frame(struct urp_endpoint *ep, struct urp_qp *qps,
+			  u32 stream_id, u16 grants)
+{
+	struct urp_buffer *buf;
+	struct ib_send_wr wr = {};
+	const struct ib_send_wr *bad_wr;
+	int ret;
+
+	if (!qps || !qps->qp || grants == 0)
+		return 0;
+
+	buf = urp_buf_alloc_send(ep);
+	if (!buf) {
+		atomic64_inc(&ep->stats.credit_stalls);
+		return -ENOBUFS;
+	}
+
+	urp_frame_encode(buf->data, stream_id, 0, URP_FRAME_TYPE_CONTROL,
+			 URP_CTRL_FLAG_CREDIT, grants, 0);
+	ib_dma_sync_single_for_device(ep->ib_dev, buf->dma_addr,
+				      URP_FRAME_HEADER_SIZE, DMA_TO_DEVICE);
+
+	buf->sge.length = URP_FRAME_HEADER_SIZE;
+	buf->cqe.done = urp_send_done;
+	wr.wr_cqe = &buf->cqe;
+	wr.sg_list = &buf->sge;
+	wr.num_sge = 1;
+	wr.opcode = IB_WR_SEND;
+	wr.send_flags = IB_SEND_SIGNALED;
+
+	ret = ib_post_send(qps->qp, &wr, &bad_wr);
+	if (ret) {
+		pr_warn("urp: CREDIT frame post_send failed: %d\n", ret);
+		urp_buf_free_send(ep, buf);
+		return ret;
+	}
+	return 0;
 }

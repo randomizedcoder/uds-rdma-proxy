@@ -25,6 +25,9 @@
 #define URP_DATA_FLAG_FIN	(1 << 1)
 #define URP_DATA_FLAG_RST	(1 << 2)
 
+/* Control flags (frame_type == URP_FRAME_TYPE_CONTROL) */
+#define URP_CTRL_FLAG_CREDIT	(1 << 0)	/* credits_granted carries grant */
+
 /* Default port for RDMA CM */
 #define URP_DEFAULT_PORT	4791
 

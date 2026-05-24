@@ -319,6 +319,8 @@ int  urp_pump_start(struct urp_endpoint *ep);
 void urp_pump_stop(struct urp_endpoint *ep);
 int  urp_stream_pump_start(struct urp_stream *stream);
 void urp_stream_pump_stop(struct urp_stream *stream);
+int  urp_emit_credit_frame(struct urp_endpoint *ep, struct urp_qp *qps,
+			   u32 stream_id, u16 grants);
 
 /* CQ completion callbacks (urp_rdma.c) -- used by pump when posting sends */
 void urp_send_done(struct ib_cq *cq, struct ib_wc *wc);
@@ -372,6 +374,13 @@ static inline u32 urp_frame_decode_stream_id(const void *buf)
 	const u8 *p = buf;
 
 	return get_unaligned_le32(p);
+}
+
+static inline u16 urp_frame_decode_credits(const void *buf)
+{
+	const u8 *p = buf;
+
+	return get_unaligned_le16(p + 14);
 }
 
 static inline u64 urp_frame_decode_seq(const void *buf)
