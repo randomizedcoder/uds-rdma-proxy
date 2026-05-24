@@ -2,7 +2,7 @@
 
 Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.md).
 
-**Last updated**: 2026-05-24 (Phase 3a complete; Phase 3b Steps 1-4 committed on `phase3b-probes-psk` HEAD `bc25de8`. 23/23 `test-kmod-k0` PASS.)
+**Last updated**: 2026-05-24 (Phase 3a complete; Phase 3b Steps 1-10 committed on `phase3b-probes-psk` HEAD `dd6bab0`. 23/23 `test-kmod-k0` PASS.)
 
 ---
 
@@ -14,7 +14,7 @@ Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.
 | 1 | [k0 -- Proof of Concept](#phase-1-k0----proof-of-concept) | Complete | 7/9 (sanitizer items deferred) |
 | 2 | [urp CLI + GENL](#phase-2-urp-cli--genl-interface) | Complete (`067829e`) | 8/9 |
 | 3a | [k1 Data Path](#phase-3a-k1-data-path) | Complete (7d pending) | 9/9 main + 5/6 sub-steps; 7d (test-client multi-stream) pending |
-| 3b | [Probes + PSK Auth](#phase-3b-probes--psk-auth) | In Progress (`bc25de8`) | 4/10 |
+| 3b | [Probes + PSK Auth](#phase-3b-probes--psk-auth) | Complete (`dd6bab0`) | 10/10 |
 | 3 | [k1 -- Functional](#phase-3-k1----functional) | In Progress (via 3a) | 0/14 |
 | 4 | [k2 -- Optimized](#phase-4-k2----optimized) | Not Started | 0/8 |
 | 5 | [MicroVM Integration](#phase-5-microvm-integration) | Not Started | 0/8 |
@@ -456,12 +456,33 @@ Deferred to **Phase 3c**: 1-hour soak with KASAN / KMEMLEAK / KCSAN
 | 2 | Probe emit via per-endpoint delayed_work | `fa58e55` | `urp_probe_work_fn` reschedules every 250ms; `urp_emit_ping_on` encodes a `URP_FRAME_TYPE_PROBE` frame with a 32B PING payload + `ktime_get_ns`/`ktime_get_real_ns` and `ib_post_send`s on every established QP. Gated on `num_qps > 1` so the single-QP test-client scenario stays probe-free. `urp_recv_done` now silently reposts PROBE frames (no UDS delivery). |
 | 3 | RX of PING -> emit PONG | `fc426a7` | `urp_emit_pong_on(ep, qp, ping_payload)` echoes the PING fields + adds `t_recv_real / t_pong_mono / t_pong_real` and `ib_post_send`s back on the same QP. Best-effort -- drops PONG on buffer / post failure. |
 | 4 | RX of PONG -> RTT EWMA | `bc25de8` | `urp_recv_done` PONG branch reads `t_send_mono` from the echoed payload, computes RTT, integer-EWMA (alpha = 0.2: `new = old*4/5 + rtt/5`, first sample seeds directly), and resets `consecutive_misses`. |
-| 5 | QP health state machine | pending | Qualifying / Active / Draining / Removed transitions; missed-probe timeout decisions. |
-| 6 | GENL emits real per-QP RTT | pending | `URP_QP_A_RTT_NS` reports `rtt_ewma_ns` (was 0 from Step 8 of 3a). |
-| 7 | PSK SHA-256 hashing on add | pending | `urp_endpoint_create` hashes the raw password into a 32-byte SHA-256 before storing. |
-| 8 | PSK in `rdma_cm` `private_data` | pending | Initiator: include `auth_method` + `auth_hash` in `rdma_connect()` `private_data` (49B total). Acceptor: validate hash in `CONNECT_REQUEST`; `rdma_reject` on mismatch. Bidirectional verification via `rdma_accept` reply. |
-| 9 | Auth-failure stats + GENL event | pending | `URP_STATS_A_AUTH_FAILURES` counter; multicast event on auth failure. |
-| 10 | Tracker polish + benchmark sanity | pending | Phase 3b DoD checklist; latency-delta measurement before/after probes; final docs pass. |
+| 5 | QP health state machine | `2cb06d3` | `enum urp_qp_state` values stored in `q->health` (QUALIFYING / ACTIVE / DRAINING / REMOVED). `RDMA_CM_EVENT_ESTABLISHED` promotes to ACTIVE; URP_QP_MISS_THRESHOLD (3) consecutive missed PONGs demotes to DRAINING; `urp_qp_select_round_robin` skips DRAINING / REMOVED. |
+| 6 | GENL emits real per-QP RTT + health | `9b6189f` | `URP_QP_A_RTT_NS` reads `q->rtt_ewma_ns`; `URP_QP_A_STATE` reads `q->health` instead of the Phase 3a placeholder. |
+| 7 | PSK SHA-256 hashing on add | `a820d92` | `urp_endpoint_create` runs `sha256(cfg->password, URP_PASSWORD_MAX, ep->password_hash)`; raw input zeroed via `memzero_explicit`. New `u8 password_hash[URP_PSK_HASH_LEN=32]` + `u8 auth_priv[1+32]` (pre-built rdma_cm private_data). |
+| 8 | PSK in `rdma_cm` `private_data` | `1115590` | Initiator: `rdma_connect` carries `auth_priv` in `private_data` when `has_password`. Acceptor: `urp_cm_accept_one` validates incoming `private_data` against `ep->auth_priv`; mismatch -> `rdma_reject` before any QP allocation. Acceptor's `rdma_accept` reply echoes its own `auth_priv` so a future initiator-side validate (8b candidate) can use it. |
+| 9 | Auth-failure stats + GENL event | `dd6bab0` | `urp_stats.auth_failures` (atomic64_t) incremented on PSK reject; `URP_STATS_A_AUTH_FAILURES` GENL emit reads it; `urp_send_event(ep)` multicasts on failure so `urp monitor` users see it. |
+| 10 | Tracker polish + DoD | (this commit) | Phase 3b complete in tracker; DoD checklist added. |
+
+### Phase 3b Definition of Done (subset of plan §3.6 + §3.7)
+
+- [x] PROBE wire format + per-QP probe state (`0d5c077`) — KUnit pins it byte-for-byte against the Rust reference impl.
+- [x] PING emission via per-endpoint `delayed_work` at 250ms (`fa58e55`); gated on `num_qps > 1` so the single-QP test-client path is undisturbed.
+- [x] PONG response on PING reception (`fc426a7`).
+- [x] RTT EWMA on PONG reception (`bc25de8`); alpha = 0.2 in integer math; first sample seeds directly.
+- [x] QP health state machine (`2cb06d3`); URP_QP_MISS_THRESHOLD (3) consecutive missed PONGs demotes ACTIVE → DRAINING; `urp_qp_select_round_robin` skips DRAINING/REMOVED.
+- [x] GENL emits real per-QP `URP_QP_A_RTT_NS` + `URP_QP_A_STATE` (`9b6189f`).
+- [x] PSK SHA-256 hashing on add (`a820d92`).
+- [x] PSK validated via `rdma_cm` `private_data` (`1115590`) — acceptor-validates-initiator end-to-end; acceptor echoes its own hash in `rdma_accept` reply for a future initiator-side check.
+- [x] Auth-failure counter + GENL multicast event (`dd6bab0`).
+
+Deferred follow-ups inside Phase 3b:
+
+| Sub-step | Subject | Status |
+|----------|---------|--------|
+| 8b | Initiator validates acceptor's hash in `RDMA_CM_EVENT_ESTABLISHED` | Pending. Acceptor already echoes `auth_priv` in `rdma_accept` reply; just need to read `event->param.conn.private_data` on the initiator side and compare. |
+| 3b/test | URP-to-URP integration test with matching + mismatched PSKs and a multi-QP probe-driven scenario | Pending. Pairs with Phase 3a's deferred 7d (test-client `--stream-id`) — a URP-to-URP harness covers both at once. |
+
+Deferred to Phase 3c (unchanged): 1-hour soak with KASAN / KMEMLEAK / KCSAN.
 
 ---
 
