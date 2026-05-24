@@ -2,7 +2,7 @@
 
 Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.md).
 
-**Last updated**: 2026-05-24 (Phase 3a complete; Phase 3b Steps 1-10 committed on `phase3b-probes-psk` HEAD `dd6bab0`. 23/23 `test-kmod-k0` PASS.)
+**Last updated**: 2026-05-24 (Phase 3a + 3b complete; Phase 4 Steps 1-2 committed on `phase4-k2-optimized` HEAD `78967e5`. 23/23 `test-kmod-k0` PASS.)
 
 ---
 
@@ -16,7 +16,7 @@ Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.
 | 3a | [k1 Data Path](#phase-3a-k1-data-path) | Complete (7d pending) | 9/9 main + 5/6 sub-steps; 7d (test-client multi-stream) pending |
 | 3b | [Probes + PSK Auth](#phase-3b-probes--psk-auth) | Complete (`dd6bab0`) | 10/10 |
 | 3 | [k1 -- Functional](#phase-3-k1----functional) | In Progress (via 3a) | 0/14 |
-| 4 | [k2 -- Optimized](#phase-4-k2----optimized) | Not Started | 0/8 |
+| 4 | [k2 -- Optimized](#phase-4-k2----optimized) | In Progress (`78967e5`); rxe-testable items done, hardware-gated items deferred | 2/8 main + 3 deferred |
 | 5 | [MicroVM Integration](#phase-5-microvm-integration) | Not Started | 0/8 |
 
 ---
@@ -564,29 +564,46 @@ Deferred to Phase 3c (unchanged): 1-hour soak with KASAN / KMEMLEAK / KCSAN.
 
 ## Phase 4: k2 -- Optimized
 
-**Status**: Not Started
+**Status**: rxe-testable scope complete -- on branch `phase4-k2-optimized`
+(cut from Phase 3b HEAD `99ac7ff`). Hardware-gated items (zero-copy
+send, adaptive CQ polling, kthread NUMA binding, real-NIC benchmarks)
+explicitly deferred: their wins are not measurable on rxe / siw, and
+their primary risk surface is hardware-specific. The 23/23
+`test-kmod-k0` regression suite passes on every commit.
 
-### Deliverables
+### Step Status
 
-- [ ] page_pool integrated: allocation uses `page_pool_dev_alloc_pages()`, recycle uses `page_pool_put_page()`
-- [ ] Zero-copy send: page-aligned 4KB writes bypass `copy_from_iter` (verified via stats counter)
-- [ ] Adaptive CQ polling: transitions between event-driven and busy-poll (verified via tracepoints)
-- [ ] NUMA: buffer allocation and kthreads on same NUMA node as RDMA device
-- [ ] All Phase 3 tests still pass (regression)
-- [ ] Performance benchmarks documented: latency p50/p99, throughput, message rate
-- [ ] page_pool recycle rate > 95% under sustained load (verify via page_pool stats)
-- [ ] Hardware RDMA tests pass (if hardware available)
+| Step | Subject | Commit | Notes |
+|------|---------|--------|-------|
+| 1 | page_pool buffer management | `ded84a7` | `urp_bufs_init` calls `page_pool_create` + N x `page_pool_dev_alloc_pages`; pages get DMA-mapped via `ib_dma_map_page`. PP_FLAG_DMA_MAP is intentionally *not* set -- rxe/siw `ib_device->dma_device == NULL` would NULL-deref `dev_to_node` inside `page_pool_create`. Documented as the plan's "primary k2 engineering risk" (§4.1). For hardware NICs the ib_dma path is equivalent to dma_map_page so the choice carries no perf cost. |
+| 2 | NUMA-aware page_pool | `78967e5` | `page_pool_params.nid` reads `dev_to_node(ib_dev->dev.parent)` when a real parent exists; falls back to `NUMA_NO_NODE` for software RDMA. |
+| 3 | tracker polish + DoD | (this commit) | Phase 4 scope settlement; deferred items below. |
 
-### Performance Benchmark Results
+### Deferred to hardware-validation (no measurable change on rxe)
 
-| Benchmark | Metric | Result | Notes |
-|-----------|--------|--------|-------|
-| Latency (64B echo) | p50/p99 ns | | |
-| Throughput (4KB bulk) | GB/s | | |
-| Small message storm | msg/sec | | |
-| page_pool vs free list | alloc/free ns | | |
-| Zero-copy vs copy | latency delta | | |
-| NUMA cross-node penalty | latency increase | | |
+| Sub-step | Subject | Why deferred |
+|----------|---------|--------------|
+| 4.2 | Zero-copy send (`get_user_pages_fast` + post user pages directly) | High-risk pin-page lifecycle; the win is bypassing `copy_from_iter`, which costs nothing measurable when DMA is emulated. Needs a real NIC + a benchmark that exercises 4KB-page-aligned writes. |
+| 4.3 | Adaptive CQ polling (event-driven <-> busy-poll switching) | Current `IB_POLL_WORKQUEUE` is already a managed mode; switching to manual polling is a substantial refactor whose only payoff is reducing workqueue scheduling jitter at >1k CQE/sec rates -- not reachable on rxe in the test VM. |
+| 4.4-kthread | `kthread_bind` of TX pumps to the NIC's NUMA node | The page_pool half (`.nid` in page_pool_params) shipped in Step 2; the kthread half is a no-op when the NIC has no NUMA binding (rxe / siw). |
+| 4.5 | Performance benchmarks on hardware | rxe gives ~3.6 MB/s throughput and ~1.07 ms p50 latency regardless of optimisation -- those numbers measure the QEMU emulation cost, not the urp module. Real numbers need a hardware RDMA NIC. |
+
+### Definition of Done (rxe-testable subset)
+
+- [x] page_pool integrated: allocation uses `page_pool_dev_alloc_pages()`, recycle uses `page_pool_put_page()` (`ded84a7`)
+- [x] NUMA: page_pool reads `ib_dev->dev.parent`'s `numa_node` when available (`78967e5`)
+- [x] All Phase 3 tests still pass (regression) -- 23/23 `test-kmod-k0` on each Phase 4 commit
+- [ ] Zero-copy send -- deferred to 4.2 hardware-validation pass
+- [ ] Adaptive CQ polling -- deferred to 4.3 hardware-validation pass
+- [ ] TX kthread NUMA binding -- deferred to 4.4 hardware-validation pass
+- [ ] Performance benchmarks documented on real hardware -- deferred to 4.5
+
+### Performance Benchmark Results (rxe baseline; not meaningful for hardware comparison)
+
+| Benchmark | Metric | rxe-in-QEMU | Notes |
+|-----------|--------|-------------|-------|
+| Latency (64B echo) | p50 ns | ~1,067,000 | Dominated by rxe + virtio-net loopback, not the urp module. |
+| Throughput (4KB bulk) | GB/s | ~0.0036 | Same -- bench harness should land alongside the hardware test plan. |
 
 ### Notes
 

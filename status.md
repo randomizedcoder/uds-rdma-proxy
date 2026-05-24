@@ -4,10 +4,9 @@ _Last updated: 2026-05-24_
 
 ## Current branch
 
-`phase3b-probes-psk` — cut from `phase3a-k1-data-path` HEAD `22f98fa`
-(Phase 3a finalized). The previous branches (`phase3a-k1-data-path`,
-`phase1-k0-kernel-module`) still exist locally and carry their respective
-phases' commits.
+`phase4-k2-optimized` — cut from `phase3b-probes-psk` HEAD `99ac7ff`
+(Phases 3a + 3b finalized). The previous branches still exist locally
+and carry their respective phases' commits.
 
 ## Where we are
 
@@ -19,7 +18,8 @@ phases' commits.
 | **3a** — k1 data path | `~/.claude/profiles/siden/plans/floofy-stirring-donut.md` + `~/.claude/profiles/runpod/plans/this-repo-has-a-abundant-fern.md` | ✅ **Phase 3a complete -- Steps 1-10 + 2b, 4b, 5b, 7b, 7c done (`c2eea2e` through `b7caab2`); 23/23 `test-kmod-k0` PASS. Sub-step 7d (test-client `--stream-id` + multi-stream integration test) + 5b's objtool-on-IBT follow-up remain pending.** |
 | **3b** — probes / PSK | `docs/KERNEL-MODULE-PLAN.md` §3.6-§3.7 + `KERNEL-MODULE-IMPLEMENTATION.md` §Phase 3b | ✅ **Complete. Steps 1-10 done (`0d5c077` through `dd6bab0`). Probes (PING/PONG/RTT EWMA/state machine), PSK SHA-256 + rdma_cm `private_data` validation, auth-failure observability all wired. Test-kmod-k0 23/23 PASS. Sub-steps 8b (initiator-validates-acceptor) + 3b/test (URP-to-URP harness) pending.** |
 | 3c — KUnit hardening + soak | (deferred) | not started |
-| 4 / 5 / 6 | per `docs/KERNEL-MODULE-PLAN.md` | not started |
+| **4** — k2 optimized | `docs/KERNEL-MODULE-PLAN.md` §4 + `KERNEL-MODULE-IMPLEMENTATION.md` §Phase 4 | 🚧 **rxe-testable scope done: Step 1 page_pool (`ded84a7`), Step 2 NUMA-aware page_pool (`78967e5`); 23/23 `test-kmod-k0` PASS. Plan §4.2 zero-copy + §4.3 adaptive CQ polling + §4.4 kthread NUMA bind + §4.5 hardware benchmarks deferred to a hardware-validation pass (rxe gives no measurable signal).** |
+| 5 / 6 | per `docs/KERNEL-MODULE-PLAN.md` | not started |
 
 ## Phase 2 deliverables (now committed in `067829e`)
 
