@@ -144,7 +144,8 @@ void urp_buf_free_recv(struct urp_endpoint *ep, struct urp_buffer *buf)
 /* Forward declaration for recv CQE callback */
 static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc);
 
-int urp_post_recv(struct urp_endpoint *ep, struct urp_buffer *buf)
+int urp_post_recv(struct urp_endpoint *ep, struct ib_qp *qp,
+		  struct urp_buffer *buf)
 {
 	struct ib_recv_wr wr = {};
 	const struct ib_recv_wr *bad_wr;
@@ -156,52 +157,121 @@ int urp_post_recv(struct urp_endpoint *ep, struct urp_buffer *buf)
 	wr.sg_list = &buf->sge;
 	wr.num_sge = 1;
 
-	return ib_post_recv(ep->qps[0].qp, &wr, &bad_wr);
+	return ib_post_recv(qp, &wr, &bad_wr);
 }
 
-int urp_post_recv_all(struct urp_endpoint *ep)
+/*
+ * Post up to @count recv buffers from the endpoint's pool to @qp's RQ.
+ * Step 2b posts a fixed slice per QP at QP-setup time; Step 3 will move
+ * this work to the shared SRQ.
+ */
+int urp_post_recv_for_qp(struct urp_endpoint *ep, struct ib_qp *qp, u32 count)
 {
-	struct urp_buffer *buf;
-	int count = 0;
-	int ret;
+	u32 posted = 0;
 
-	while ((buf = urp_buf_alloc_recv(ep)) != NULL) {
-		ret = urp_post_recv(ep, buf);
+	while (posted < count) {
+		struct urp_buffer *buf = urp_buf_alloc_recv(ep);
+		int ret;
+
+		if (!buf)
+			break;	/* pool exhausted -- not fatal */
+
+		ret = urp_post_recv(ep, qp, buf);
 		if (ret) {
 			urp_buf_free_recv(ep, buf);
 			pr_err("urp: post_recv failed: %d\n", ret);
 			return ret;
 		}
-		count++;
+		posted++;
 	}
 
-	pr_info("urp: posted %d recv buffers\n", count);
+	pr_info("urp: posted %u recv buffers to QP\n", posted);
 	return 0;
 }
 
-/* ---- QP creation ---- */
+/* ---- Shared per-endpoint RDMA setup ---- */
 
-static int urp_create_qp(struct urp_endpoint *ep)
+/*
+ * One-shot setup of resources shared across all QPs of an endpoint:
+ * PD, buffer pool, and the two CQs that all QPs feed. Called from the
+ * first cm-event that observes the ib_device (ROUTE_RESOLVED for the
+ * initiator, CONNECT_REQUEST for the acceptor); subsequent invocations
+ * are no-ops because ep->pd is already populated.
+ */
+static int urp_endpoint_setup_shared(struct urp_endpoint *ep,
+				     struct ib_device *dev)
+{
+	u32 cq_entries;
+	int i, ret;
+
+	if (ep->pd)
+		return 0;
+
+	ep->ib_dev = dev;
+
+	ep->pd = ib_alloc_pd(dev, 0);
+	if (IS_ERR(ep->pd)) {
+		ret = PTR_ERR(ep->pd);
+		ep->pd = NULL;
+		pr_err("urp: ib_alloc_pd failed: %d\n", ret);
+		return ret;
+	}
+
+	ret = urp_bufs_init(ep, dev);
+	if (ret)
+		goto err_pd;
+
+	for (i = 0; i < URP_NUM_BUFS; i++)
+		ep->bufs[i].sge.lkey = ep->pd->local_dma_lkey;
+
+	/*
+	 * Shared CQs sized so completions don't back up under N QPs of
+	 * sustained traffic. URP_CQ_ENTRIES (URP_NUM_BUFS * 2) is the
+	 * single-QP figure that worked in k0; scale it by num_qps.
+	 */
+	cq_entries = URP_CQ_ENTRIES * ep->num_qps;
+
+	ep->send_cq = ib_alloc_cq(dev, ep, cq_entries, 0, IB_POLL_WORKQUEUE);
+	if (IS_ERR(ep->send_cq)) {
+		ret = PTR_ERR(ep->send_cq);
+		ep->send_cq = NULL;
+		pr_err("urp: ib_alloc_cq (send) failed: %d\n", ret);
+		goto err_bufs;
+	}
+
+	ep->recv_cq = ib_alloc_cq(dev, ep, cq_entries, 0, IB_POLL_WORKQUEUE);
+	if (IS_ERR(ep->recv_cq)) {
+		ret = PTR_ERR(ep->recv_cq);
+		ep->recv_cq = NULL;
+		pr_err("urp: ib_alloc_cq (recv) failed: %d\n", ret);
+		goto err_send_cq;
+	}
+
+	return 0;
+
+err_send_cq:
+	ib_free_cq(ep->send_cq);
+	ep->send_cq = NULL;
+err_bufs:
+	urp_bufs_cleanup(ep, dev);
+err_pd:
+	ib_dealloc_pd(ep->pd);
+	ep->pd = NULL;
+	ep->ib_dev = NULL;
+	return ret;
+}
+
+/*
+ * Create the QP for one cm_id and pin it into ep->qps[qp_index]. The
+ * shared PD/CQs must already be set up. After this returns success the
+ * QP is in INIT; rdma_connect / rdma_accept transitions it to RTS.
+ */
+static int urp_qp_create_on_cm_id(struct urp_endpoint *ep,
+				  struct rdma_cm_id *cm_id, u32 qp_index)
 {
 	struct ib_qp_init_attr attr = {};
 	int ret;
 
-	ep->send_cq = ib_alloc_cq(ep->cm_id->device, ep,
-				   URP_CQ_ENTRIES, 0, IB_POLL_WORKQUEUE);
-	if (IS_ERR(ep->send_cq)) {
-		pr_err("urp: ib_alloc_cq (send) failed\n");
-		return PTR_ERR(ep->send_cq);
-	}
-
-	ep->recv_cq = ib_alloc_cq(ep->cm_id->device, ep,
-				   URP_CQ_ENTRIES, 0, IB_POLL_WORKQUEUE);
-	if (IS_ERR(ep->recv_cq)) {
-		pr_err("urp: ib_alloc_cq (recv) failed\n");
-		ib_free_cq(ep->send_cq);
-		return PTR_ERR(ep->recv_cq);
-	}
-
-	attr.event_handler = NULL; /* k0: no QP event handling */
 	attr.send_cq = ep->send_cq;
 	attr.recv_cq = ep->recv_cq;
 	attr.cap.max_send_wr = URP_SQ_DEPTH;
@@ -211,58 +281,28 @@ static int urp_create_qp(struct urp_endpoint *ep)
 	attr.qp_type = IB_QPT_RC;
 	attr.sq_sig_type = IB_SIGNAL_ALL_WR;
 
-	ret = rdma_create_qp(ep->cm_id, ep->pd, &attr);
-	if (!ret) {
-		/* Phase 3a Step 2: single-cm-id scaffold still binds the one
-		 * QP to slot 0. Step 2b will iterate ep->qps[] with one cm_id
-		 * per QP and populate each slot's qp + cm_id independently.
-		 */
-		ep->qps[0].qp = ep->cm_id->qp;
-		ep->qps[0].cm_id = ep->cm_id;
+	ret = rdma_create_qp(cm_id, ep->pd, &attr);
+	if (ret) {
+		pr_err("urp: rdma_create_qp[%u] failed: %d\n", qp_index, ret);
+		return ret;
 	}
-	return ret;
+
+	ep->qps[qp_index].qp = cm_id->qp;
+	ep->qps[qp_index].cm_id = cm_id;
+	return 0;
 }
 
-/* ---- RDMA CM event handling ---- */
-
-static int urp_cm_setup_connection(struct urp_endpoint *ep)
+/*
+ * Post the per-QP slice of recv buffers. Step 3 will replace this with
+ * SRQ-based watermark refill; until then each QP owns roughly
+ * (recv_pool_size / num_qps) buffers on its dedicated RQ.
+ */
+static u32 urp_recvs_per_qp(struct urp_endpoint *ep)
 {
-	struct ib_device *dev = ep->cm_id->device;
-	int i, ret;
+	u32 recv_pool = URP_NUM_BUFS / 2;
+	u32 per_qp = recv_pool / ep->num_qps;
 
-	ep->pd = ib_alloc_pd(dev, 0);
-	if (IS_ERR(ep->pd)) {
-		pr_err("urp: ib_alloc_pd failed\n");
-		return PTR_ERR(ep->pd);
-	}
-
-	ret = urp_bufs_init(ep, dev);
-	if (ret)
-		goto err_pd;
-
-	/* Set lkey on all buffers now that PD exists */
-	for (i = 0; i < URP_NUM_BUFS; i++)
-		ep->bufs[i].sge.lkey = ep->pd->local_dma_lkey;
-
-	ret = urp_create_qp(ep);
-	if (ret)
-		goto err_bufs;
-
-	ret = urp_post_recv_all(ep);
-	if (ret)
-		goto err_qp;
-
-	return 0;
-
-err_qp:
-	rdma_destroy_qp(ep->cm_id);
-	ib_free_cq(ep->recv_cq);
-	ib_free_cq(ep->send_cq);
-err_bufs:
-	urp_bufs_cleanup(ep, dev);
-err_pd:
-	ib_dealloc_pd(ep->pd);
-	return ret;
+	return per_qp ? per_qp : 1;
 }
 
 /*
@@ -274,12 +314,15 @@ void urp_send_done(struct ib_cq *cq, struct ib_wc *wc)
 	struct urp_buffer *buf = container_of(wc->wr_cqe, struct urp_buffer, cqe);
 	struct urp_endpoint *ep = cq->cq_context;
 
-	if (wc->status != IB_WC_SUCCESS) {
+	if (wc->status != IB_WC_SUCCESS && wc->status != IB_WC_WR_FLUSH_ERR)
 		pr_err("urp: send completion error: %s (%d)\n",
 		       ib_wc_status_msg(wc->status), wc->status);
-		return;
-	}
 
+	/*
+	 * Always return the buffer to the pool, including on flush after QP
+	 * destruction. Without this, every QP teardown permanently
+	 * leaks outstanding send buffers and the pool eventually exhausts.
+	 */
 	urp_buf_free_send(ep, buf);
 }
 
@@ -287,6 +330,7 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 {
 	struct urp_buffer *buf = container_of(wc->wr_cqe, struct urp_buffer, cqe);
 	struct urp_endpoint *ep = cq->cq_context;
+	struct ib_qp *src_qp = wc->qp;	/* repost back to this QP */
 	struct msghdr msg = {};
 	struct kvec iov;
 	u32 payload_len;
@@ -296,6 +340,8 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 		if (wc->status != IB_WC_WR_FLUSH_ERR)
 			pr_err("urp: recv completion error: %s (%d)\n",
 			       ib_wc_status_msg(wc->status), wc->status);
+		/* Return buffer to pool so subsequent connects can repost it. */
+		urp_buf_free_recv(ep, buf);
 		return;
 	}
 
@@ -322,23 +368,144 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 	}
 
 repost:
-	/* Return buffer to receive pool and repost */
+	/*
+	 * Return buffer to pool and repost to the SAME QP this completion
+	 * arrived on, so we keep each QP's RQ topped up. Step 3's SRQ moves
+	 * to a single shared queue and removes the per-QP refill loop here.
+	 */
 	urp_buf_free_recv(ep, buf);
 	buf = urp_buf_alloc_recv(ep);
 	if (buf) {
-		ret = urp_post_recv(ep, buf);
+		ret = urp_post_recv(ep, src_qp, buf);
 		if (ret)
 			urp_buf_free_recv(ep, buf);
 	}
 }
 
+/*
+ * Acceptor: handle one CONNECT_REQUEST event on the listener cm_id.
+ *
+ * For each peer-side QP, the peer initiates one CM connection which
+ * arrives here as a separate CONNECT_REQUEST. We attach the next free
+ * urp_qp slot to the child cm_id, create the QP, pre-post recvs, and
+ * rdma_accept. On the very first connect we also stand up the UDS data
+ * path and start the TX pump so that recvs go somewhere once the QP
+ * transitions to RTS (see the comment in the previous single-QP code).
+ */
+static int urp_cm_accept_one(struct rdma_cm_id *child, struct urp_endpoint *ep)
+{
+	struct urp_cm_ctx *child_ctx;
+	struct rdma_conn_param param = {};
+	u32 qp_index;
+	int ret;
+
+	qp_index = (u32)atomic_inc_return(&ep->qps_accepted) - 1;
+	if (qp_index >= ep->num_qps) {
+		atomic_dec(&ep->qps_accepted);
+		pr_warn("urp: rejecting extra CONNECT_REQUEST (%u >= %u QPs)\n",
+			qp_index, ep->num_qps);
+		rdma_reject(child, NULL, 0, 0);
+		return 0;
+	}
+
+	ret = urp_endpoint_setup_shared(ep, child->device);
+	if (ret)
+		goto err_release_slot;
+
+	/*
+	 * If this slot was used by a previous (now-disconnected) connection,
+	 * tear down the old QP + cm_id before reusing. DISCONNECTED only
+	 * marks the slot free; we defer destruction until reuse or drain to
+	 * avoid destroying a cm_id from inside its own event handler.
+	 */
+	if (ep->qps[qp_index].cm_id) {
+		struct urp_cm_ctx *old_ctx = ep->qps[qp_index].cm_id->context;
+
+		if (ep->qps[qp_index].qp) {
+			ib_drain_qp(ep->qps[qp_index].qp);
+			rdma_destroy_qp(ep->qps[qp_index].cm_id);
+			ep->qps[qp_index].qp = NULL;
+		}
+		rdma_destroy_id(ep->qps[qp_index].cm_id);
+		kfree(old_ctx);
+		ep->qps[qp_index].cm_id = NULL;
+		ep->qps[qp_index].established = false;
+	}
+
+	child_ctx = kzalloc(sizeof(*child_ctx), GFP_KERNEL);
+	if (!child_ctx)
+		return -ENOMEM;
+	child_ctx->ep = ep;
+	child_ctx->qp_index = qp_index;
+	child_ctx->is_listener = false;
+	child->context = child_ctx;
+
+	ret = urp_qp_create_on_cm_id(ep, child, qp_index);
+	if (ret)
+		goto err_free_ctx;
+
+	/*
+	 * On the FIRST accepted child we bring up UDS + the TX pump. We do
+	 * it here (before rdma_accept) so recvs landing the moment the QP
+	 * transitions to RTS already have somewhere to go -- same reason as
+	 * the k0 single-QP path. Subsequent accepted QPs share the same
+	 * pump (it round-robins across qps[] via urp_qp_select_round_robin).
+	 */
+	if (qp_index == 0 && ep->connect_path[0]) {
+		ret = urp_connect_uds(ep, ep->connect_path);
+		if (!ret)
+			ret = urp_pump_start(ep);
+		if (ret) {
+			pr_err("urp: acceptor data path setup failed: %d\n", ret);
+			goto err_destroy_qp;
+		}
+	}
+
+	ret = urp_post_recv_for_qp(ep, child->qp, urp_recvs_per_qp(ep));
+	if (ret)
+		goto err_destroy_qp;
+
+	param.responder_resources = 1;
+	param.initiator_depth = 1;
+	param.rnr_retry_count = 7;
+	ret = rdma_accept(child, &param);
+	if (ret)
+		goto err_destroy_qp;
+
+	return 0;
+
+err_destroy_qp:
+	rdma_destroy_qp(child);
+	ep->qps[qp_index].qp = NULL;
+	ep->qps[qp_index].cm_id = NULL;
+err_free_ctx:
+	child->context = NULL;
+	kfree(child_ctx);
+err_release_slot:
+	atomic_dec(&ep->qps_accepted);
+	return ret;
+}
+
+/*
+ * Unified CM handler for every urp-managed rdma_cm_id. Dispatches on
+ * ctx->is_listener (listener: CONNECT_REQUEST only) vs per-QP cm_ids
+ * (full address/route/establish/teardown lifecycle).
+ */
 static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 {
-	struct urp_endpoint *ep = id->context;
+	struct urp_cm_ctx *ctx = id->context;
+	struct urp_endpoint *ep = ctx->ep;
 	int ret = 0;
 
-	pr_info("urp: CM event: %s (%d)\n",
-		rdma_event_msg(event->event), event->event);
+	pr_info("urp: CM event: %s (%d) [%s qp=%u]\n",
+		rdma_event_msg(event->event), event->event,
+		ctx->is_listener ? "listener" : "qp", ctx->qp_index);
+
+	if (ctx->is_listener) {
+		if (event->event == RDMA_CM_EVENT_CONNECT_REQUEST)
+			return urp_cm_accept_one(id, ep);
+		return 0;
+	}
 
 	switch (event->event) {
 	case RDMA_CM_EVENT_ADDR_RESOLVED:
@@ -346,7 +513,15 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 		break;
 
 	case RDMA_CM_EVENT_ROUTE_RESOLVED:
-		ret = urp_cm_setup_connection(ep);
+		ret = urp_endpoint_setup_shared(ep, id->device);
+		if (ret)
+			break;
+
+		ret = urp_qp_create_on_cm_id(ep, id, ctx->qp_index);
+		if (ret)
+			break;
+
+		ret = urp_post_recv_for_qp(ep, id->qp, urp_recvs_per_qp(ep));
 		if (ret)
 			break;
 
@@ -362,48 +537,15 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 		break;
 
 	case RDMA_CM_EVENT_ESTABLISHED:
-		ep->connected = true;
-		if (ep->qps) {
-			ep->qps[0].established = true;
-			atomic_inc(&ep->qps_connected);
-		}
-		complete(&ep->cm_done);
-		pr_info("urp: RDMA connection established\n");
-		break;
-
-	case RDMA_CM_EVENT_CONNECT_REQUEST:
-		/* Acceptor side: save listener, switch to child CM ID */
-		ep->listen_id = ep->cm_id;
-		ep->cm_id = id;
-		id->context = ep;
-
-		ret = urp_cm_setup_connection(ep);
-		if (ret)
-			break;
-
-		/* Connect UDS and start pump BEFORE rdma_accept.
-		 * rdma_accept transitions QP to RTR/RTS, enabling data flow.
-		 * If we delay UDS setup, recv completions race ahead and
-		 * urp_recv_done drops data (conn.active is still false).
-		 * The TX pump blocks on kernel_recvmsg until echo data arrives,
-		 * so it won't attempt ib_post_send before the QP is ready. */
-		if (ep->connect_path[0]) {
-			ret = urp_connect_uds(ep, ep->connect_path);
-			if (!ret)
-				ret = urp_pump_start(ep);
-			if (ret) {
-				pr_err("urp: acceptor data path setup failed: %d\n", ret);
-				break;
+		if (ep->qps && ctx->qp_index < ep->num_qps) {
+			ep->qps[ctx->qp_index].established = true;
+			if ((u32)atomic_inc_return(&ep->qps_connected) ==
+			    ep->num_qps) {
+				ep->connected = true;
+				complete(&ep->cm_done);
+				pr_info("urp: all %u QPs established\n",
+					ep->num_qps);
 			}
-		}
-
-		{
-			struct rdma_conn_param param = {};
-
-			param.responder_resources = 1;
-			param.initiator_depth = 1;
-			param.rnr_retry_count = 7;
-			ret = rdma_accept(id, &param);
 		}
 		break;
 
@@ -413,10 +555,24 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 	case RDMA_CM_EVENT_CONNECT_ERROR:
 	case RDMA_CM_EVENT_UNREACHABLE:
 	case RDMA_CM_EVENT_REJECTED:
-		ep->connected = false;
+		if (ep->qps && ctx->qp_index < ep->num_qps) {
+			if (ep->qps[ctx->qp_index].established) {
+				ep->qps[ctx->qp_index].established = false;
+				atomic_dec(&ep->qps_connected);
+				/*
+				 * Acceptor: release the slot so the next
+				 * CONNECT_REQUEST can reuse it (the old QP +
+				 * cm_id stay until the next reuse or drain,
+				 * since we can't safely destroy the cm_id from
+				 * inside its own handler).
+				 */
+				if (!ep->is_initiator)
+					atomic_dec(&ep->qps_accepted);
+			}
+		}
 		ep->cm_status = event->status;
 		complete(&ep->cm_done);
-		pr_info("urp: RDMA connection down: %s\n",
+		pr_info("urp: QP %u CM down: %s\n", ctx->qp_index,
 			rdma_event_msg(event->event));
 		break;
 
@@ -431,92 +587,158 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 
 /* ---- Init / cleanup ---- */
 
+/*
+ * Allocate a cm_ctx, create the rdma_cm_id with our handler, and stash
+ * the ctx in id->context. On failure both the ctx and id are released.
+ */
+static int urp_make_cm_id(struct urp_endpoint *ep, u32 qp_index,
+			  bool is_listener, struct rdma_cm_id **out)
+{
+	struct urp_cm_ctx *ctx;
+	struct rdma_cm_id *id;
+
+	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	if (!ctx)
+		return -ENOMEM;
+	ctx->ep = ep;
+	ctx->qp_index = qp_index;
+	ctx->is_listener = is_listener;
+
+	id = rdma_create_id(&init_net, urp_cm_handler, ctx,
+			    RDMA_PS_TCP, IB_QPT_RC);
+	if (IS_ERR(id)) {
+		kfree(ctx);
+		return PTR_ERR(id);
+	}
+
+	*out = id;
+	return 0;
+}
+
 int urp_rdma_init(struct urp_endpoint *ep, const char *peer_addr,
 		  int peer_port, int bind_port, bool is_initiator)
 {
 	struct sockaddr_in addr;
 	int ret;
-
-	/*
-	 * Phase 3a Step 2 scaffold: the per-QP arrays are allocated and
-	 * urp_qp.c selectors / index_of work for any num_qps, but the
-	 * rdma_cm flow below still uses a single cm_id. Step 2b will
-	 * replace the single rdma_create_id call with one per QP.
-	 */
-	if (ep->num_qps != 1) {
-		pr_err("urp: num_qps=%u not yet supported (Step 2b lands multi-cm-id)\n",
-		       ep->num_qps);
-		return -EOPNOTSUPP;
-	}
-
-	ep->cm_id = rdma_create_id(&init_net, urp_cm_handler, ep,
-				   RDMA_PS_TCP, IB_QPT_RC);
-	if (IS_ERR(ep->cm_id)) {
-		pr_err("urp: rdma_create_id failed\n");
-		return PTR_ERR(ep->cm_id);
-	}
+	u32 i;
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
 
 	if (is_initiator) {
-		/* Initiator: resolve peer address and connect */
 		addr.sin_port = htons(peer_port);
 		addr.sin_addr.s_addr = in_aton(peer_addr);
 
-		ret = rdma_resolve_addr(ep->cm_id, NULL,
-					(struct sockaddr *)&addr, 2000);
-		if (ret) {
-			pr_err("urp: rdma_resolve_addr failed: %d\n", ret);
-			goto err_destroy;
-		}
-	} else {
-		/* Acceptor: bind and listen for incoming RDMA connections */
-		addr.sin_port = htons(bind_port);
-		addr.sin_addr.s_addr = htonl(INADDR_ANY);
+		for (i = 0; i < ep->num_qps; i++) {
+			struct rdma_cm_id *id;
 
-		ret = rdma_bind_addr(ep->cm_id, (struct sockaddr *)&addr);
-		if (ret) {
-			pr_err("urp: rdma_bind_addr failed: %d\n", ret);
-			goto err_destroy;
-		}
+			ret = urp_make_cm_id(ep, i, false, &id);
+			if (ret) {
+				pr_err("urp: cm_id %u create failed: %d\n",
+				       i, ret);
+				goto err_destroy_all;
+			}
 
-		ret = rdma_listen(ep->cm_id, 1);
-		if (ret) {
-			pr_err("urp: rdma_listen failed: %d\n", ret);
-			goto err_destroy;
-		}
+			ep->qps[i].cm_id = id;
 
-		pr_info("urp: RDMA listening on port %d\n", bind_port);
+			ret = rdma_resolve_addr(id, NULL,
+						(struct sockaddr *)&addr, 2000);
+			if (ret) {
+				pr_err("urp: rdma_resolve_addr[%u] failed: %d\n",
+				       i, ret);
+				goto err_destroy_all;
+			}
+		}
+		return 0;
 	}
 
+	/* Acceptor: single listener; CONNECT_REQUESTs populate ep->qps[]. */
+	addr.sin_port = htons(bind_port);
+	addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+	ret = urp_make_cm_id(ep, 0, true, &ep->listen_id);
+	if (ret) {
+		pr_err("urp: listener cm_id create failed: %d\n", ret);
+		return ret;
+	}
+
+	ret = rdma_bind_addr(ep->listen_id, (struct sockaddr *)&addr);
+	if (ret) {
+		pr_err("urp: rdma_bind_addr failed: %d\n", ret);
+		goto err_destroy_listen;
+	}
+
+	ret = rdma_listen(ep->listen_id, ep->num_qps);
+	if (ret) {
+		pr_err("urp: rdma_listen failed: %d\n", ret);
+		goto err_destroy_listen;
+	}
+
+	pr_info("urp: RDMA listening on port %d for %u QPs\n",
+		bind_port, ep->num_qps);
 	return 0;
 
-err_destroy:
-	rdma_destroy_id(ep->cm_id);
-	ep->cm_id = NULL;
+err_destroy_listen:
+	{
+		struct urp_cm_ctx *ctx = ep->listen_id->context;
+
+		rdma_destroy_id(ep->listen_id);
+		kfree(ctx);
+		ep->listen_id = NULL;
+	}
+	return ret;
+
+err_destroy_all:
+	for (i = 0; i < ep->num_qps; i++) {
+		if (ep->qps[i].cm_id) {
+			struct urp_cm_ctx *ctx = ep->qps[i].cm_id->context;
+
+			rdma_destroy_id(ep->qps[i].cm_id);
+			kfree(ctx);
+			ep->qps[i].cm_id = NULL;
+		}
+	}
 	return ret;
 }
 
 void urp_rdma_cleanup(struct urp_endpoint *ep)
 {
-	if (!ep->cm_id)
-		return;
+	struct ib_device *dev = ep->ib_dev;
+	u32 i;
 
-	/* Disconnect and drain outstanding work before freeing resources */
-	if (ep->connected) {
-		rdma_disconnect(ep->cm_id);
-		ep->connected = false;
+	/* Disconnect all established QPs. */
+	if (ep->qps) {
+		for (i = 0; i < ep->num_qps; i++) {
+			if (ep->qps[i].established && ep->qps[i].cm_id) {
+				rdma_disconnect(ep->qps[i].cm_id);
+				ep->qps[i].established = false;
+			}
+		}
+
+		/* Drain and destroy each QP. */
+		for (i = 0; i < ep->num_qps; i++) {
+			if (ep->qps[i].qp) {
+				ib_drain_qp(ep->qps[i].qp);
+				rdma_destroy_qp(ep->qps[i].cm_id);
+				ep->qps[i].qp = NULL;
+			}
+		}
+
+		/* Free per-QP cm_ids (and their cm_ctx). */
+		for (i = 0; i < ep->num_qps; i++) {
+			if (ep->qps[i].cm_id) {
+				struct urp_cm_ctx *ctx = ep->qps[i].cm_id->context;
+
+				rdma_destroy_id(ep->qps[i].cm_id);
+				kfree(ctx);
+				ep->qps[i].cm_id = NULL;
+			}
+		}
 	}
 
-	if (ep->qps && ep->qps[0].qp) {
-		ib_drain_qp(ep->qps[0].qp);
-		rdma_destroy_qp(ep->cm_id);
-		ep->qps[0].qp = NULL;
-		ep->qps[0].cm_id = NULL;
-		ep->qps[0].established = false;
-	}
+	ep->connected = false;
 
+	/* Shared resources -- only present once any QP setup completed. */
 	if (ep->send_cq) {
 		ib_free_cq(ep->send_cq);
 		ep->send_cq = NULL;
@@ -525,20 +747,18 @@ void urp_rdma_cleanup(struct urp_endpoint *ep)
 		ib_free_cq(ep->recv_cq);
 		ep->recv_cq = NULL;
 	}
-
-	if (ep->pd) {
-		struct ib_device *dev = ep->cm_id->device;
-
+	if (ep->pd && dev) {
 		urp_bufs_cleanup(ep, dev);
 		ib_dealloc_pd(ep->pd);
 		ep->pd = NULL;
 	}
-
-	rdma_destroy_id(ep->cm_id);
-	ep->cm_id = NULL;
+	ep->ib_dev = NULL;
 
 	if (ep->listen_id) {
+		struct urp_cm_ctx *ctx = ep->listen_id->context;
+
 		rdma_destroy_id(ep->listen_id);
+		kfree(ctx);
 		ep->listen_id = NULL;
 	}
 }

@@ -70,7 +70,7 @@ static int urp_tx_thread_fn(void *data)
 				 len);
 
 		/* DMA sync for send */
-		ib_dma_sync_single_for_device(ep->cm_id->device,
+		ib_dma_sync_single_for_device(ep->ib_dev,
 					      buf->dma_addr,
 					      URP_FRAME_HEADER_SIZE + len,
 					      DMA_TO_DEVICE);

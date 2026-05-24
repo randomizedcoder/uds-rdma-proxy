@@ -79,16 +79,34 @@ struct urp_endpoint;	/* forward decl for struct urp_qp */
  * struct urp_qp - per-QP runtime state
  *
  * One entry per QP in ep->qps[]. Holds the verbs QP handle (set after
- * rdma_create_qp), connectedness, and a back-pointer to the owning
- * endpoint for CM-event dispatch. Phase 3a Step 4 will add credit
- * tracking; Phase 3b will add probe state (RTT EWMA, consecutive_misses).
+ * rdma_create_qp), per-QP rdma_cm_id, connectedness, and a back-pointer
+ * to the owning endpoint for CM-event dispatch. Phase 3a Step 4 will
+ * add credit tracking; Phase 3b will add probe state (RTT EWMA,
+ * consecutive_misses).
  */
 struct urp_qp {
 	struct urp_endpoint	*ep;		/* back-pointer */
-	struct rdma_cm_id	*cm_id;		/* per-QP CM id (Step 2b); aliases ep->cm_id in 2a */
+	struct rdma_cm_id	*cm_id;		/* per-QP CM id */
 	struct ib_qp		*qp;
 	u32			index;		/* position in ep->qps[] */
 	bool			established;	/* set on RDMA_CM_EVENT_ESTABLISHED */
+};
+
+/*
+ * struct urp_cm_ctx - context attached to every rdma_cm_id created by urp
+ *
+ * Allocated by urp_rdma_init (or by the listener handler when a child
+ * cm_id is accepted) and stashed in id->context. The CM handler reads
+ * this on every event so the per-cm-id work can find both the owning
+ * endpoint and (for per-QP cm_ids) the QP slot to update.
+ *
+ * Freed at cm_id destroy time. For the listener cm_id, is_listener is
+ * true and qp_index is unused.
+ */
+struct urp_cm_ctx {
+	struct urp_endpoint	*ep;
+	u32			qp_index;
+	bool			is_listener;
 };
 
 /*
@@ -140,16 +158,17 @@ struct urp_endpoint {
 	struct task_struct	*accept_thread;
 	struct urp_connection	conn;
 
-	/* RDMA side */
-	struct rdma_cm_id	*cm_id;		/* active connection (or listener before connect); Step 2b will move this into ep->qps[i].cm_id */
-	struct rdma_cm_id	*listen_id;	/* acceptor: listener CM ID kept for cleanup */
+	/* RDMA side -- shared across all QPs of this endpoint */
+	struct rdma_cm_id	*listen_id;	/* acceptor: listener CM ID */
+	struct ib_device	*ib_dev;	/* cached on first QP setup */
 	struct ib_pd		*pd;
 	struct ib_cq		*send_cq;
 	struct ib_cq		*recv_cq;
 
-	/* Multi-QP state (Phase 3a Step 2) */
+	/* Multi-QP state (Phase 3a Step 2 scaffold; Step 2b fills it) */
 	struct urp_qp	*qps;		/* array of num_qps entries; allocated in activate */
 	atomic_t		qps_connected;	/* count of QPs in ESTABLISHED state */
+	atomic_t		qps_accepted;	/* acceptor: count of CONNECT_REQUESTs processed */
 	atomic_t		rr_counter;	/* round-robin selector cursor */
 
 	/* Buffer pool */
@@ -200,8 +219,8 @@ struct urp_buffer *urp_buf_alloc_send(struct urp_endpoint *ep);
 void urp_buf_free_send(struct urp_endpoint *ep, struct urp_buffer *buf);
 struct urp_buffer *urp_buf_alloc_recv(struct urp_endpoint *ep);
 void urp_buf_free_recv(struct urp_endpoint *ep, struct urp_buffer *buf);
-int  urp_post_recv(struct urp_endpoint *ep, struct urp_buffer *buf);
-int  urp_post_recv_all(struct urp_endpoint *ep);
+int  urp_post_recv(struct urp_endpoint *ep, struct ib_qp *qp, struct urp_buffer *buf);
+int  urp_post_recv_for_qp(struct urp_endpoint *ep, struct ib_qp *qp, u32 count);
 
 /* urp_qp.c -- per-QP state and selection (Phase 3a Step 2) */
 int  urp_qps_init(struct urp_endpoint *ep);
