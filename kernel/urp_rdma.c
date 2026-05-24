@@ -12,6 +12,7 @@
 
 #include "urp.h"
 #include <linux/inet.h>
+#include <linux/ktime.h>
 
 /* ---- Buffer pool ---- */
 
@@ -380,16 +381,45 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 	/*
 	 * Phase 3b PROBE handling.
 	 *   flags == 0                       -> PING (Step 3): emit PONG
-	 *   flags has URP_PROBE_FLAG_PONG    -> PONG (Step 4 will compute
-	 *                                       RTT here); for now repost.
+	 *   flags has URP_PROBE_FLAG_PONG    -> PONG (Step 4): compute
+	 *                                       RTT, update per-QP EWMA,
+	 *                                       reset consecutive_misses
 	 * In both cases the frame is not delivered to UDS.
 	 */
 	if (urp_frame_decode_type(buf->data) == URP_FRAME_TYPE_PROBE) {
 		u8 pflags = urp_frame_decode_flags(buf->data);
+		const void *payload = buf->data + URP_FRAME_HEADER_SIZE;
 
-		if (!(pflags & URP_PROBE_FLAG_PONG))
-			urp_emit_pong_on(ep, wc->qp,
-					 buf->data + URP_FRAME_HEADER_SIZE);
+		if (pflags & URP_PROBE_FLAG_PONG) {
+			int qp_idx = urp_qp_index_of(ep, wc->qp);
+
+			if (qp_idx >= 0) {
+				struct urp_qp *q = &ep->qps[qp_idx];
+				u64 t_send_mono =
+					urp_ping_decode_t_send_mono(payload);
+				u64 now = ktime_get_ns();
+
+				if (now > t_send_mono) {
+					u64 rtt = now - t_send_mono;
+					/*
+					 * EWMA alpha = 0.2 in integer math:
+					 *   new = old * 4/5 + rtt * 1/5
+					 * First sample (rtt_ewma_ns == 0)
+					 * seeds directly so we don't pull the
+					 * baseline toward zero.
+					 */
+					if (q->rtt_ewma_ns == 0)
+						q->rtt_ewma_ns = rtt;
+					else
+						q->rtt_ewma_ns =
+							(q->rtt_ewma_ns * 4 +
+							 rtt) / 5;
+					q->consecutive_misses = 0;
+				}
+			}
+		} else {
+			urp_emit_pong_on(ep, wc->qp, payload);
+		}
 		goto repost;
 	}
 
