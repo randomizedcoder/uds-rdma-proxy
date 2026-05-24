@@ -327,6 +327,7 @@ void urp_endpoint_drain_all(void);
 /* urp_socket.c */
 int  urp_socket_init(struct urp_endpoint *ep, const char *path);
 void urp_socket_cleanup(struct urp_endpoint *ep);
+void urp_socket_conn_cleanup(struct urp_endpoint *ep);
 int  urp_connect_uds(struct urp_endpoint *ep, const char *path);
 int  urp_stream_connect_uds(struct urp_stream *stream, const char *path);
 

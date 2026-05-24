@@ -234,6 +234,44 @@ int urp_socket_init(struct urp_endpoint *ep, const char *path)
 	return 0;
 }
 
+/*
+ * Tear down the legacy single-connection state on the acceptor when
+ * the peer disconnects (or pre-emptively on a fresh CONNECT_REQUEST
+ * if the previous teardown didn't fire). Phase 4 Step 5.
+ *
+ * Order matters:
+ *   1. set conn.active = false so the pump loop's outer while
+ *      condition will exit on its next iteration.
+ *   2. kernel_sock_shutdown(SHUT_RDWR) wakes any pending
+ *      kernel_recvmsg in the pump kthread with -ENOTCONN, so
+ *      kthread_stop below doesn't block indefinitely.
+ *   3. urp_pump_stop kthread_stop's the pump and waits for it to
+ *      exit. Without step 2 this would deadlock when the pump is
+ *      asleep in recvmsg.
+ *   4. sock_release the UDS socket.
+ *
+ * Idempotent: safe to call when conn is already clean (callers may
+ * defensively invoke it without checking).
+ */
+void urp_socket_conn_cleanup(struct urp_endpoint *ep)
+{
+	struct socket *sock = ep->conn.uds_sock;
+
+	if (!ep->conn.active && !sock && !ep->conn.tx_thread)
+		return;
+
+	ep->conn.active = false;
+	if (sock)
+		kernel_sock_shutdown(sock, SHUT_RDWR);
+
+	urp_pump_stop(ep);	/* joins tx_thread (now unblocked by shutdown) */
+
+	if (sock) {
+		sock_release(sock);
+		ep->conn.uds_sock = NULL;
+	}
+}
+
 void urp_socket_cleanup(struct urp_endpoint *ep)
 {
 	if (ep->accept_thread) {
@@ -241,12 +279,7 @@ void urp_socket_cleanup(struct urp_endpoint *ep)
 		ep->accept_thread = NULL;
 	}
 
-	if (ep->conn.uds_sock) {
-		ep->conn.active = false;
-		kernel_sock_shutdown(ep->conn.uds_sock, SHUT_RDWR);
-		sock_release(ep->conn.uds_sock);
-		ep->conn.uds_sock = NULL;
-	}
+	urp_socket_conn_cleanup(ep);
 
 	if (ep->listen_sock) {
 		kernel_sock_shutdown(ep->listen_sock, SHUT_RDWR);

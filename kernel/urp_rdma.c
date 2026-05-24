@@ -682,8 +682,16 @@ static int urp_cm_accept_one(struct rdma_cm_id *child, struct urp_endpoint *ep,
 	 * transitions to RTS already have somewhere to go -- same reason as
 	 * the k0 single-QP path. Subsequent accepted QPs share the same
 	 * pump (it round-robins across qps[] via urp_qp_select_round_robin).
+	 *
+	 * Phase 4 Step 5: defensive cleanup of any prior ep->conn state.
+	 * The matching DISCONNECTED handler should have torn this down
+	 * already, but if events arrive out of order (the kernel doesn't
+	 * always emit DISCONNECTED before the next CONNECT_REQUEST when
+	 * the peer slams the connection), the previous pump kthread
+	 * would otherwise survive and racing with the new one.
 	 */
 	if (qp_index == 0 && ep->connect_path[0]) {
+		urp_socket_conn_cleanup(ep);
 		ret = urp_connect_uds(ep, ep->connect_path);
 		if (!ret)
 			ret = urp_pump_start(ep);
@@ -826,6 +834,18 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 					atomic_dec(&ep->qps_accepted);
 			}
 		}
+		/*
+		 * Phase 4 Step 5: on the acceptor's primary QP, tear down
+		 * the legacy ep->conn before the next test client reconnects.
+		 * Without this, urp_cm_accept_one for the new client overwrites
+		 * conn->uds_sock + conn->tx_thread, orphaning the previous
+		 * pump kthread and leaking ~16 KB stack + struct socket per
+		 * connect/disconnect cycle. The 1-hour soak found this -- the
+		 * leak rate was ~210 kB/cycle (the orphan pump plus auxiliary
+		 * state). Pre-fix: 12 urp-tx kthreads after ~30 churn cycles.
+		 */
+		if (!ep->is_initiator && ctx->qp_index == 0)
+			urp_socket_conn_cleanup(ep);
 		ep->cm_status = event->status;
 		complete(&ep->cm_done);
 		pr_info("urp: QP %u CM down: %s\n", ctx->qp_index,
