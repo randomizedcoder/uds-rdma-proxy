@@ -268,6 +268,9 @@ struct urp_endpoint {
 	struct ib_srq		*srq;		/* shared receive queue (Step 3) */
 	u32			srq_pool_target;
 
+	/* Phase 4 Step 1: kernel page_pool backing the buffer cache. */
+	struct page_pool	*page_pool;
+
 	/* Multi-QP state (Phase 3a Step 2 scaffold; Step 2b fills it) */
 	struct urp_qp	*qps;		/* array of num_qps entries; allocated in activate */
 	atomic_t		qps_connected;	/* count of QPs in ESTABLISHED state */

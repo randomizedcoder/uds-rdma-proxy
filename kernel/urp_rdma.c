@@ -13,11 +13,40 @@
 #include "urp.h"
 #include <linux/inet.h>
 #include <linux/ktime.h>
+#include <net/page_pool/helpers.h>
+#include <net/page_pool/types.h>
 
-/* ---- Buffer pool ---- */
+/* ---- Buffer pool (Phase 4 Step 1: kernel page_pool) ----
+ *
+ * page_pool replaces our hand-rolled alloc_page with the standard
+ * kernel pool that NIC drivers use. We deliberately do NOT use
+ * PP_FLAG_DMA_MAP: software RDMA (rxe / siw) ib_devices have
+ * `dma_device == NULL` and override `dma_ops`, so the DMA address has
+ * to come from ib_dma_map_page rather than dma_map_page (which is what
+ * PP_FLAG_DMA_MAP calls under the covers). For hardware RDMA NICs the
+ * two paths happen to be equivalent, but doing it this way keeps the
+ * rxe-based test environment working unchanged -- this was the plan's
+ * "primary k2 engineering risk" (Plan §4.1) and the answer is
+ * "page_pool for page lifecycle, ib_dma_map_page for the mapping."
+ *
+ * Hot-path callers (urp_buf_alloc_send/recv) are unchanged: pages are
+ * allocated up front, attached to urp_buffer slots, and the free list
+ * keeps the existing spinlock semantics. page_pool_put_page is only
+ * called at endpoint teardown, just before page_pool_destroy.
+ */
 
 static int urp_bufs_init(struct urp_endpoint *ep, struct ib_device *dev)
 {
+	struct page_pool_params pp = {
+		.flags		= 0,	/* no DMA mapping -- see comment above */
+		.order		= 0,
+		.pool_size	= URP_NUM_BUFS,
+		.nid		= NUMA_NO_NODE,
+		.dev		= NULL,
+		.dma_dir	= DMA_BIDIRECTIONAL,
+		.max_len	= URP_BUF_SIZE,
+		.offset		= 0,
+	};
 	int i;
 
 	INIT_LIST_HEAD(&ep->send_free);
@@ -25,22 +54,31 @@ static int urp_bufs_init(struct urp_endpoint *ep, struct ib_device *dev)
 	spin_lock_init(&ep->send_lock);
 	spin_lock_init(&ep->recv_lock);
 
+	ep->page_pool = page_pool_create(&pp);
+	if (IS_ERR(ep->page_pool)) {
+		int ret = PTR_ERR(ep->page_pool);
+
+		ep->page_pool = NULL;
+		pr_err("urp: page_pool_create failed: %d\n", ret);
+		return ret;
+	}
+
 	for (i = 0; i < URP_NUM_BUFS; i++) {
 		struct urp_buffer *buf = &ep->bufs[i];
 
 		buf->index = i;
-		buf->page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		buf->page = page_pool_dev_alloc_pages(ep->page_pool);
 		if (!buf->page) {
-			pr_err("urp: alloc_page failed for buf %d\n", i);
+			pr_err("urp: page_pool_dev_alloc_pages failed for buf %d\n", i);
 			goto err;
 		}
 
 		buf->data = page_address(buf->page);
 		buf->dma_addr = ib_dma_map_page(dev, buf->page, 0,
-						 URP_BUF_SIZE, DMA_BIDIRECTIONAL);
+						URP_BUF_SIZE, DMA_BIDIRECTIONAL);
 		if (ib_dma_mapping_error(dev, buf->dma_addr)) {
-			pr_err("urp: DMA map failed for buf %d\n", i);
-			__free_page(buf->page);
+			pr_err("urp: ib_dma_map_page failed for buf %d\n", i);
+			page_pool_put_page(ep->page_pool, buf->page, -1, false);
 			buf->page = NULL;
 			goto err;
 		}
@@ -61,17 +99,18 @@ static int urp_bufs_init(struct urp_endpoint *ep, struct ib_device *dev)
 	return 0;
 
 err:
-	/* Clean up already-allocated buffers */
 	for (i = i - 1; i >= 0; i--) {
 		struct urp_buffer *buf = &ep->bufs[i];
 
 		if (buf->page) {
-			ib_dma_unmap_page(dev, buf->dma_addr,
-					  URP_BUF_SIZE, DMA_BIDIRECTIONAL);
-			__free_page(buf->page);
+			ib_dma_unmap_page(dev, buf->dma_addr, URP_BUF_SIZE,
+					  DMA_BIDIRECTIONAL);
+			page_pool_put_page(ep->page_pool, buf->page, -1, false);
 			buf->page = NULL;
 		}
 	}
+	page_pool_destroy(ep->page_pool);
+	ep->page_pool = NULL;
 	return -ENOMEM;
 }
 
@@ -79,17 +118,23 @@ static void urp_bufs_cleanup(struct urp_endpoint *ep, struct ib_device *dev)
 {
 	int i;
 
+	if (!ep->page_pool)
+		return;
+
 	for (i = 0; i < URP_NUM_BUFS; i++) {
 		struct urp_buffer *buf = &ep->bufs[i];
 
 		if (!buf->page)
 			continue;
 
-		ib_dma_unmap_page(dev, buf->dma_addr,
-				  URP_BUF_SIZE, DMA_BIDIRECTIONAL);
-		__free_page(buf->page);
+		ib_dma_unmap_page(dev, buf->dma_addr, URP_BUF_SIZE,
+				  DMA_BIDIRECTIONAL);
+		page_pool_put_page(ep->page_pool, buf->page, -1, false);
 		buf->page = NULL;
 	}
+
+	page_pool_destroy(ep->page_pool);
+	ep->page_pool = NULL;
 }
 
 struct urp_buffer *urp_buf_alloc_send(struct urp_endpoint *ep)
