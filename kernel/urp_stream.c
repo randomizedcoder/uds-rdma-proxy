@@ -151,7 +151,12 @@ void urp_stream_destroy(struct urp_endpoint *ep, struct urp_stream *s)
 
 	rhashtable_remove_fast(&ep->streams, &s->ht_node, urp_stream_params);
 
+	/* Stop the per-stream TX kthread before we release its uds_sock,
+	 * so the kthread never reads from a half-freed socket. (Step 7c) */
+	urp_stream_pump_stop(s);
+
 	if (s->uds_sock) {
+		kernel_sock_shutdown(s->uds_sock, SHUT_RDWR);
 		sock_release(s->uds_sock);
 		s->uds_sock = NULL;
 	}
@@ -202,6 +207,24 @@ int urp_stream_rx_syn(struct urp_endpoint *ep, u32 stream_id,
 	mutex_lock(&s->lock);
 	s->state = URP_STREAM_STATE_SYN_RECEIVED;
 	mutex_unlock(&s->lock);
+
+	/*
+	 * Acceptor-side multi-stream wiring (Phase 3a Step 7c). When the
+	 * endpoint has a connect_path (we're the URP acceptor of an external
+	 * peer's RDMA connection), open a fresh UDS to the backend for this
+	 * stream and spin up its TX pump. The initiator side instead
+	 * populates uds_sock from its UDS accept loop and starts the pump
+	 * there.
+	 *
+	 * Failure here doesn't tear the stream down -- we leave it in
+	 * SYN_RECEIVED with no UDS, RX dispatch will drop subsequent frames
+	 * (counted in buffer_alloc_fails), and the drain path cleans up.
+	 */
+	if (!ep->is_initiator && ep->connect_path[0]) {
+		if (urp_stream_connect_uds(s, ep->connect_path) == 0)
+			urp_stream_pump_start(s);
+	}
+
 	*out_stream = s;
 	return 0;
 }

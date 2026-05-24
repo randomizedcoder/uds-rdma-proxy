@@ -170,6 +170,7 @@ struct urp_stream {
 	struct urp_reorder	*reorder;	/* per-stream reorder buffer */
 
 	struct socket		*uds_sock;	/* this stream's UDS endpoint */
+	struct task_struct	*tx_thread;	/* per-stream TX kthread (Step 7c) */
 
 	struct rhash_head	ht_node;
 	struct rcu_head		rcu;
@@ -269,6 +270,7 @@ void urp_endpoint_drain_all(void);
 int  urp_socket_init(struct urp_endpoint *ep, const char *path);
 void urp_socket_cleanup(struct urp_endpoint *ep);
 int  urp_connect_uds(struct urp_endpoint *ep, const char *path);
+int  urp_stream_connect_uds(struct urp_stream *stream, const char *path);
 
 /* urp_rdma.c */
 int  urp_rdma_init(struct urp_endpoint *ep, const char *peer_addr,
@@ -315,6 +317,8 @@ int  urp_stream_rx_dispatch(struct urp_endpoint *ep, u32 stream_id, u8 flags,
 /* urp_pump.c */
 int  urp_pump_start(struct urp_endpoint *ep);
 void urp_pump_stop(struct urp_endpoint *ep);
+int  urp_stream_pump_start(struct urp_stream *stream);
+void urp_stream_pump_stop(struct urp_stream *stream);
 
 /* CQ completion callbacks (urp_rdma.c) -- used by pump when posting sends */
 void urp_send_done(struct ib_cq *cq, struct ib_wc *wc);

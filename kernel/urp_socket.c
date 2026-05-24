@@ -76,6 +76,47 @@ static int urp_accept_thread_fn(void *data)
 }
 
 /*
+ * Open a fresh UDS connection to @path and attach it to @stream
+ * (Phase 3a Step 7c). Used by the acceptor side to give each
+ * multi-stream entry its own backend UDS connection.
+ *
+ * On success the kernel takes ownership of the socket via
+ * stream->uds_sock; urp_stream_destroy will sock_release it.
+ */
+int urp_stream_connect_uds(struct urp_stream *stream, const char *path)
+{
+	struct socket *sock;
+	struct sockaddr_un addr;
+	int ret;
+
+	ret = sock_create_kern(&init_net, AF_UNIX, SOCK_STREAM, 0, &sock);
+	if (ret) {
+		pr_err("urp: stream %u sock_create_kern failed: %d\n",
+		       stream->id, ret);
+		return ret;
+	}
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	sized_strscpy(addr.sun_path, path, sizeof(addr.sun_path));
+
+	ret = kernel_connect(sock, (struct sockaddr_unsized *)&addr,
+			     offsetof(struct sockaddr_un, sun_path) +
+				     strlen(path) + 1,
+			     0);
+	if (ret) {
+		pr_err("urp: stream %u connect to %s failed: %d\n",
+		       stream->id, path, ret);
+		sock_release(sock);
+		return ret;
+	}
+
+	stream->uds_sock = sock;
+	pr_info("urp: stream %u connected to UDS %s\n", stream->id, path);
+	return 0;
+}
+
+/*
  * Connect to local UDS (acceptor mode).
  *
  * The acceptor side connects to a local application's UDS socket
