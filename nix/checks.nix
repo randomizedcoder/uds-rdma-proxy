@@ -36,26 +36,69 @@ let
       (pkgs.lib.hasSuffix ".h" baseName);
   };
 
-  # Build urp.ko against a given kernel package
-  buildUrpKo = kernelPackages: pkgs.stdenv.mkDerivation {
-    name = "urp-ko-${kernelPackages.kernel.version}";
-    inherit src;
-    nativeBuildInputs = [ pkgs.gnumake ] ++
-      kernelPackages.kernel.moduleBuildDependencies;
-    buildPhase =
-      let
-        kdir = "${kernelPackages.kernel.dev}/lib/modules/${kernelPackages.kernel.modDirVersion}/build";
-      in ''
-        make -C ${kdir} M=$PWD/kernel modules
+  # Build urp.ko against a given kernel package. The optional
+  # @rustFfi argument selects the Rust-backed reorder buffer
+  # (Phase 3a Step 5b): if non-null, its result/lib/liburp_protocol_ffi.a
+  # is copied into kernel/ and Kbuild sets CONFIG_URP_REORDER_RUST=y
+  # via KCFLAGS.
+  buildUrpKoWith = { kernelPackages, rustFfi ? null }:
+    pkgs.stdenv.mkDerivation {
+      name =
+        if rustFfi == null
+        then "urp-ko-${kernelPackages.kernel.version}"
+        else "urp-ko-rust-${kernelPackages.kernel.version}";
+      inherit src;
+      nativeBuildInputs = [ pkgs.gnumake ] ++
+        kernelPackages.kernel.moduleBuildDependencies;
+      buildPhase =
+        let
+          kdir = "${kernelPackages.kernel.dev}/lib/modules/${kernelPackages.kernel.modDirVersion}/build";
+          extraCfg = if rustFfi == null then "" else ''
+            # Pre-extract the Rust staticlib's objects so Kbuild can list
+            # them as urp-objs. ld -r (used to build module objects) does
+            # not pull symbols out of static archives the way a normal
+            # link would, so the cleanest option is to materialize the
+            # constituent .o files and link them directly.
+            mkdir -p kernel/rust_ffi
+            (cd kernel/rust_ffi && \
+                ar x ${rustFfi}/lib/liburp_protocol_ffi.a)
+
+            # Strip compiler_builtins x86 FMA helpers that objtool can't
+            # decode (compiler_builtins::math::libm_math::arch::x86::fma::*).
+            # The reorder buffer doesn't use floating point at all, so
+            # these are dead weight pulled in by rustc's standard
+            # library glue. Walk every extracted .o and drop sections
+            # whose name mentions compiler_builtins ... arch::x86::fma.
+            for o in kernel/rust_ffi/*.o; do
+              # List sections containing the problem prefix.
+              for sec in $(${pkgs.binutils}/bin/objdump -h "$o" \
+                  | awk '/compiler_builtins.*arch.*x86.*fma/ {print $2}'); do
+                ${pkgs.binutils}/bin/objcopy --remove-section="$sec" "$o" || true
+              done
+            done
+
+            export KCFLAGS="-DCONFIG_URP_REORDER_RUST=1"
+            export CONFIG_URP_REORDER_RUST=y
+          '';
+        in ''
+          ${extraCfg}
+          make -C ${kdir} M=$PWD/kernel \
+            ${if rustFfi == null then "" else "CONFIG_URP_REORDER_RUST=y"} \
+            modules
+        '';
+      installPhase = ''
+        mkdir -p $out/lib/modules/${kernelPackages.kernel.modDirVersion}
+        cp kernel/urp.ko $out/lib/modules/${kernelPackages.kernel.modDirVersion}/
       '';
-    installPhase = ''
-      mkdir -p $out/lib/modules/${kernelPackages.kernel.modDirVersion}
-      cp kernel/urp.ko $out/lib/modules/${kernelPackages.kernel.modDirVersion}/
-    '';
+    };
+
+  buildUrpKo = kernelPackages: buildUrpKoWith {
+    inherit kernelPackages;
+    rustFfi = null;
   };
 in
 {
-  inherit buildUrpKo;
+  inherit buildUrpKo buildUrpKoWith;
 
   # cargo test -- runs all protocol crate tests. Uses rustPlatform.buildRustPackage
   # so cargo dependencies are vendored from Cargo.lock rather than fetched from

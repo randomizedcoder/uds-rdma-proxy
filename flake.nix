@@ -30,6 +30,17 @@
         # CI: build against flake-pinned nixpkgs kernel
         urpKo = nixChecks.kernel-module-build;
 
+        # Phase 3a Step 5b: opt-in Rust-backed reorder buffer.
+        # Built with CONFIG_URP_REORDER_RUST=y so the kernel module
+        # links against liburp_protocol_ffi.a instead of compiling
+        # the native rbtree implementation. Same kernel target as
+        # urp-ko (linuxPackages_latest); switch via `nix build
+        # .#urp-ko-rust` and use that .ko in place of the default.
+        urpKoRust = nixChecks.buildUrpKoWith {
+          kernelPackages = pkgs.linuxPackages_latest;
+          rustFfi = urpProtocolFfi;
+        };
+
         urpTestClient = import ./nix/urp-test-client.nix { inherit pkgs; };
 
         urpCli = import ./nix/urp-cli.nix {
@@ -79,6 +90,7 @@
 
         packages = {
           urp-ko = urpKo;
+          urp-ko-rust = urpKoRust;
           urp-cli = urpCli;
           urp-protocol-ffi = urpProtocolFfi;
           test-kmod-k0 = testKmodK0;

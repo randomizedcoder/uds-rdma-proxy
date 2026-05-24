@@ -1,7 +1,30 @@
 obj-m := urp.o
 urp-objs := urp_main.o urp_socket.o urp_rdma.o urp_pump.o urp_proc.o \
 	    urp_endpoint.o urp_netlink.o urp_qp.o urp_srq.o urp_credit.o \
-	    urp_reorder.o urp_stream.o
+	    urp_stream.o
+
+# Phase 3a Step 5b: reorder backend selection. Default is the C
+# rbtree implementation; CONFIG_URP_REORDER_RUST=y swaps in the Rust
+# FFI shim. The Rust staticlib is pre-extracted by the Nix derivation
+# (or local build script) into kernel/rust_ffi/*.o so Kbuild can list
+# the objects in urp-objs alongside the shim. ld -r doesn't pull
+# unreferenced objects out of static archives, hence the extraction.
+ifeq ($(CONFIG_URP_REORDER_RUST),y)
+urp-objs += urp_reorder_rust.o $(patsubst $(src)/%.o,%.o,$(wildcard $(src)/rust_ffi/*.o))
+ccflags-y += -DCONFIG_URP_REORDER_RUST=1
+# objtool can't validate the Rust compiler-builtins' x86 FMA helpers
+# (compiler_builtins::math::libm_math::arch::x86::fma::fma_with_fma4
+# and friends). On CONFIG_X86_KERNEL_IBT=y kernels objtool is wired
+# into the multi-obj-m link via $(delay-objtool) -- OBJECT_FILES_NON_STANDARD
+# only disables the per-source pass, not the module-link pass.
+# Override the per-target make variable so the link step skips it; the
+# default C-only build (`nix build .#urp-ko`) keeps full objtool
+# coverage.
+urp.o: private objtool-enabled :=
+else
+urp-objs += urp_reorder.o
+endif
+
 urp-$(CONFIG_KUNIT) += urp_test.o
 
 ccflags-y += -I$(src)/include
