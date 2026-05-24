@@ -32,6 +32,7 @@
 #include <rdma/rdma_cm.h>
 
 #include "include/uapi/linux/urp.h"
+#include "urp_credit.h"
 
 /* Buffer pool sizing -- defaults; per-endpoint values override at create */
 #define URP_NUM_BUFS		64
@@ -90,6 +91,13 @@ struct urp_qp {
 	struct ib_qp		*qp;
 	u32			index;		/* position in ep->qps[] */
 	bool			established;	/* set on RDMA_CM_EVENT_ESTABLISHED */
+
+	/*
+	 * Step 4: per-QP credit-based flow control state. Initialized on
+	 * QP allocation; not yet wired into TX/RX (Step 4b adds the
+	 * consume-and-block + grant-frame emission).
+	 */
+	struct urp_credit	credit;
 };
 
 /*

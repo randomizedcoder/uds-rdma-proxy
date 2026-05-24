@@ -30,6 +30,12 @@ int urp_qps_init(struct urp_endpoint *ep)
 	for (i = 0; i < ep->num_qps; i++) {
 		ep->qps[i].ep = ep;
 		ep->qps[i].index = i;
+		/*
+		 * Step 4: initial credits. SRQ pool size is the natural
+		 * upper bound (peer can grant up to its SRQ population),
+		 * so use that. Step 4b wires the gate.
+		 */
+		urp_credit_init(&ep->qps[i].credit, URP_NUM_BUFS / 2);
 	}
 
 	atomic_set(&ep->qps_connected, 0);
