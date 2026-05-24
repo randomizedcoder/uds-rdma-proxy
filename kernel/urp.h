@@ -124,9 +124,23 @@ struct urp_qp {
 	 */
 	u32			probe_seq;
 	u32			consecutive_misses;
+	u32			consecutive_pongs;
 	u64			last_ping_ns;
 	u64			rtt_ewma_ns;
+
+	/*
+	 * Phase 3b Step 5: per-QP health state machine (design 08a §8a.9).
+	 * Values are from UAPI `enum urp_qp_state`
+	 * (QUALIFYING / ACTIVE / DRAINING / REMOVED). For now QPs start
+	 * directly in ACTIVE on RDMA_CM_EVENT_ESTABLISHED (Qualifying is
+	 * skipped pending a slow-interval probe phase); on >= 3
+	 * consecutive missed PONGs the state transitions to DRAINING and
+	 * urp_qp_select_round_robin stops dispatching on that QP.
+	 */
+	u8			health;
 };
+
+#define URP_QP_MISS_THRESHOLD	3
 
 /*
  * struct urp_cm_ctx - context attached to every rdma_cm_id created by urp

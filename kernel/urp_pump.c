@@ -331,6 +331,23 @@ static int urp_emit_ping_on(struct urp_endpoint *ep, struct urp_qp *qps)
 	if (!qps->established || !qps->qp)
 		return 0;
 
+	/* Step 5: miss detection. If the previous PING is still
+	 * outstanding (last_ping_ns != 0), no PONG arrived in time,
+	 * count a miss. On URP_QP_MISS_THRESHOLD consecutive misses
+	 * demote the QP to DRAINING -- urp_qp_select_round_robin
+	 * stops dispatching there until it recovers. PONGs reset
+	 * last_ping_ns and consecutive_misses (see urp_recv_done). */
+	if (qps->last_ping_ns) {
+		qps->consecutive_misses++;
+		qps->consecutive_pongs = 0;
+		if (qps->consecutive_misses >= URP_QP_MISS_THRESHOLD &&
+		    qps->health == URP_QP_STATE_ACTIVE) {
+			qps->health = URP_QP_STATE_DRAINING;
+			pr_warn("urp: QP %u demoted to DRAINING after %u misses\n",
+				qps->index, qps->consecutive_misses);
+		}
+	}
+
 	buf = urp_buf_alloc_send(ep);
 	if (!buf)
 		return -ENOBUFS;

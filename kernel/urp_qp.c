@@ -36,6 +36,9 @@ int urp_qps_init(struct urp_endpoint *ep)
 		 * so use that. Step 4b wires the gate.
 		 */
 		urp_credit_init(&ep->qps[i].credit, URP_NUM_BUFS / 2);
+		/* Step 5: start in QUALIFYING; RDMA_CM_EVENT_ESTABLISHED
+		 * promotes to ACTIVE (probe-driven Qualifying lands later). */
+		ep->qps[i].health = URP_QP_STATE_QUALIFYING;
 	}
 
 	atomic_set(&ep->qps_connected, 0);
@@ -70,8 +73,16 @@ struct urp_qp *urp_qp_select_round_robin(struct urp_endpoint *ep)
 		u32 idx = (u32)atomic_inc_return(&ep->rr_counter) % ep->num_qps;
 		struct urp_qp *qps = &ep->qps[idx];
 
-		if (qps->established && qps->qp)
-			return qps;
+		if (!qps->established || !qps->qp)
+			continue;
+		/* Step 5: skip QPs that probes have demoted out of the
+		 * working set (DRAINING / REMOVED). QUALIFYING and ACTIVE
+		 * both carry data -- QUALIFYING is the just-established
+		 * pre-promotion state, ACTIVE is the steady-state. */
+		if (qps->health == URP_QP_STATE_DRAINING ||
+		    qps->health == URP_QP_STATE_REMOVED)
+			continue;
+		return qps;
 	}
 
 	return NULL;

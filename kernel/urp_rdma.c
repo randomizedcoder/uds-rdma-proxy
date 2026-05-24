@@ -414,7 +414,16 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 						q->rtt_ewma_ns =
 							(q->rtt_ewma_ns * 4 +
 							 rtt) / 5;
+					/* Step 5: signal "PONG arrived for
+					 * the outstanding PING" by clearing
+					 * last_ping_ns; bump pong streak;
+					 * reset misses. A future Qualifying
+					 * promotion step will use
+					 * consecutive_pongs >= 3 to lift
+					 * the QP to ACTIVE. */
+					q->last_ping_ns = 0;
 					q->consecutive_misses = 0;
+					q->consecutive_pongs++;
 				}
 			}
 		} else {
@@ -685,6 +694,11 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 	case RDMA_CM_EVENT_ESTABLISHED:
 		if (ep->qps && ctx->qp_index < ep->num_qps) {
 			ep->qps[ctx->qp_index].established = true;
+			/* Step 5: skip the probe-driven QUALIFYING grace
+			 * period for now and go straight to ACTIVE. The
+			 * miss-counter in probe_work_fn still demotes to
+			 * DRAINING on >= URP_QP_MISS_THRESHOLD misses. */
+			ep->qps[ctx->qp_index].health = URP_QP_STATE_ACTIVE;
 			if ((u32)atomic_inc_return(&ep->qps_connected) ==
 			    ep->num_qps) {
 				ep->connected = true;
