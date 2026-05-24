@@ -130,7 +130,7 @@ static int urp_fill_endpoint(struct sk_buff *skb, struct urp_endpoint *ep,
 				struct urp_qp *q = &ep->qps[i];
 				struct nlattr *qp_entry;
 				u8 qp_state = q->established
-					? URP_QP_STATE_ACTIVE
+					? q->health
 					: URP_QP_STATE_QUALIFYING;
 
 				qp_entry = nla_nest_start(skb, i + 1);
@@ -139,8 +139,9 @@ static int urp_fill_endpoint(struct sk_buff *skb, struct urp_endpoint *ep,
 
 				if (nla_put_u32(skb, URP_QP_A_INDEX, q->index) ||
 				    nla_put_u8(skb, URP_QP_A_STATE, qp_state) ||
-				    /* RTT lands in Phase 3b with probes */
-				    nla_put_u64_64bit(skb, URP_QP_A_RTT_NS, 0, 0) ||
+				    /* Step 6: real per-QP EWMA RTT (was 0). */
+				    nla_put_u64_64bit(skb, URP_QP_A_RTT_NS,
+						      q->rtt_ewma_ns, 0) ||
 				    nla_put_u64_64bit(skb, URP_QP_A_TX_BYTES,
 						      atomic64_read(&q->tx_bytes), 0) ||
 				    nla_put_u64_64bit(skb, URP_QP_A_RX_BYTES,
