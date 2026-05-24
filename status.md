@@ -15,7 +15,7 @@ carries phases 0, 1, 2, and 3a-Step-1 commits despite its name.
 | **0** — Skeleton | `docs/KERNEL-MODULE-PLAN.md` §0 | ✅ Committed (`3a32ffc`) |
 | **1 — k0** RDMA echo data path | `docs/KERNEL-MODULE-PLAN.md` §1 | ✅ Committed (`d440794`, `a986fe7`, `a600b17`) |
 | **2** — GENL control plane | `docs/KERNEL-MODULE-IMPLEMENTATION.md` §Phase 2 | ✅ Committed (`067829e`) |
-| **3a** — k1 data path | `~/.claude/profiles/siden/plans/floofy-stirring-donut.md` + `~/.claude/profiles/runpod/plans/this-repo-has-a-abundant-fern.md` | 🚧 **Steps 1, 2, 2b, 3, 4, 5, 6, 7 done (`c2eea2e`, `9dd0a70`, `f9f49b4`, `0fba325`, `728db70`, `3737132`, `e2ea525`, `f3f9903`); Steps 4b/5b/7b/8–10 pending** |
+| **3a** — k1 data path | `~/.claude/profiles/siden/plans/floofy-stirring-donut.md` + `~/.claude/profiles/runpod/plans/this-repo-has-a-abundant-fern.md` | 🚧 **Steps 1, 2, 2b, 3, 4, 5, 6, 7, 8 done (`c2eea2e`, `9dd0a70`, `f9f49b4`, `0fba325`, `728db70`, `3737132`, `e2ea525`, `f3f9903`, `70fafc6`); Steps 4b/5b/7b/9/10 pending** |
 | 3b — probes / PSK / extended observability | (deferred) | not started |
 | 3c — KUnit hardening + soak | (deferred) | not started |
 | 4 / 5 / 6 | per `docs/KERNEL-MODULE-PLAN.md` | not started |
@@ -71,7 +71,7 @@ Verified via Nix (no system Rust used):
 | 6 | Stream multiplexing core (scaffold) | `e2ea525` | done |
 | 7 | Stream lifecycle handlers | `f3f9903` | done |
 | 7b | Wire stream dispatch into RX/TX | — | pending |
-| 8 | GENL emitters wire up real state | — | pending |
+| 8 | GENL emitters wire up real state | `70fafc6` | done |
 | 9 | Integration test expansion + bench harness | — | pending |
 | 10 | Tracker polish + benchmark table | — | pending |
 
