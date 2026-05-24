@@ -363,6 +363,13 @@ static inline u32 urp_frame_decode_payload_len(const void *buf)
 	return get_unaligned_le32(p + 16);
 }
 
+static inline u32 urp_frame_decode_stream_id(const void *buf)
+{
+	const u8 *p = buf;
+
+	return get_unaligned_le32(p);
+}
+
 static inline u64 urp_frame_decode_seq(const void *buf)
 {
 	const u8 *p = buf;

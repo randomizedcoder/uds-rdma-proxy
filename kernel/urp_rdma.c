@@ -339,9 +339,12 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 {
 	struct urp_buffer *buf = container_of(wc->wr_cqe, struct urp_buffer, cqe);
 	struct urp_endpoint *ep = cq->cq_context;
+	struct socket *uds = NULL;
 	struct msghdr msg = {};
 	struct kvec iov;
 	u32 payload_len;
+	u32 stream_id;
+	u8 flags;
 	int ret;
 
 	if (wc->status != IB_WC_SUCCESS) {
@@ -359,15 +362,42 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 		goto repost;
 	}
 
-	if (!ep->conn.active || !ep->conn.uds_sock)
+	/*
+	 * Phase 3a Step 7b: dispatch by stream_id. stream_id == 0 is the
+	 * k0/legacy single-connection path -- frames go to ep->conn.
+	 * Non-zero stream_ids look up a per-stream UDS socket; SYN-flagged
+	 * frames may auto-create the stream entry via urp_stream_rx_syn,
+	 * but until 7c wires UDS-accept-allocates-stream the per-stream
+	 * uds_sock stays NULL, so non-zero stream traffic is dropped
+	 * with a counter rather than crashing.
+	 */
+	stream_id = urp_frame_decode_stream_id(buf->data);
+	flags = urp_frame_decode_flags(buf->data);
+
+	if (stream_id == 0) {
+		if (ep->conn.active && ep->conn.uds_sock)
+			uds = ep->conn.uds_sock;
+	} else {
+		struct urp_stream *s = NULL;
+
+		rcu_read_lock();
+		(void)urp_stream_rx_dispatch(ep, stream_id, flags, &s);
+		if (s)
+			uds = s->uds_sock;
+		rcu_read_unlock();
+	}
+
+	if (!uds) {
+		atomic64_inc(&ep->stats.buffer_alloc_fails);
 		goto repost;
+	}
 
 	/* Forward payload to UDS socket */
 	iov.iov_base = buf->data + URP_FRAME_HEADER_SIZE;
 	iov.iov_len = payload_len;
 	iov_iter_kvec(&msg.msg_iter, ITER_SOURCE, &iov, 1, payload_len);
 
-	ret = kernel_sendmsg(ep->conn.uds_sock, &msg, &iov, 1, payload_len);
+	ret = kernel_sendmsg(uds, &msg, &iov, 1, payload_len);
 	if (ret < 0) {
 		pr_err("urp: kernel_sendmsg failed: %d\n", ret);
 	} else {
