@@ -27,6 +27,7 @@
 
 #include "urp.h"
 #include <linux/slab.h>
+#include <linux/net.h>
 
 /*
  * Fixed-key rhashtable on u32 stream_id. Same default-hashing trick as
@@ -157,6 +158,182 @@ void urp_stream_destroy(struct urp_endpoint *ep, struct urp_stream *s)
 
 	mutex_destroy(&s->lock);
 	call_rcu(&s->rcu, urp_stream_rcu_free);
+}
+
+/*
+ * Handle a SYN-flagged frame arriving from the peer. Creates a stream
+ * for the given peer-assigned id if absent, transitions to
+ * SYN_RECEIVED, and returns the stream (locked-free; caller doesn't
+ * need to hold any lock for read of the returned pointer because RCU
+ * + table lookup keep it alive across the call).
+ *
+ * Idempotent: a duplicate SYN on an already-known stream is a no-op
+ * (returns the existing stream).
+ *
+ * Returns 0 on success and writes *out_stream. -ENOMEM on alloc
+ * failure. -EEXIST if the stream id was already in the table with a
+ * non-handshake state (sign of a peer protocol bug).
+ */
+int urp_stream_rx_syn(struct urp_endpoint *ep, u32 stream_id,
+		      struct urp_stream **out_stream)
+{
+	struct urp_stream *s;
+	int ret;
+
+	s = urp_stream_lookup(ep, stream_id);
+	if (s) {
+		mutex_lock(&s->lock);
+		if (s->state == URP_STREAM_STATE_SYN_SENT ||
+		    s->state == URP_STREAM_STATE_SYN_RECEIVED ||
+		    s->state == URP_STREAM_STATE_ESTABLISHED) {
+			s->state = URP_STREAM_STATE_ESTABLISHED;
+			mutex_unlock(&s->lock);
+			*out_stream = s;
+			return 0;
+		}
+		mutex_unlock(&s->lock);
+		return -EEXIST;
+	}
+
+	ret = urp_stream_create(ep, stream_id, &s);
+	if (ret)
+		return ret;
+
+	mutex_lock(&s->lock);
+	s->state = URP_STREAM_STATE_SYN_RECEIVED;
+	mutex_unlock(&s->lock);
+	*out_stream = s;
+	return 0;
+}
+
+/*
+ * Handle a FIN-flagged frame arriving from the peer. Implements the
+ * half-close semantics in design 09 §9.4: peer is done sending; we
+ * shutdown(SHUT_WR) the UDS so the local app sees EOF on read, but
+ * we keep reading from the UDS for any pending TX in this direction.
+ *
+ * When the local app eventually closes its side, the TX pump will
+ * emit a FIN of our own, fully closing the stream.
+ */
+int urp_stream_rx_fin(struct urp_stream *s)
+{
+	if (!s)
+		return -EINVAL;
+
+	mutex_lock(&s->lock);
+
+	if (s->uds_sock)
+		kernel_sock_shutdown(s->uds_sock, SHUT_WR);
+
+	if (s->state == URP_STREAM_STATE_ESTABLISHED)
+		s->state = URP_STREAM_STATE_CLOSE_WAIT;
+	else if (s->state == URP_STREAM_STATE_FIN_WAIT)
+		s->state = URP_STREAM_STATE_CLOSED;
+
+	mutex_unlock(&s->lock);
+	return 0;
+}
+
+/*
+ * Handle a RST-flagged frame arriving from the peer. Abrupt close --
+ * drop in-flight data and tear down the stream. The destroy itself is
+ * deferred via call_rcu so concurrent rhashtable walks still see the
+ * entry until their critical section ends.
+ */
+int urp_stream_rx_rst(struct urp_stream *s)
+{
+	struct urp_endpoint *ep;
+
+	if (!s)
+		return -EINVAL;
+
+	mutex_lock(&s->lock);
+	s->state = URP_STREAM_STATE_CLOSED;
+	if (s->uds_sock) {
+		kernel_sock_shutdown(s->uds_sock, SHUT_RDWR);
+	}
+	ep = s->ep;
+	mutex_unlock(&s->lock);
+
+	urp_stream_destroy(ep, s);
+	return 0;
+}
+
+/*
+ * Local-side send of FIN -- graceful close from our direction. The
+ * caller will emit a DATA frame with URP_DATA_FLAG_FIN; this helper
+ * just updates the stream-state machine. ESTABLISHED -> FIN_WAIT (we
+ * stop reading from UDS in this direction); CLOSE_WAIT -> CLOSED
+ * (peer already FIN'd, this is the second half).
+ */
+void urp_stream_tx_fin(struct urp_stream *s)
+{
+	if (!s)
+		return;
+
+	mutex_lock(&s->lock);
+	if (s->state == URP_STREAM_STATE_ESTABLISHED)
+		s->state = URP_STREAM_STATE_FIN_WAIT;
+	else if (s->state == URP_STREAM_STATE_CLOSE_WAIT)
+		s->state = URP_STREAM_STATE_CLOSED;
+	mutex_unlock(&s->lock);
+}
+
+/*
+ * Local-side send of RST -- abrupt close from our direction. The
+ * caller will emit a DATA frame with URP_DATA_FLAG_RST; this helper
+ * updates state. Subsequent calls to urp_stream_destroy reap the
+ * entry from the rhashtable.
+ */
+void urp_stream_tx_rst(struct urp_stream *s)
+{
+	if (!s)
+		return;
+
+	mutex_lock(&s->lock);
+	s->state = URP_STREAM_STATE_CLOSED;
+	if (s->uds_sock)
+		kernel_sock_shutdown(s->uds_sock, SHUT_RDWR);
+	mutex_unlock(&s->lock);
+}
+
+/*
+ * Frame-flag dispatcher used by the RX path (Step 7b will plumb the
+ * call from urp_recv_done). Examines the DATA frame's flags byte and
+ * fans out to syn/fin/rst handlers; pure-DATA frames (no flags)
+ * fall through to ordinary in-order delivery via the reorder buffer.
+ *
+ * For Step 7 this is exercised by KUnit only (Step 9). The wire-path
+ * call site lands in a follow-up commit alongside the multi-stream
+ * test in test-kmod-k0.
+ */
+int urp_stream_rx_dispatch(struct urp_endpoint *ep, u32 stream_id, u8 flags,
+			   struct urp_stream **out_stream)
+{
+	struct urp_stream *s = NULL;
+	int ret = 0;
+
+	if (flags & URP_DATA_FLAG_SYN) {
+		ret = urp_stream_rx_syn(ep, stream_id, &s);
+		if (ret)
+			return ret;
+	} else {
+		s = urp_stream_lookup(ep, stream_id);
+		if (!s)
+			return -ENOENT;
+	}
+
+	if (flags & URP_DATA_FLAG_RST) {
+		urp_stream_rx_rst(s);
+		*out_stream = NULL;
+		return 0;
+	}
+
+	if (flags & URP_DATA_FLAG_FIN)
+		urp_stream_rx_fin(s);
+
+	*out_stream = s;
+	return 0;
 }
 
 /* Walk the stream rhashtable and tear down every entry. Used at

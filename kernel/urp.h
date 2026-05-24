@@ -290,6 +290,16 @@ int  urp_stream_create(struct urp_endpoint *ep, u32 stream_id,
 struct urp_stream *urp_stream_lookup(struct urp_endpoint *ep, u32 stream_id);
 void urp_stream_destroy(struct urp_endpoint *ep, struct urp_stream *s);
 
+/* urp_stream.c -- lifecycle handlers (Phase 3a Step 7) */
+int  urp_stream_rx_syn(struct urp_endpoint *ep, u32 stream_id,
+		       struct urp_stream **out_stream);
+int  urp_stream_rx_fin(struct urp_stream *s);
+int  urp_stream_rx_rst(struct urp_stream *s);
+void urp_stream_tx_fin(struct urp_stream *s);
+void urp_stream_tx_rst(struct urp_stream *s);
+int  urp_stream_rx_dispatch(struct urp_endpoint *ep, u32 stream_id, u8 flags,
+			    struct urp_stream **out_stream);
+
 /* urp_pump.c */
 int  urp_pump_start(struct urp_endpoint *ep);
 void urp_pump_stop(struct urp_endpoint *ep);
