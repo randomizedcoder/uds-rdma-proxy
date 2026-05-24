@@ -15,7 +15,7 @@ carries phases 0, 1, 2, and 3a-Step-1 commits despite its name.
 | **0** — Skeleton | `docs/KERNEL-MODULE-PLAN.md` §0 | ✅ Committed (`3a32ffc`) |
 | **1 — k0** RDMA echo data path | `docs/KERNEL-MODULE-PLAN.md` §1 | ✅ Committed (`d440794`, `a986fe7`, `a600b17`) |
 | **2** — GENL control plane | `docs/KERNEL-MODULE-IMPLEMENTATION.md` §Phase 2 | ✅ Committed (`067829e`) |
-| **3a** — k1 data path | `~/.claude/profiles/siden/plans/floofy-stirring-donut.md` + `~/.claude/profiles/runpod/plans/this-repo-has-a-abundant-fern.md` | 🚧 **Steps 1, 2 done (`c2eea2e`, `9dd0a70`); Steps 2b–10 pending** |
+| **3a** — k1 data path | `~/.claude/profiles/siden/plans/floofy-stirring-donut.md` + `~/.claude/profiles/runpod/plans/this-repo-has-a-abundant-fern.md` | 🚧 **Steps 1, 2, 2b done (`c2eea2e`, `9dd0a70`, `f9f49b4`); Steps 3–10 pending** |
 | 3b — probes / PSK / extended observability | (deferred) | not started |
 | 3c — KUnit hardening + soak | (deferred) | not started |
 | 4 / 5 / 6 | per `docs/KERNEL-MODULE-PLAN.md` | not started |
@@ -62,7 +62,7 @@ Verified via Nix (no system Rust used):
 | Step | Subject | Commit | Status |
 |------|---------|--------|--------|
 | 2 | Multi-QP scaffold + round-robin selection | `9dd0a70` | done |
-| 2b | Actual N-QP multi-cm-id allocation | — | pending |
+| 2b | Actual N-QP multi-cm-id allocation | `f9f49b4` | done |
 | 3 | Shared Receive Queue (SRQ) | — | pending |
 | 4 | Per-QP credit flow control | — | pending |
 | 5 | Reorder buffer (C default + Rust opt-in) | — | pending |

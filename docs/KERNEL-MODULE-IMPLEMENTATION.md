@@ -2,7 +2,7 @@
 
 Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.md).
 
-**Last updated**: 2026-05-23 (Phase 3a Step 2 committed as `9dd0a70`)
+**Last updated**: 2026-05-23 (Phase 3a Steps 2 + 2b committed as `9dd0a70`, `f9f49b4`)
 
 ---
 
@@ -13,7 +13,7 @@ Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.
 | 0 | [Prerequisites](#phase-0-prerequisites) | Complete | 6/7 |
 | 1 | [k0 -- Proof of Concept](#phase-1-k0----proof-of-concept) | Complete | 7/9 (sanitizer items deferred) |
 | 2 | [urp CLI + GENL](#phase-2-urp-cli--genl-interface) | Complete (`067829e`) | 8/9 |
-| 3a | [k1 Data Path](#phase-3a-k1-data-path) | In Progress | 1/9 |
+| 3a | [k1 Data Path](#phase-3a-k1-data-path) | In Progress | 2/9 |
 | 3 | [k1 -- Functional](#phase-3-k1----functional) | In Progress (via 3a) | 0/14 |
 | 4 | [k2 -- Optimized](#phase-4-k2----optimized) | Not Started | 0/8 |
 | 5 | [MicroVM Integration](#phase-5-microvm-integration) | Not Started | 0/8 |
@@ -369,7 +369,7 @@ sub-plan lives in `~/.claude/profiles/siden/plans/floofy-stirring-donut.md`.
 |------|---------|--------|-------|
 | 1 | Rust->kernel FFI staticlib prerequisite | `c2eea2e` | staticlib + `kernel/include/urp_ffi.h` + `nix/urp-protocol-ffi.nix`. Consumed by Step 5 (Rust reorder backend). |
 | 2 | Multi-QP scaffold + round-robin selection | `9dd0a70` | `struct urp_qp`, `urp_qps_init/destroy/select_round_robin/index_of` in new `kernel/urp_qp.c`. Endpoint owns `ep->qps[]`. Single-cm-id flow preserved; `num_qps > 1` returns `-EOPNOTSUPP` until Step 2b. 19/19 `test-kmod-k0` still pass. |
-| 2b | Actual N-QP multi-cm-id allocation | pending | Replaces the `-EOPNOTSUPP` guard. N parallel `rdma_cm_id`s; data-path-ready gate fires when all reach `ESTABLISHED`. |
+| 2b | Actual N-QP multi-cm-id allocation | `f9f49b4` | Per-QP `rdma_cm_id`s via `struct urp_cm_ctx`. Initiator loops `num_qps` resolves; acceptor's listener fans out to N CONNECT_REQUESTs via slot allocator. Shared PD + CQs sized by `URP_CQ_ENTRIES * num_qps`. Test 12-15 (connect/disconnect/reconnect) exposed a latent flush-completion buffer leak that was masked in k0 by reinit-on-every-CONNECT_REQUEST; fixed by always returning buffers to the pool from send/recv_done. |
 | 3 | Shared Receive Queue (SRQ) | pending | `kernel/urp_srq.c`. |
 | 4 | Per-QP credit flow control | pending | `kernel/urp_credit.{c,h}`, 1:1 with `uds_rdma_protocol::credit::CreditState`. |
 | 5 | Reorder buffer (C rbtree default + Rust opt-in) | pending | `kernel/urp_reorder.{c,h}` + `urp_reorder_rust.c` + `kernel/Kconfig`. |
@@ -396,6 +396,14 @@ sub-plan lives in `~/.claude/profiles/siden/plans/floofy-stirring-donut.md`.
    `urp-vm` / `test-kmod-k0`) failed to build until the filter was
    extended in `e63db81`. Logged here so a future Phase 3a Step 5 doesn't
    re-trip the same issue when wiring up the FFI staticlib.
+4. **Flush-completion buffer-pool leak** -- the k0 send/recv done
+   callbacks bailed early on `IB_WC_WR_FLUSH_ERR` without returning the
+   buffer to the free list. k0 papered over this by re-initing the
+   entire buffer pool inside the CONNECT_REQUEST handler (so each new
+   client got a fresh pool). Step 2b's one-shot
+   `urp_endpoint_setup_shared` exposed the leak after the first
+   disconnect/reconnect cycle (Test 13 of `test-kmod-k0`). Fixed by
+   always returning the buffer to the pool, including on FLUSH_ERR.
 
 ---
 
