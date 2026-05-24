@@ -378,13 +378,20 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 	}
 
 	/*
-	 * Phase 3b Step 2: silently drop PROBE frames (PING / PONG). Step
-	 * 3 hooks PING -> emit PONG; Step 4 hooks PONG -> compute RTT.
-	 * Until then, the recv path just reposts the buffer so probes
-	 * don't end up delivered to UDS as garbage data.
+	 * Phase 3b PROBE handling.
+	 *   flags == 0                       -> PING (Step 3): emit PONG
+	 *   flags has URP_PROBE_FLAG_PONG    -> PONG (Step 4 will compute
+	 *                                       RTT here); for now repost.
+	 * In both cases the frame is not delivered to UDS.
 	 */
-	if (urp_frame_decode_type(buf->data) == URP_FRAME_TYPE_PROBE)
+	if (urp_frame_decode_type(buf->data) == URP_FRAME_TYPE_PROBE) {
+		u8 pflags = urp_frame_decode_flags(buf->data);
+
+		if (!(pflags & URP_PROBE_FLAG_PONG))
+			urp_emit_pong_on(ep, wc->qp,
+					 buf->data + URP_FRAME_HEADER_SIZE);
 		goto repost;
+	}
 
 	/*
 	 * Phase 3a Step 7b: dispatch DATA frames by stream_id. stream_id

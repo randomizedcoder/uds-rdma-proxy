@@ -343,6 +343,8 @@ int  urp_stream_pump_start(struct urp_stream *stream);
 void urp_stream_pump_stop(struct urp_stream *stream);
 int  urp_emit_credit_frame(struct urp_endpoint *ep, struct urp_qp *qps,
 			   u32 stream_id, u16 grants);
+int  urp_emit_pong_on(struct urp_endpoint *ep, struct ib_qp *qp,
+		      const void *ping_payload);
 void urp_probe_work_start(struct urp_endpoint *ep);
 void urp_probe_work_stop(struct urp_endpoint *ep);
 

@@ -403,6 +403,59 @@ void urp_probe_work_stop(struct urp_endpoint *ep)
 	}
 }
 
+/*
+ * Phase 3b Step 3: PONG emission. Called from the recv-completion
+ * handler when a PING frame arrives on @qps. Echoes the PING fields
+ * and appends our timestamps so the peer can compute RTT.
+ * Best-effort: drops the PONG silently on buffer / post failure.
+ */
+int urp_emit_pong_on(struct urp_endpoint *ep, struct ib_qp *qp,
+		     const void *ping_payload)
+{
+	struct urp_buffer *buf;
+	struct ib_send_wr wr = {};
+	const struct ib_send_wr *bad_wr;
+	u64 t_recv_real, t_pong_mono, t_pong_real;
+	int ret;
+
+	if (!qp)
+		return -EINVAL;
+
+	buf = urp_buf_alloc_send(ep);
+	if (!buf)
+		return -ENOBUFS;
+
+	t_recv_real = ktime_get_real_ns();
+	t_pong_mono = ktime_get_ns();
+	t_pong_real = t_recv_real;	/* "now" -- same wall-clock instant */
+
+	urp_frame_encode(buf->data, 0, 0, URP_FRAME_TYPE_PROBE,
+			 URP_PROBE_FLAG_PONG, 0, URP_PONG_PAYLOAD_SIZE);
+	urp_pong_encode(buf->data + URP_FRAME_HEADER_SIZE, ping_payload,
+			t_recv_real, t_pong_mono, t_pong_real);
+
+	ib_dma_sync_single_for_device(ep->ib_dev, buf->dma_addr,
+				      URP_FRAME_HEADER_SIZE +
+					      URP_PONG_PAYLOAD_SIZE,
+				      DMA_TO_DEVICE);
+
+	buf->sge.length = URP_FRAME_HEADER_SIZE + URP_PONG_PAYLOAD_SIZE;
+	buf->cqe.done = urp_send_done;
+	wr.wr_cqe = &buf->cqe;
+	wr.sg_list = &buf->sge;
+	wr.num_sge = 1;
+	wr.opcode = IB_WR_SEND;
+	wr.send_flags = IB_SEND_SIGNALED;
+
+	ret = ib_post_send(qp, &wr, &bad_wr);
+	if (ret) {
+		pr_warn_ratelimited("urp: PONG post_send failed: %d\n", ret);
+		urp_buf_free_send(ep, buf);
+		return ret;
+	}
+	return 0;
+}
+
 int urp_emit_credit_frame(struct urp_endpoint *ep, struct urp_qp *qps,
 			  u32 stream_id, u16 grants)
 {
