@@ -2,7 +2,7 @@
 
 Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.md).
 
-**Last updated**: 2026-05-23 (Phase 3a Steps 2, 2b, 3, 4, 5, 6, 7, 8, 9 committed; HEAD `336e7e0`. 23/23 `test-kmod-k0` PASS.)
+**Last updated**: 2026-05-24 (Phase 3a Steps 2, 2b, 3, 4, 5, 6, 7, 7b, 8, 9 committed; HEAD `9075f57`. 23/23 `test-kmod-k0` PASS.)
 
 ---
 
@@ -381,7 +381,8 @@ sub-plan lives in `~/.claude/profiles/siden/plans/floofy-stirring-donut.md`.
 | 5b | Rust-backed reorder buffer wiring | pending | `kernel/urp_reorder_rust.c` + `CONFIG_URP_REORDER_RUST` gating + Nix `urp-ko-rust` variant linking `liburp_protocol_ffi.a`. |
 | 6 | Stream multiplexing core (scaffold) | `e2ea525` | `struct urp_stream` + `ep->streams` rhashtable + stream-id allocator (initiator=odd, acceptor=even). `kernel/urp_stream.c` has create / lookup / destroy / destroy_all. RCU-deferred free. Data path still uses single `ep->conn` -- Step 7 wires per-stream lifecycle. |
 | 7 | Stream lifecycle handlers (SYN/FIN/RST + half-close) | `f3f9903` | `urp_stream_rx_syn / _rx_fin / _rx_rst / _tx_fin / _tx_rst / _rx_dispatch`. Half-close via `kernel_sock_shutdown(SHUT_WR)`; abort via `SHUT_RDWR` + RCU destroy. Wire-path call site lands in Step 7b alongside the multi-stream test. |
-| 7b | Wire stream dispatch into RX/TX | pending | `urp_recv_done` -> `urp_stream_rx_dispatch` + per-stream reorder + UDS delivery; TX pump per-stream iteration; UDS accept on initiator -> new stream + SYN. |
+| 7b | Wire stream_id dispatch into RX path | `9075f57` | `urp_recv_done` now decodes `stream_id` + `flags` and routes: `stream_id == 0` -> `ep->conn` (k0 compat); non-zero -> `urp_stream_rx_dispatch` under RCU, with SYN auto-creating the stream and FIN/RST running the lifecycle handlers from Step 7. The dispatch entry point is now load-bearing. |
+| 7c | TX-side + UDS-accept multi-stream wiring | pending | Per-stream TX kthread, `urp_socket.c` accept loop allocates a stream per accepted UDS connection, populates `stream->uds_sock`. With this lands the multi-stream integration test (50 concurrent UDS, half-close, RST). |
 | 8 | GENL emitters wire up real state | `70fafc6` | `urp_fill_endpoint` iterates `ep->qps[]` and `ep->streams` rhashtable, emitting real per-QP / per-stream nested blocks. New per-QP `atomic64_t tx/rx_{bytes,frames}` counters bumped from TX/RX paths. Synthetic stream_id=0 emitted for legacy `ep->conn` traffic until Step 7b retires it. New aggregate counters (credit_stalls, reorder_insertions/drops, buffer_alloc_fails) report 0 -- Steps 4b/5b/7b light them up. RTT and auth_failures stay 0 (3b). |
 | 9 | KUnit suites + multi-QP integration smoke | `336e7e0` | 16 new KUnit cases (credit 8, reorder 5, qp_select 3) mirror the Rust unit-test counts; 4 new integration tests bring `test-kmod-k0` to 23/23. Bench harness (`urp-bench.nix`) + multi-stream tests pair with Step 7b/5b. |
 | 10 | Tracker polish + DoD checklist | (this commit) | Phase 3a Definition of Done checklist; `test-kmod-k0` banner renamed to "Phase 3a Test Results"; tracker reflects 9/9 + 3 deferred. C-vs-Rust benchmark table lands with Step 5b. |
@@ -418,7 +419,7 @@ sub-plan lives in `~/.claude/profiles/siden/plans/floofy-stirring-donut.md`.
 - [x] SRQ prevents per-QP receive starvation (`0fba325`)
 - [x] Per-QP credit-state scaffold (`728db70`) - actual TX gate deferred to **Step 4b**
 - [x] Reorder buffer (C rbtree backend) (`3737132`); Rust backend wiring deferred to **Step 5b**
-- [x] Per-stream rhashtable + id allocator (`e2ea525`); SYN/FIN/RST/half-close handlers (`f3f9903`); wire-path wiring deferred to **Step 7b**
+- [x] Per-stream rhashtable + id allocator (`e2ea525`); SYN/FIN/RST/half-close handlers (`f3f9903`); RX dispatch wired (`9075f57`); TX + accept-allocates-stream deferred to **Step 7c**
 - [x] `urp show` displays real per-QP + per-stream + aggregate stats (`70fafc6`)
 - [x] KUnit suites for credit / reorder / qp_select (`336e7e0`) -- compile in default urp.ko build; runtime gating via the sanitizer/debug VM is blocked on the same VIRTIO_BLK / 9P_FS issue carried from Phase 1 (Variation #9) and lands in **Phase 5**.
 - [x] Multi-QP integration smoke (`urp add --num-qps 2` + `urp show --json | jq '.qps | length == 2'`) -- 23/23 PASS in `test-kmod-k0` (`336e7e0`)
@@ -430,7 +431,7 @@ Deferred follow-ups still inside Phase 3a:
 |----------|---------|---------|
 | 4b | Wire credit gate into TX/RX paths | Need a CREDIT-frame-aware peer (test-client extension or new bench harness). |
 | 5b | Rust-backed reorder via `liburp_protocol_ffi.a` | Nix linking of the Rust staticlib into urp.ko + Kbuild `CONFIG_URP_REORDER_RUST` gating. |
-| 7b | Wire stream dispatch into RX/TX | Per-stream `urp_recv_done` dispatch + per-stream TX iteration + UDS-accept-allocates-stream. Pairs naturally with the multi-stream integration tests. |
+| 7c | TX + UDS-accept multi-stream wiring | Per-stream TX kthread + accept loop allocates one stream per UDS connection + populates `stream->uds_sock`. Pairs naturally with the multi-stream integration test (50 concurrent UDS, half-close, RST). 7b's RX dispatch is in place (`9075f57`) -- this is what's left. |
 
 Deferred to **Phase 3b** (per scope decision in `floofy-stirring-donut.md`):
 QP health probes (RTT EWMA, qualifying/draining states), PSK auth
