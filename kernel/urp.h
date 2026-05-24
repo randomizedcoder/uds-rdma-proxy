@@ -237,6 +237,14 @@ struct urp_endpoint {
 	 * after hashing; ep->password is zeroed for the live endpoint.
 	 */
 	u8			password_hash[URP_PSK_HASH_LEN];
+	/*
+	 * Phase 3b Step 8: pre-built private_data buffer for rdma_connect
+	 * / rdma_accept. Layout:
+	 *   [0]    auth_method (URP_PSK_AUTH_METHOD_SHA256)
+	 *   [1..]  password_hash
+	 * Built once at endpoint create time.
+	 */
+	u8			auth_priv[1 + URP_PSK_HASH_LEN];
 
 	/* Lifecycle */
 	enum urp_endpoint_state	state;

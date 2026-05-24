@@ -550,12 +550,27 @@ void urp_recv_done_for_srq(struct ib_cq *cq, struct ib_wc *wc)
  * path and start the TX pump so that recvs go somewhere once the QP
  * transitions to RTS (see the comment in the previous single-QP code).
  */
-static int urp_cm_accept_one(struct rdma_cm_id *child, struct urp_endpoint *ep)
+static int urp_cm_accept_one(struct rdma_cm_id *child, struct urp_endpoint *ep,
+			     const void *peer_priv, u8 peer_priv_len)
 {
 	struct urp_cm_ctx *child_ctx;
 	struct rdma_conn_param param = {};
 	u32 qp_index;
 	int ret;
+
+	/*
+	 * Phase 3b Step 8: PSK validation. With ep->has_password, the
+	 * peer must have included a matching 1+32-byte auth payload in
+	 * its rdma_connect private_data. Reject otherwise.
+	 */
+	if (ep->has_password) {
+		if (peer_priv_len < sizeof(ep->auth_priv) ||
+		    memcmp(peer_priv, ep->auth_priv, sizeof(ep->auth_priv))) {
+			pr_warn("urp: rejecting CONNECT_REQUEST with bad/missing PSK\n");
+			rdma_reject(child, NULL, 0, 0);
+			return 0;
+		}
+	}
 
 	qp_index = (u32)atomic_inc_return(&ep->qps_accepted) - 1;
 	if (qp_index >= ep->num_qps) {
@@ -625,6 +640,16 @@ static int urp_cm_accept_one(struct rdma_cm_id *child, struct urp_endpoint *ep)
 	param.responder_resources = 1;
 	param.initiator_depth = 1;
 	param.rnr_retry_count = 7;
+	/*
+	 * Phase 3b Step 8: echo our own auth_priv in the accept reply
+	 * so the initiator can (in a future bidirectional check) also
+	 * validate the acceptor. Initiator-validates-acceptor is not
+	 * wired yet -- this just stages the payload on the wire.
+	 */
+	if (ep->has_password) {
+		param.private_data = ep->auth_priv;
+		param.private_data_len = sizeof(ep->auth_priv);
+	}
 	ret = rdma_accept(child, &param);
 	if (ret)
 		goto err_destroy_qp;
@@ -660,7 +685,9 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 
 	if (ctx->is_listener) {
 		if (event->event == RDMA_CM_EVENT_CONNECT_REQUEST)
-			return urp_cm_accept_one(id, ep);
+			return urp_cm_accept_one(id, ep,
+					event->param.conn.private_data,
+					event->param.conn.private_data_len);
 		return 0;
 	}
 
@@ -687,6 +714,16 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 			param.initiator_depth = 1;
 			param.retry_count = 7;
 			param.rnr_retry_count = 7;
+			/*
+			 * Phase 3b Step 8: include PSK auth payload in
+			 * private_data when configured. Acceptor compares
+			 * the hash against its own and rdma_reject's on
+			 * mismatch.
+			 */
+			if (ep->has_password) {
+				param.private_data = ep->auth_priv;
+				param.private_data_len = sizeof(ep->auth_priv);
+			}
 			ret = rdma_connect(id, &param);
 		}
 		break;

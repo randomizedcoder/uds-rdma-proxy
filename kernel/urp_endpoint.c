@@ -148,13 +148,16 @@ int urp_endpoint_create(struct urp_endpoint *cfg, struct urp_endpoint **out)
 		/*
 		 * Phase 3b Step 7: SHA-256 the raw 16-byte input from the
 		 * netlink attr into a 32-byte hash, then zero the raw
-		 * field so the kernel only retains the digest. Step 8
-		 * embeds this hash into the rdma_cm private_data on
-		 * connect; the matching acceptor compares hashes and
-		 * rdma_rejects on mismatch.
+		 * field so the kernel only retains the digest.
+		 *
+		 * Phase 3b Step 8: also pre-build the auth_priv buffer
+		 * (1B method + 32B hash) we'll feed rdma_connect's
+		 * private_data.
 		 */
 		sha256(cfg->password, URP_PASSWORD_MAX, ep->password_hash);
 		memzero_explicit(ep->password, sizeof(ep->password));
+		ep->auth_priv[0] = URP_PSK_AUTH_METHOD_SHA256;
+		memcpy(ep->auth_priv + 1, ep->password_hash, URP_PSK_HASH_LEN);
 	}
 
 	ep->is_initiator = initiator;
