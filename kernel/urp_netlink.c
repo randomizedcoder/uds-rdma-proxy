@@ -254,7 +254,8 @@ static int urp_fill_endpoint(struct sk_buff *skb, struct urp_endpoint *ep,
 				      atomic64_read(&ep->stats.reorder_drops), 0) ||
 		    nla_put_u64_64bit(skb, URP_STATS_A_BUFFER_ALLOC_FAILS,
 				      atomic64_read(&ep->stats.buffer_alloc_fails), 0) ||
-		    nla_put_u64_64bit(skb, URP_STATS_A_AUTH_FAILURES, 0, 0))
+		    nla_put_u64_64bit(skb, URP_STATS_A_AUTH_FAILURES,
+				      atomic64_read(&ep->stats.auth_failures), 0))
 			goto cancel;
 		nla_nest_end(skb, stats_nest);
 	}

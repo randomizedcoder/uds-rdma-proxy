@@ -73,12 +73,13 @@ struct urp_stats {
 	atomic64_t	tx_frames;
 	atomic64_t	rx_frames;
 	atomic64_t	connections;
-	/* Phase 3a Step 8: aggregate diagnostic counters (RTT and
-	 * auth_failures stay 0 until Phase 3b probes/PSK land). */
+	/* Phase 3a Step 8: aggregate diagnostic counters. */
 	atomic64_t	credit_stalls;
 	atomic64_t	reorder_insertions;
 	atomic64_t	reorder_drops;
 	atomic64_t	buffer_alloc_fails;
+	/* Phase 3b Step 9: incremented on PSK rdma_reject. */
+	atomic64_t	auth_failures;
 };
 
 struct urp_endpoint;	/* forward decl for struct urp_qp */

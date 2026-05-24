@@ -566,8 +566,12 @@ static int urp_cm_accept_one(struct rdma_cm_id *child, struct urp_endpoint *ep,
 	if (ep->has_password) {
 		if (peer_priv_len < sizeof(ep->auth_priv) ||
 		    memcmp(peer_priv, ep->auth_priv, sizeof(ep->auth_priv))) {
+			atomic64_inc(&ep->stats.auth_failures);
 			pr_warn("urp: rejecting CONNECT_REQUEST with bad/missing PSK\n");
 			rdma_reject(child, NULL, 0, 0);
+			/* Step 9: multicast event so `urp monitor` users see
+			 * auth failures alongside state transitions. */
+			urp_send_event(ep);
 			return 0;
 		}
 	}
