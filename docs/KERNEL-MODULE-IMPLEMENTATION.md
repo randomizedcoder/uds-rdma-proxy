@@ -2,7 +2,7 @@
 
 Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.md).
 
-**Last updated**: 2026-05-23 (Phase 3a Steps 2, 2b, 3, 4, 5, 6 committed; HEAD `e2ea525`)
+**Last updated**: 2026-05-23 (Phase 3a Steps 2, 2b, 3, 4, 5, 6, 7 committed; HEAD `f3f9903`)
 
 ---
 
@@ -13,7 +13,7 @@ Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.
 | 0 | [Prerequisites](#phase-0-prerequisites) | Complete | 6/7 |
 | 1 | [k0 -- Proof of Concept](#phase-1-k0----proof-of-concept) | Complete | 7/9 (sanitizer items deferred) |
 | 2 | [urp CLI + GENL](#phase-2-urp-cli--genl-interface) | Complete (`067829e`) | 8/9 |
-| 3a | [k1 Data Path](#phase-3a-k1-data-path) | In Progress | 6/9 |
+| 3a | [k1 Data Path](#phase-3a-k1-data-path) | In Progress | 7/9 |
 | 3 | [k1 -- Functional](#phase-3-k1----functional) | In Progress (via 3a) | 0/14 |
 | 4 | [k2 -- Optimized](#phase-4-k2----optimized) | Not Started | 0/8 |
 | 5 | [MicroVM Integration](#phase-5-microvm-integration) | Not Started | 0/8 |
@@ -376,7 +376,8 @@ sub-plan lives in `~/.claude/profiles/siden/plans/floofy-stirring-donut.md`.
 | 5 | Reorder buffer (C rbtree default) | `3737132` | `kernel/urp_reorder.{c,h}` rbtree-backed implementation. Opaque handle + copy-in/copy-out semantics matching the Rust FFI surface in `kernel/include/urp_ffi.h`, so Step 5b's Rust backend is a thin cast-and-forward shim. Not yet wired into the data path -- Step 6 puts the buffer per-stream. |
 | 5b | Rust-backed reorder buffer wiring | pending | `kernel/urp_reorder_rust.c` + `CONFIG_URP_REORDER_RUST` gating + Nix `urp-ko-rust` variant linking `liburp_protocol_ffi.a`. |
 | 6 | Stream multiplexing core (scaffold) | `e2ea525` | `struct urp_stream` + `ep->streams` rhashtable + stream-id allocator (initiator=odd, acceptor=even). `kernel/urp_stream.c` has create / lookup / destroy / destroy_all. RCU-deferred free. Data path still uses single `ep->conn` -- Step 7 wires per-stream lifecycle. |
-| 7 | Stream lifecycle (SYN/FIN/RST + half-close) | pending | Flag handling + UDS half-close. |
+| 7 | Stream lifecycle handlers (SYN/FIN/RST + half-close) | `f3f9903` | `urp_stream_rx_syn / _rx_fin / _rx_rst / _tx_fin / _tx_rst / _rx_dispatch`. Half-close via `kernel_sock_shutdown(SHUT_WR)`; abort via `SHUT_RDWR` + RCU destroy. Wire-path call site lands in Step 7b alongside the multi-stream test. |
+| 7b | Wire stream dispatch into RX/TX | pending | `urp_recv_done` -> `urp_stream_rx_dispatch` + per-stream reorder + UDS delivery; TX pump per-stream iteration; UDS accept on initiator -> new stream + SYN. |
 | 8 | GENL emitters wire up real state | pending | Real per-QP / per-stream nested blocks; aggregate stats. |
 | 9 | Integration tests + bench harness | pending | Tests grow from 19 to ~30; new `nix/urp-bench.nix` for C-vs-Rust reorder comparison. |
 | 10 | Tracker polish + benchmark table | pending | Final docs pass + C-vs-Rust numbers. |
