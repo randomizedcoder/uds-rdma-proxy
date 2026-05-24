@@ -2,7 +2,7 @@
 
 Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.md).
 
-**Last updated**: 2026-05-24 (Phase 3a + 3b complete; Phase 4 Steps 1-2 committed on `phase4-k2-optimized` HEAD `78967e5`. 23/23 `test-kmod-k0` PASS.)
+**Last updated**: 2026-05-24 (Phase 3a + 3b + 4 complete; HEAD `c41bd61` on `phase4-k2-optimized`. 23/23 `test-kmod-k0` PASS; 1-hour soak PASS at 1240 cycles + 120 churn add/remove.)
 
 ---
 
@@ -16,7 +16,7 @@ Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.
 | 3a | [k1 Data Path](#phase-3a-k1-data-path) | Complete (7d pending) | 9/9 main + 5/6 sub-steps; 7d (test-client multi-stream) pending |
 | 3b | [Probes + PSK Auth](#phase-3b-probes--psk-auth) | Complete (`dd6bab0`) | 10/10 |
 | 3 | [k1 -- Functional](#phase-3-k1----functional) | In Progress (via 3a) | 0/14 |
-| 4 | [k2 -- Optimized](#phase-4-k2----optimized) | In Progress (`78967e5`); rxe-testable items done, hardware-gated items deferred | 2/8 main + 3 deferred |
+| 4 | [k2 -- Optimized](#phase-4-k2----optimized) | rxe-testable scope complete (`c41bd61`) + 1-hour soak PASS | 2/8 main + 3 deferred-hardware; soak harness + on-reconnect-leak fix added |
 | 5 | [MicroVM Integration](#phase-5-microvm-integration) | Not Started | 0/8 |
 
 ---
@@ -577,7 +577,27 @@ their primary risk surface is hardware-specific. The 23/23
 |------|---------|--------|-------|
 | 1 | page_pool buffer management | `ded84a7` | `urp_bufs_init` calls `page_pool_create` + N x `page_pool_dev_alloc_pages`; pages get DMA-mapped via `ib_dma_map_page`. PP_FLAG_DMA_MAP is intentionally *not* set -- rxe/siw `ib_device->dma_device == NULL` would NULL-deref `dev_to_node` inside `page_pool_create`. Documented as the plan's "primary k2 engineering risk" (§4.1). For hardware NICs the ib_dma path is equivalent to dma_map_page so the choice carries no perf cost. |
 | 2 | NUMA-aware page_pool | `78967e5` | `page_pool_params.nid` reads `dev_to_node(ib_dev->dev.parent)` when a real parent exists; falls back to `NUMA_NO_NODE` for software RDMA. |
-| 3 | tracker polish + DoD | (this commit) | Phase 4 scope settlement; deferred items below. |
+| 3 | tracker polish + DoD | `c535c7a` | Phase 4 scope settlement; deferred items below. |
+| 4 | 1-hour soak harness | `c41bd61` | `nix/soak-1h.nix`: load loop + churn add/remove every 30s; baseline-deltas slab/dmesg/stats; OVERALL PASS/FAIL with leak budget. Wired as `nix run .#urp-vm -- ssh soak-1h`. |
+| 5 | Fix on-reconnect leak found by soak | `c41bd61` | `urp_socket_conn_cleanup` + call from DISCONNECT branch + defensive call at top of `urp_cm_accept_one`. The acceptor was orphaning one `urp-tx` kthread + one UDS `struct socket` per test-client reconnect (overwriting `ep->conn.uds_sock` / `ep->conn.tx_thread` without releasing the previous ones). Pre-fix soak: ~210 kB/cycle leak + TX freeze at first churn + 12 orphan kthreads after 30 cycles. Post-fix soak: see results below. |
+
+### 1-Hour Soak Result (post-fix)
+
+Command: `nix run .#urp-vm -- ssh "sudo soak-1h"`
+
+| Metric | Value | Budget |
+|---|---|---|
+| Duration | 3600 s | |
+| Load cycles | 1240 | |
+| Churn add/remove cycles | 120 | |
+| CLI failures | 0 | 0 |
+| dmesg `urp:` errors / warnings | 0 | 0 |
+| Slab Δ in-loop | +1956 kB (1.91 MB) | |
+| Slab Δ post-rmmod | +1828 kB (1.79 MB) | 2048 kB (PASS) |
+| Frames TX | 3,314,520 | matched RX exactly |
+| Frames RX | 3,314,520 | |
+
+Drain + rmmod freed 128 kB of slab beyond the in-loop measurement -- that's the endpoint struct + page_pool teardown returning memory cleanly. The residual 1.83 MB plateaued repeatedly during the run (multiple `slab_delta=X` ticks identical to the prior tick), strongly suggesting kernel-slab cache growth rather than a per-cycle urp leak; further attribution would need `/proc/slabinfo` deltas (deferred).
 
 ### Deferred to hardware-validation (no measurable change on rxe)
 
