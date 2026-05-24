@@ -17,7 +17,7 @@ phases' commits.
 | **1 — k0** RDMA echo data path | `docs/KERNEL-MODULE-PLAN.md` §1 | ✅ Committed (`d440794`, `a986fe7`, `a600b17`) |
 | **2** — GENL control plane | `docs/KERNEL-MODULE-IMPLEMENTATION.md` §Phase 2 | ✅ Committed (`067829e`) |
 | **3a** — k1 data path | `~/.claude/profiles/siden/plans/floofy-stirring-donut.md` + `~/.claude/profiles/runpod/plans/this-repo-has-a-abundant-fern.md` | ✅ **Phase 3a complete -- Steps 1-10 + 2b, 4b, 5b, 7b, 7c done (`c2eea2e` through `b7caab2`); 23/23 `test-kmod-k0` PASS. Sub-step 7d (test-client `--stream-id` + multi-stream integration test) + 5b's objtool-on-IBT follow-up remain pending.** |
-| **3b** — probes / PSK | `docs/KERNEL-MODULE-PLAN.md` §3.6-§3.7 + `KERNEL-MODULE-IMPLEMENTATION.md` §Phase 3b | 🚧 **In progress. Step 1 done (`0d5c077`).** |
+| **3b** — probes / PSK | `docs/KERNEL-MODULE-PLAN.md` §3.6-§3.7 + `KERNEL-MODULE-IMPLEMENTATION.md` §Phase 3b | 🚧 **In progress. Steps 1, 2 done (`0d5c077`, `fa58e55`).** |
 | 3c — KUnit hardening + soak | (deferred) | not started |
 | 4 / 5 / 6 | per `docs/KERNEL-MODULE-PLAN.md` | not started |
 
