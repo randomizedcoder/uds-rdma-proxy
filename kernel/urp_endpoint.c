@@ -13,6 +13,7 @@
 #include "urp.h"
 #include <linux/inet.h>
 #include <linux/slab.h>
+#include <crypto/sha2.h>
 #include <net/ipv6.h>
 
 struct rhashtable urp_endpoints;
@@ -143,8 +144,18 @@ int urp_endpoint_create(struct urp_endpoint *cfg, struct urp_endpoint **out)
 	ep->buffer_count = cfg->buffer_count ? cfg->buffer_count : URP_BUFFER_COUNT_DEFAULT;
 	ep->buffer_size  = cfg->buffer_size  ? cfg->buffer_size  : URP_BUFFER_SIZE_DEFAULT;
 	ep->has_password = cfg->has_password;
-	if (cfg->has_password)
-		memcpy(ep->password, cfg->password, URP_PASSWORD_MAX);
+	if (cfg->has_password) {
+		/*
+		 * Phase 3b Step 7: SHA-256 the raw 16-byte input from the
+		 * netlink attr into a 32-byte hash, then zero the raw
+		 * field so the kernel only retains the digest. Step 8
+		 * embeds this hash into the rdma_cm private_data on
+		 * connect; the matching acceptor compares hashes and
+		 * rdma_rejects on mismatch.
+		 */
+		sha256(cfg->password, URP_PASSWORD_MAX, ep->password_hash);
+		memzero_explicit(ep->password, sizeof(ep->password));
+	}
 
 	ep->is_initiator = initiator;
 	ep->state        = URP_STATE_CREATING;

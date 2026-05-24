@@ -142,6 +142,10 @@ struct urp_qp {
 
 #define URP_QP_MISS_THRESHOLD	3
 
+/* Phase 3b: PSK auth (design 17 / Tier 0.5). */
+#define URP_PSK_HASH_LEN	32	/* SHA-256 digest size */
+#define URP_PSK_AUTH_METHOD_SHA256	1
+
 /*
  * struct urp_cm_ctx - context attached to every rdma_cm_id created by urp
  *
@@ -225,8 +229,14 @@ struct urp_endpoint {
 	u32			num_qps;		/* mutable via SET */
 	u32			buffer_count;		/* mutable via SET */
 	u32			buffer_size;
-	u8			password[URP_PASSWORD_MAX];	/* mutable via SET, write-only */
+	u8			password[URP_PASSWORD_MAX];	/* raw input from netlink (cfg only) */
 	bool			has_password;
+	/*
+	 * Phase 3b Step 7: SHA-256(password) lives here once
+	 * urp_endpoint_create runs. The raw 16-byte input is discarded
+	 * after hashing; ep->password is zeroed for the live endpoint.
+	 */
+	u8			password_hash[URP_PSK_HASH_LEN];
 
 	/* Lifecycle */
 	enum urp_endpoint_state	state;
