@@ -440,7 +440,7 @@ pkgs.writeShellApplication {
     # ---- Summary ----
     echo ""
     echo "========================================"
-    echo "  Phase 2 Test Results"
+    echo "  Phase 3a Test Results"
     echo "========================================"
     echo "  Passed: ''${GREEN}''${TEST_PASSED}''${NC}"
     echo "  Failed: ''${RED}''${TEST_FAILED}''${NC}"

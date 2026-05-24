@@ -2,7 +2,7 @@
 
 Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.md).
 
-**Last updated**: 2026-05-23 (Phase 3a Steps 2, 2b, 3, 4, 5, 6, 7, 8 committed; HEAD `70fafc6`)
+**Last updated**: 2026-05-23 (Phase 3a Steps 2, 2b, 3, 4, 5, 6, 7, 8, 9 committed; HEAD `336e7e0`. 23/23 `test-kmod-k0` PASS.)
 
 ---
 
@@ -13,7 +13,7 @@ Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.
 | 0 | [Prerequisites](#phase-0-prerequisites) | Complete | 6/7 |
 | 1 | [k0 -- Proof of Concept](#phase-1-k0----proof-of-concept) | Complete | 7/9 (sanitizer items deferred) |
 | 2 | [urp CLI + GENL](#phase-2-urp-cli--genl-interface) | Complete (`067829e`) | 8/9 |
-| 3a | [k1 Data Path](#phase-3a-k1-data-path) | In Progress | 8/9 |
+| 3a | [k1 Data Path](#phase-3a-k1-data-path) | Scaffold complete (4b/5b/7b deferred) | 9/9 main + 3 sub-steps deferred |
 | 3 | [k1 -- Functional](#phase-3-k1----functional) | In Progress (via 3a) | 0/14 |
 | 4 | [k2 -- Optimized](#phase-4-k2----optimized) | Not Started | 0/8 |
 | 5 | [MicroVM Integration](#phase-5-microvm-integration) | Not Started | 0/8 |
@@ -355,7 +355,11 @@ the result; tracked for a follow-up cleanup pass.
 
 ## Phase 3a: k1 Data Path
 
-**Status**: In Progress -- on branch `phase3a-k1-data-path` (cut from `c2eea2e`).
+**Status**: Data-path scaffold complete -- on branch `phase3a-k1-data-path`
+(cut from `c2eea2e`). Steps 1, 2, 2b, 3, 4, 5, 6, 7, 8, 9 committed and
+green; Steps 4b, 5b, 7b deferred to follow-up commits pending peer / test
+fixture work that they depend on. `test-kmod-k0` passes 23/23 against
+HEAD (existing 19 from Phase 2 + 4 new multi-QP smoke tests).
 
 Phase 3 from `KERNEL-MODULE-PLAN.md` covers k1 functional in one big bucket
 (14 deliverables). For execution we split it: **3a = data path** (multi-QP,
@@ -379,8 +383,8 @@ sub-plan lives in `~/.claude/profiles/siden/plans/floofy-stirring-donut.md`.
 | 7 | Stream lifecycle handlers (SYN/FIN/RST + half-close) | `f3f9903` | `urp_stream_rx_syn / _rx_fin / _rx_rst / _tx_fin / _tx_rst / _rx_dispatch`. Half-close via `kernel_sock_shutdown(SHUT_WR)`; abort via `SHUT_RDWR` + RCU destroy. Wire-path call site lands in Step 7b alongside the multi-stream test. |
 | 7b | Wire stream dispatch into RX/TX | pending | `urp_recv_done` -> `urp_stream_rx_dispatch` + per-stream reorder + UDS delivery; TX pump per-stream iteration; UDS accept on initiator -> new stream + SYN. |
 | 8 | GENL emitters wire up real state | `70fafc6` | `urp_fill_endpoint` iterates `ep->qps[]` and `ep->streams` rhashtable, emitting real per-QP / per-stream nested blocks. New per-QP `atomic64_t tx/rx_{bytes,frames}` counters bumped from TX/RX paths. Synthetic stream_id=0 emitted for legacy `ep->conn` traffic until Step 7b retires it. New aggregate counters (credit_stalls, reorder_insertions/drops, buffer_alloc_fails) report 0 -- Steps 4b/5b/7b light them up. RTT and auth_failures stay 0 (3b). |
-| 9 | Integration tests + bench harness | pending | Tests grow from 19 to ~30; new `nix/urp-bench.nix` for C-vs-Rust reorder comparison. |
-| 10 | Tracker polish + benchmark table | pending | Final docs pass + C-vs-Rust numbers. |
+| 9 | KUnit suites + multi-QP integration smoke | `336e7e0` | 16 new KUnit cases (credit 8, reorder 5, qp_select 3) mirror the Rust unit-test counts; 4 new integration tests bring `test-kmod-k0` to 23/23. Bench harness (`urp-bench.nix`) + multi-stream tests pair with Step 7b/5b. |
+| 10 | Tracker polish + DoD checklist | (this commit) | Phase 3a Definition of Done checklist; `test-kmod-k0` banner renamed to "Phase 3a Test Results"; tracker reflects 9/9 + 3 deferred. C-vs-Rust benchmark table lands with Step 5b. |
 
 ### Variations from Plan
 
@@ -407,6 +411,34 @@ sub-plan lives in `~/.claude/profiles/siden/plans/floofy-stirring-donut.md`.
    `urp_endpoint_setup_shared` exposed the leak after the first
    disconnect/reconnect cycle (Test 13 of `test-kmod-k0`). Fixed by
    always returning the buffer to the pool, including on FLUSH_ERR.
+
+### Phase 3a Definition of Done (subset of plan §3)
+
+- [x] Multi-QP: 1-32 QPs per endpoint via `urp add --num-qps` (`9dd0a70`, `f9f49b4`)
+- [x] SRQ prevents per-QP receive starvation (`0fba325`)
+- [x] Per-QP credit-state scaffold (`728db70`) - actual TX gate deferred to **Step 4b**
+- [x] Reorder buffer (C rbtree backend) (`3737132`); Rust backend wiring deferred to **Step 5b**
+- [x] Per-stream rhashtable + id allocator (`e2ea525`); SYN/FIN/RST/half-close handlers (`f3f9903`); wire-path wiring deferred to **Step 7b**
+- [x] `urp show` displays real per-QP + per-stream + aggregate stats (`70fafc6`)
+- [x] KUnit suites for credit / reorder / qp_select (`336e7e0`) -- compile in default urp.ko build; runtime gating via the sanitizer/debug VM is blocked on the same VIRTIO_BLK / 9P_FS issue carried from Phase 1 (Variation #9) and lands in **Phase 5**.
+- [x] Multi-QP integration smoke (`urp add --num-qps 2` + `urp show --json | jq '.qps | length == 2'`) -- 23/23 PASS in `test-kmod-k0` (`336e7e0`)
+- [ ] Multi-stream integration tests (50 concurrent UDS, half-close, RST, gap timeout, multi-stream throughput) -- depend on **Step 7b**
+
+Deferred follow-ups still inside Phase 3a:
+
+| Sub-step | Subject | Blocker |
+|----------|---------|---------|
+| 4b | Wire credit gate into TX/RX paths | Need a CREDIT-frame-aware peer (test-client extension or new bench harness). |
+| 5b | Rust-backed reorder via `liburp_protocol_ffi.a` | Nix linking of the Rust staticlib into urp.ko + Kbuild `CONFIG_URP_REORDER_RUST` gating. |
+| 7b | Wire stream dispatch into RX/TX | Per-stream `urp_recv_done` dispatch + per-stream TX iteration + UDS-accept-allocates-stream. Pairs naturally with the multi-stream integration tests. |
+
+Deferred to **Phase 3b** (per scope decision in `floofy-stirring-donut.md`):
+QP health probes (RTT EWMA, qualifying/draining states), PSK auth
+(SHA-256 + rdma_cm `private_data`), per-QP RTT in `urp show`, remaining
+KUnit tests (probe, PSK, stream-id allocation).
+
+Deferred to **Phase 3c**: 1-hour soak with KASAN / KMEMLEAK / KCSAN
+(the sanitizer-VM blocker carries forward to Phase 5).
 
 ---
 
