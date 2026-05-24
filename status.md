@@ -1,12 +1,13 @@
 # Project Status
 
-_Last updated: 2026-05-23_
+_Last updated: 2026-05-24_
 
 ## Current branch
 
-`phase3a-k1-data-path` — cut from `c2eea2e` (the prior `phase1-k0-kernel-module`
-HEAD). The historical branch `phase1-k0-kernel-module` still exists locally and
-carries phases 0, 1, 2, and 3a-Step-1 commits despite its name.
+`phase3b-probes-psk` — cut from `phase3a-k1-data-path` HEAD `22f98fa`
+(Phase 3a finalized). The previous branches (`phase3a-k1-data-path`,
+`phase1-k0-kernel-module`) still exist locally and carry their respective
+phases' commits.
 
 ## Where we are
 
@@ -15,8 +16,8 @@ carries phases 0, 1, 2, and 3a-Step-1 commits despite its name.
 | **0** — Skeleton | `docs/KERNEL-MODULE-PLAN.md` §0 | ✅ Committed (`3a32ffc`) |
 | **1 — k0** RDMA echo data path | `docs/KERNEL-MODULE-PLAN.md` §1 | ✅ Committed (`d440794`, `a986fe7`, `a600b17`) |
 | **2** — GENL control plane | `docs/KERNEL-MODULE-IMPLEMENTATION.md` §Phase 2 | ✅ Committed (`067829e`) |
-| **3a** — k1 data path | `~/.claude/profiles/siden/plans/floofy-stirring-donut.md` + `~/.claude/profiles/runpod/plans/this-repo-has-a-abundant-fern.md` | ✅ **Phase 3a complete -- Steps 1-10 + 2b, 4b, 5b, 7b, 7c done (`c2eea2e` through `b7caab2`); 23/23 `test-kmod-k0` PASS. Remaining: 7d (test-client `--stream-id` + multi-stream integration test) + 5b's objtool-on-IBT follow-up; both unblockable in a separate session before Phase 3b lands.** |
-| 3b — probes / PSK / extended observability | (deferred) | not started |
+| **3a** — k1 data path | `~/.claude/profiles/siden/plans/floofy-stirring-donut.md` + `~/.claude/profiles/runpod/plans/this-repo-has-a-abundant-fern.md` | ✅ **Phase 3a complete -- Steps 1-10 + 2b, 4b, 5b, 7b, 7c done (`c2eea2e` through `b7caab2`); 23/23 `test-kmod-k0` PASS. Sub-step 7d (test-client `--stream-id` + multi-stream integration test) + 5b's objtool-on-IBT follow-up remain pending.** |
+| **3b** — probes / PSK | `docs/KERNEL-MODULE-PLAN.md` §3.6-§3.7 + `KERNEL-MODULE-IMPLEMENTATION.md` §Phase 3b | 🚧 **In progress. Step 1 done (`0d5c077`).** |
 | 3c — KUnit hardening + soak | (deferred) | not started |
 | 4 / 5 / 6 | per `docs/KERNEL-MODULE-PLAN.md` | not started |
 

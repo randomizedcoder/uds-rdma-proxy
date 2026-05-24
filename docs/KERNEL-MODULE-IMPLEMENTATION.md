@@ -2,7 +2,7 @@
 
 Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.md).
 
-**Last updated**: 2026-05-24 (Phase 3a Steps 1-10 + 2b/4b/5b/7b/7c committed; HEAD `b7caab2`. 23/23 `test-kmod-k0` PASS.)
+**Last updated**: 2026-05-24 (Phase 3a complete; Phase 3b Step 1 committed on branch `phase3b-probes-psk` HEAD `0d5c077`. 23/23 `test-kmod-k0` PASS.)
 
 ---
 
@@ -13,7 +13,8 @@ Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.
 | 0 | [Prerequisites](#phase-0-prerequisites) | Complete | 6/7 |
 | 1 | [k0 -- Proof of Concept](#phase-1-k0----proof-of-concept) | Complete | 7/9 (sanitizer items deferred) |
 | 2 | [urp CLI + GENL](#phase-2-urp-cli--genl-interface) | Complete (`067829e`) | 8/9 |
-| 3a | [k1 Data Path](#phase-3a-k1-data-path) | Scaffold complete (4b/5b/7b deferred) | 9/9 main + 3 sub-steps deferred |
+| 3a | [k1 Data Path](#phase-3a-k1-data-path) | Complete (7d pending) | 9/9 main + 5/6 sub-steps; 7d (test-client multi-stream) pending |
+| 3b | [Probes + PSK Auth](#phase-3b-probes--psk-auth) | In Progress (`0d5c077`) | 1/10 |
 | 3 | [k1 -- Functional](#phase-3-k1----functional) | In Progress (via 3a) | 0/14 |
 | 4 | [k2 -- Optimized](#phase-4-k2----optimized) | Not Started | 0/8 |
 | 5 | [MicroVM Integration](#phase-5-microvm-integration) | Not Started | 0/8 |
@@ -440,6 +441,27 @@ KUnit tests (probe, PSK, stream-id allocation).
 
 Deferred to **Phase 3c**: 1-hour soak with KASAN / KMEMLEAK / KCSAN
 (the sanitizer-VM blocker carries forward to Phase 5).
+
+---
+
+## Phase 3b: Probes + PSK Auth
+
+**Status**: In Progress -- on branch `phase3b-probes-psk` (cut from Phase 3a HEAD `22f98fa`). Scope: §3.6 QP health probes (PING/PONG, RTT EWMA, qualifying/draining state machine) + §3.7 Tier 0.5 PSK auth (SHA-256 in `rdma_cm` `private_data`).
+
+### Step Status
+
+| Step | Subject | Commit | Notes |
+|------|---------|--------|-------|
+| 1 | Probe state + PROBE wire format + KUnit | `0d5c077` | `struct urp_qp` gains `probe_seq` / `consecutive_misses` / `last_ping_ns` / `rtt_ewma_ns`. `urp.h` adds `urp_ping_encode/decode_*` + `urp_pong_encode/decode_*` (matches `uds_rdma_protocol::probe` byte-for-byte). 3 KUnit cases pin the wire format. |
+| 2 | Probe emit via per-endpoint hrtimer | pending | 250ms hrtimer ticks PING on every QP; updates `probe_seq` + `last_ping_ns`. |
+| 3 | RX of PING -> emit PONG | pending | Handle `URP_FRAME_TYPE_PROBE` with flags == 0: echo PING fields, fill responder timestamps, post the PONG. |
+| 4 | RX of PONG -> RTT EWMA | pending | Match probe_seq against most recent PING, compute RTT, update EWMA (alpha = 0.2), reset `consecutive_misses`. |
+| 5 | QP health state machine | pending | Qualifying / Active / Draining / Removed transitions; missed-probe timeout decisions. |
+| 6 | GENL emits real per-QP RTT | pending | `URP_QP_A_RTT_NS` reports `rtt_ewma_ns` (was 0 from Step 8 of 3a). |
+| 7 | PSK SHA-256 hashing on add | pending | `urp_endpoint_create` hashes the raw password into a 32-byte SHA-256 before storing. |
+| 8 | PSK in `rdma_cm` `private_data` | pending | Initiator: include `auth_method` + `auth_hash` in `rdma_connect()` `private_data` (49B total). Acceptor: validate hash in `CONNECT_REQUEST`; `rdma_reject` on mismatch. Bidirectional verification via `rdma_accept` reply. |
+| 9 | Auth-failure stats + GENL event | pending | `URP_STATS_A_AUTH_FAILURES` counter; multicast event on auth failure. |
+| 10 | Tracker polish + benchmark sanity | pending | Phase 3b DoD checklist; latency-delta measurement before/after probes; final docs pass. |
 
 ---
 
