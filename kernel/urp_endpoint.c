@@ -224,6 +224,7 @@ int urp_endpoint_activate(struct urp_endpoint *ep)
 		goto err_rdma;
 
 	ep->state = URP_STATE_ACTIVE;
+	urp_probe_work_start(ep);
 	mutex_unlock(&ep->lock);
 	urp_send_event(ep);
 	return 0;
@@ -260,6 +261,7 @@ void urp_endpoint_drain(struct urp_endpoint *ep)
 	urp_send_event(ep);
 
 	mutex_lock(&ep->lock);
+	urp_probe_work_stop(ep);
 	urp_pump_stop(ep);
 	urp_socket_cleanup(ep);
 	urp_rdma_cleanup(ep);

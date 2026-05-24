@@ -13,6 +13,8 @@
 
 #include "urp.h"
 #include <linux/sched.h>
+#include <linux/ktime.h>
+#include <linux/timekeeping.h>
 
 /*
  * TX pump kthread.
@@ -308,6 +310,99 @@ void urp_stream_pump_stop(struct urp_stream *stream)
  * credit state from its own send counter (the protocol tolerates
  * dropped CREDIT frames).
  */
+/*
+ * Phase 3b Step 2: probe emission. The per-endpoint delayed_work
+ * fires every URP_PROBE_INTERVAL_MS (250ms) and posts one PING on
+ * every established QP. Probes are gated on num_qps > 1 so the
+ * single-QP test-client scenario (which expects only echo traffic
+ * back) is unaffected; Phase 3b Step 4 will compute RTT when the
+ * matching PONG arrives.
+ */
+#define URP_PROBE_INTERVAL_MS	250
+
+static int urp_emit_ping_on(struct urp_endpoint *ep, struct urp_qp *qps)
+{
+	struct urp_buffer *buf;
+	struct ib_send_wr wr = {};
+	const struct ib_send_wr *bad_wr;
+	u64 now_mono, now_real;
+	int ret;
+
+	if (!qps->established || !qps->qp)
+		return 0;
+
+	buf = urp_buf_alloc_send(ep);
+	if (!buf)
+		return -ENOBUFS;
+
+	now_mono = ktime_get_ns();
+	now_real = ktime_get_real_ns();
+	qps->probe_seq++;
+	qps->last_ping_ns = now_mono;
+
+	urp_frame_encode(buf->data, 0, qps->probe_seq, URP_FRAME_TYPE_PROBE,
+			 0 /* flags == 0 means PING */, 0,
+			 URP_PING_PAYLOAD_SIZE);
+	urp_ping_encode(buf->data + URP_FRAME_HEADER_SIZE, qps->probe_seq,
+			(u16)qps->index, now_mono, now_real);
+
+	ib_dma_sync_single_for_device(ep->ib_dev, buf->dma_addr,
+				      URP_FRAME_HEADER_SIZE +
+					      URP_PING_PAYLOAD_SIZE,
+				      DMA_TO_DEVICE);
+
+	buf->sge.length = URP_FRAME_HEADER_SIZE + URP_PING_PAYLOAD_SIZE;
+	buf->cqe.done = urp_send_done;
+	wr.wr_cqe = &buf->cqe;
+	wr.sg_list = &buf->sge;
+	wr.num_sge = 1;
+	wr.opcode = IB_WR_SEND;
+	wr.send_flags = IB_SEND_SIGNALED;
+
+	ret = ib_post_send(qps->qp, &wr, &bad_wr);
+	if (ret) {
+		pr_warn_ratelimited("urp: PING post_send on qp %u failed: %d\n",
+				    qps->index, ret);
+		urp_buf_free_send(ep, buf);
+		return ret;
+	}
+	return 0;
+}
+
+static void urp_probe_work_fn(struct work_struct *work)
+{
+	struct urp_endpoint *ep = container_of(to_delayed_work(work),
+					       struct urp_endpoint, probe_work);
+	u32 i;
+
+	if (!ep->probe_active || ep->state != URP_STATE_ACTIVE)
+		return;
+
+	if (ep->qps && ep->num_qps > 1) {
+		for (i = 0; i < ep->num_qps; i++)
+			urp_emit_ping_on(ep, &ep->qps[i]);
+	}
+
+	schedule_delayed_work(&ep->probe_work,
+			      msecs_to_jiffies(URP_PROBE_INTERVAL_MS));
+}
+
+void urp_probe_work_start(struct urp_endpoint *ep)
+{
+	INIT_DELAYED_WORK(&ep->probe_work, urp_probe_work_fn);
+	ep->probe_active = true;
+	schedule_delayed_work(&ep->probe_work,
+			      msecs_to_jiffies(URP_PROBE_INTERVAL_MS));
+}
+
+void urp_probe_work_stop(struct urp_endpoint *ep)
+{
+	if (ep->probe_active) {
+		ep->probe_active = false;
+		cancel_delayed_work_sync(&ep->probe_work);
+	}
+}
+
 int urp_emit_credit_frame(struct urp_endpoint *ep, struct urp_qp *qps,
 			  u32 stream_id, u16 grants)
 {

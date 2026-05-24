@@ -263,6 +263,13 @@ struct urp_endpoint {
 	struct work_struct	rx_work;
 	struct workqueue_struct	*rx_wq;
 
+	/* Phase 3b: per-endpoint probe ticker. Fires every
+	 * URP_PROBE_INTERVAL_MS on the system workqueue, emits one PING
+	 * per established QP, reschedules itself. Cancelled in
+	 * urp_endpoint_drain. */
+	struct delayed_work	probe_work;
+	bool			probe_active;
+
 	/* /proc/urp/<name>/stats entry (set by urp_endpoint_proc_create) */
 	struct proc_dir_entry	*proc_dir;
 };
@@ -336,6 +343,8 @@ int  urp_stream_pump_start(struct urp_stream *stream);
 void urp_stream_pump_stop(struct urp_stream *stream);
 int  urp_emit_credit_frame(struct urp_endpoint *ep, struct urp_qp *qps,
 			   u32 stream_id, u16 grants);
+void urp_probe_work_start(struct urp_endpoint *ep);
+void urp_probe_work_stop(struct urp_endpoint *ep);
 
 /* CQ completion callbacks (urp_rdma.c) -- used by pump when posting sends */
 void urp_send_done(struct ib_cq *cq, struct ib_wc *wc);
