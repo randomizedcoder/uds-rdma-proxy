@@ -111,6 +111,21 @@ struct urp_qp {
 	atomic64_t		rx_bytes;
 	atomic64_t		tx_frames;
 	atomic64_t		rx_frames;
+
+	/*
+	 * Phase 3b QP health-probe state (design 08a). probe_seq is the
+	 * next outgoing PING sequence number. last_ping_ns is the
+	 * monotonic timestamp of the last PING we sent on this QP, used
+	 * to compute RTT when the PONG arrives. consecutive_misses
+	 * counts PINGs that didn't get a PONG within the timeout (used
+	 * by the qualifying / draining state machine). rtt_ewma_ns is
+	 * the exponentially-weighted RTT in nanoseconds (alpha = 0.2);
+	 * 0 until the first PONG lands.
+	 */
+	u32			probe_seq;
+	u32			consecutive_misses;
+	u64			last_ping_ns;
+	u64			rtt_ewma_ns;
 };
 
 /*
@@ -381,6 +396,85 @@ static inline u16 urp_frame_decode_credits(const void *buf)
 	const u8 *p = buf;
 
 	return get_unaligned_le16(p + 14);
+}
+
+/*
+ * QP health probe wire payloads (Phase 3b, design 08a §8a.2).
+ * Carried inside a frame_type == URP_FRAME_TYPE_PROBE frame; flags
+ * distinguish PING (0) from PONG (URP_PROBE_FLAG_PONG).
+ *
+ * PING (32 bytes, little-endian):
+ *   [0..4)   probe_seq        u32
+ *   [4..6)   qp_index         u16
+ *   [6]      clock_flags      u8
+ *   [7]      reserved         u8
+ *   [8..16)  t_send_mono      u64  (initiator's CLOCK_MONOTONIC at send)
+ *   [16..24) t_send_real      u64  (initiator's CLOCK_REALTIME at send)
+ *   [24..32) padding          u64
+ *
+ * PONG (48 bytes): same layout for fields 0..16 as PING (echoed),
+ *   then [24..32) t_recv_real, [32..40) t_pong_mono, [40..48) t_pong_real.
+ *
+ * Sizes match crates/uds-rdma-protocol/src/probe.rs.
+ */
+#define URP_PING_PAYLOAD_SIZE	32
+#define URP_PONG_PAYLOAD_SIZE	48
+#define URP_PROBE_FLAG_PONG	(1 << 0)
+
+static inline void urp_ping_encode(void *buf, u32 probe_seq, u16 qp_index,
+				   u64 t_send_mono, u64 t_send_real)
+{
+	u8 *p = buf;
+
+	put_unaligned_le32(probe_seq, p);
+	put_unaligned_le16(qp_index, p + 4);
+	p[6] = 0;	/* clock_flags */
+	p[7] = 0;	/* reserved */
+	put_unaligned_le64(t_send_mono, p + 8);
+	put_unaligned_le64(t_send_real, p + 16);
+	put_unaligned_le64(0, p + 24);
+}
+
+static inline u32 urp_ping_decode_seq(const void *buf)
+{
+	return get_unaligned_le32((const u8 *)buf);
+}
+
+static inline u16 urp_ping_decode_qp_index(const void *buf)
+{
+	return get_unaligned_le16((const u8 *)buf + 4);
+}
+
+static inline u64 urp_ping_decode_t_send_mono(const void *buf)
+{
+	return get_unaligned_le64((const u8 *)buf + 8);
+}
+
+static inline u64 urp_ping_decode_t_send_real(const void *buf)
+{
+	return get_unaligned_le64((const u8 *)buf + 16);
+}
+
+/* Encode a PONG by echoing the PING fields and appending responder
+ * timestamps. ping must point to the received PING payload. */
+static inline void urp_pong_encode(void *buf, const void *ping,
+				   u64 t_recv_real, u64 t_pong_mono,
+				   u64 t_pong_real)
+{
+	u8 *p = buf;
+	const u8 *q = ping;
+
+	/* Echo PING [0..24) -- probe_seq, qp_index, clock_flags, reserved,
+	 * t_send_mono, t_send_real. */
+	memcpy(p, q, 24);
+	put_unaligned_le64(t_recv_real, p + 24);
+	put_unaligned_le64(t_pong_mono, p + 32);
+	put_unaligned_le64(t_pong_real, p + 40);
+}
+
+static inline u64 urp_pong_decode_t_pong_mono(const void *buf)
+{
+	return get_unaligned_le64((const u8 *)buf + 32);
 }
 
 static inline u64 urp_frame_decode_seq(const void *buf)
