@@ -41,7 +41,17 @@ static int urp_bufs_init(struct urp_endpoint *ep, struct ib_device *dev)
 		.flags		= 0,	/* no DMA mapping -- see comment above */
 		.order		= 0,
 		.pool_size	= URP_NUM_BUFS,
-		.nid		= NUMA_NO_NODE,
+		/*
+		 * Phase 4 Step 2: NUMA-aware allocation. When the
+		 * underlying NIC has a real PCI parent we can read its
+		 * numa_node and steer page_pool to allocate close to the
+		 * NIC. For rxe / siw the parent is missing or has no NUMA
+		 * binding, so we fall back to NUMA_NO_NODE ("any node") --
+		 * page_pool handles either input transparently.
+		 */
+		.nid		= (dev->dev.parent
+				   ? dev_to_node(dev->dev.parent)
+				   : NUMA_NO_NODE),
 		.dev		= NULL,
 		.dma_dir	= DMA_BIDIRECTIONAL,
 		.max_len	= URP_BUF_SIZE,
