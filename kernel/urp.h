@@ -33,6 +33,7 @@
 
 #include "include/uapi/linux/urp.h"
 #include "urp_credit.h"
+#include "urp_reorder.h"
 
 /* Buffer pool sizing -- defaults; per-endpoint values override at create */
 #define URP_NUM_BUFS		64
@@ -132,6 +133,37 @@ struct urp_connection {
 };
 
 /*
+ * struct urp_stream - one multiplexed connection over the endpoint's
+ *                     QP set (Phase 3a Step 6).
+ *
+ * Each accepted UDS connection (Step 7) maps to one stream.  Sequence
+ * spaces are per-stream (design 09 §9.6); reorder buffer + credit
+ * state are per-stream because multi-QP delivery across an endpoint is
+ * shared by all of its streams.
+ *
+ * Lifecycle is mediated by call_rcu so concurrent rhashtable walks see
+ * a stable view until their read-side critical section ends, matching
+ * the pattern used by the endpoint table.
+ */
+struct urp_stream {
+	struct urp_endpoint	*ep;		/* back-pointer */
+	u32			id;		/* rhashtable key */
+	enum urp_stream_state	state;
+	struct mutex		lock;		/* serializes state changes */
+
+	u64			tx_seq;		/* next outgoing seq */
+	u64			rx_next;	/* next expected incoming seq */
+
+	struct urp_credit	credit;		/* per-stream flow control */
+	struct urp_reorder	*reorder;	/* per-stream reorder buffer */
+
+	struct socket		*uds_sock;	/* this stream's UDS endpoint */
+
+	struct rhash_head	ht_node;
+	struct rcu_head		rcu;
+};
+
+/*
  * struct urp_endpoint - one configured proxy endpoint
  *
  * Multiple endpoints exist concurrently; lookup is by name via the global
@@ -180,6 +212,11 @@ struct urp_endpoint {
 	atomic_t		qps_connected;	/* count of QPs in ESTABLISHED state */
 	atomic_t		qps_accepted;	/* acceptor: count of CONNECT_REQUESTs processed */
 	atomic_t		rr_counter;	/* round-robin selector cursor */
+
+	/* Stream multiplexing (Phase 3a Step 6) */
+	struct rhashtable	streams;	/* keyed by u32 stream_id */
+	bool			streams_inited;
+	atomic_t		next_stream_id;	/* monotonic per-direction allocator */
 
 	/* Buffer pool */
 	struct urp_buffer	bufs[URP_NUM_BUFS];
@@ -243,6 +280,15 @@ int  urp_qps_init(struct urp_endpoint *ep);
 void urp_qps_destroy(struct urp_endpoint *ep);
 struct urp_qp *urp_qp_select_round_robin(struct urp_endpoint *ep);
 int  urp_qp_index_of(struct urp_endpoint *ep, struct ib_qp *qp);
+
+/* urp_stream.c -- stream multiplexing core (Phase 3a Step 6) */
+int  urp_streams_init(struct urp_endpoint *ep);
+void urp_streams_destroy_all(struct urp_endpoint *ep);
+u32  urp_stream_next_id(struct urp_endpoint *ep);
+int  urp_stream_create(struct urp_endpoint *ep, u32 stream_id,
+		       struct urp_stream **out_stream);
+struct urp_stream *urp_stream_lookup(struct urp_endpoint *ep, u32 stream_id);
+void urp_stream_destroy(struct urp_endpoint *ep, struct urp_stream *s);
 
 /* urp_pump.c */
 int  urp_pump_start(struct urp_endpoint *ep);
