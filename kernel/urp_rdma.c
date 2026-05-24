@@ -247,8 +247,16 @@ static int urp_endpoint_setup_shared(struct urp_endpoint *ep,
 		goto err_send_cq;
 	}
 
+	/* SRQ shared across all QPs (Step 3). */
+	ret = urp_srq_create(ep);
+	if (ret)
+		goto err_recv_cq;
+
 	return 0;
 
+err_recv_cq:
+	ib_free_cq(ep->recv_cq);
+	ep->recv_cq = NULL;
 err_send_cq:
 	ib_free_cq(ep->send_cq);
 	ep->send_cq = NULL;
@@ -274,8 +282,9 @@ static int urp_qp_create_on_cm_id(struct urp_endpoint *ep,
 
 	attr.send_cq = ep->send_cq;
 	attr.recv_cq = ep->recv_cq;
+	attr.srq = ep->srq;			/* Step 3: shared RQ */
 	attr.cap.max_send_wr = URP_SQ_DEPTH;
-	attr.cap.max_recv_wr = URP_RQ_DEPTH;
+	attr.cap.max_recv_wr = 0;		/* recvs flow through SRQ */
 	attr.cap.max_send_sge = 1;
 	attr.cap.max_recv_sge = 1;
 	attr.qp_type = IB_QPT_RC;
@@ -330,7 +339,6 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 {
 	struct urp_buffer *buf = container_of(wc->wr_cqe, struct urp_buffer, cqe);
 	struct urp_endpoint *ep = cq->cq_context;
-	struct ib_qp *src_qp = wc->qp;	/* repost back to this QP */
 	struct msghdr msg = {};
 	struct kvec iov;
 	u32 payload_len;
@@ -340,7 +348,7 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 		if (wc->status != IB_WC_WR_FLUSH_ERR)
 			pr_err("urp: recv completion error: %s (%d)\n",
 			       ib_wc_status_msg(wc->status), wc->status);
-		/* Return buffer to pool so subsequent connects can repost it. */
+		/* Return buffer to pool so it can be reposted. */
 		urp_buf_free_recv(ep, buf);
 		return;
 	}
@@ -369,17 +377,28 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 
 repost:
 	/*
-	 * Return buffer to pool and repost to the SAME QP this completion
-	 * arrived on, so we keep each QP's RQ topped up. Step 3's SRQ moves
-	 * to a single shared queue and removes the per-QP refill loop here.
+	 * Recycle the buffer back to the SRQ. With one shared pool per
+	 * endpoint, recv completions on any QP refill the same SRQ.
 	 */
 	urp_buf_free_recv(ep, buf);
 	buf = urp_buf_alloc_recv(ep);
-	if (buf) {
-		ret = urp_post_recv(ep, src_qp, buf);
+	if (buf && ep->srq) {
+		ret = urp_post_srq_recv(ep, buf);
 		if (ret)
 			urp_buf_free_recv(ep, buf);
+	} else if (buf) {
+		urp_buf_free_recv(ep, buf);
 	}
+}
+
+/*
+ * Alias so urp_srq.c can register the same callback without exposing
+ * the static linkage of urp_recv_done. The cqe->done function pointer
+ * is what dispatches, so the alias is purely a naming convenience.
+ */
+void urp_recv_done_for_srq(struct ib_cq *cq, struct ib_wc *wc)
+{
+	urp_recv_done(cq, wc);
 }
 
 /*
@@ -461,9 +480,8 @@ static int urp_cm_accept_one(struct rdma_cm_id *child, struct urp_endpoint *ep)
 		}
 	}
 
-	ret = urp_post_recv_for_qp(ep, child->qp, urp_recvs_per_qp(ep));
-	if (ret)
-		goto err_destroy_qp;
+	/* Recv buffers are pre-posted to ep->srq inside
+	 * urp_endpoint_setup_shared; no per-QP RQ to fill (Step 3). */
 
 	param.responder_resources = 1;
 	param.initiator_depth = 1;
@@ -521,9 +539,7 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 		if (ret)
 			break;
 
-		ret = urp_post_recv_for_qp(ep, id->qp, urp_recvs_per_qp(ep));
-		if (ret)
-			break;
+		/* Recvs are pre-posted to ep->srq in setup_shared (Step 3). */
 
 		{
 			struct rdma_conn_param param = {};
@@ -739,6 +755,7 @@ void urp_rdma_cleanup(struct urp_endpoint *ep)
 	ep->connected = false;
 
 	/* Shared resources -- only present once any QP setup completed. */
+	urp_srq_destroy(ep);
 	if (ep->send_cq) {
 		ib_free_cq(ep->send_cq);
 		ep->send_cq = NULL;

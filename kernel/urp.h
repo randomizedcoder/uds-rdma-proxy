@@ -164,6 +164,8 @@ struct urp_endpoint {
 	struct ib_pd		*pd;
 	struct ib_cq		*send_cq;
 	struct ib_cq		*recv_cq;
+	struct ib_srq		*srq;		/* shared receive queue (Step 3) */
+	u32			srq_pool_target;
 
 	/* Multi-QP state (Phase 3a Step 2 scaffold; Step 2b fills it) */
 	struct urp_qp	*qps;		/* array of num_qps entries; allocated in activate */
@@ -221,6 +223,12 @@ struct urp_buffer *urp_buf_alloc_recv(struct urp_endpoint *ep);
 void urp_buf_free_recv(struct urp_endpoint *ep, struct urp_buffer *buf);
 int  urp_post_recv(struct urp_endpoint *ep, struct ib_qp *qp, struct urp_buffer *buf);
 int  urp_post_recv_for_qp(struct urp_endpoint *ep, struct ib_qp *qp, u32 count);
+
+/* urp_srq.c -- Shared Receive Queue (Phase 3a Step 3) */
+int  urp_srq_create(struct urp_endpoint *ep);
+void urp_srq_destroy(struct urp_endpoint *ep);
+int  urp_srq_post_initial(struct urp_endpoint *ep);
+int  urp_post_srq_recv(struct urp_endpoint *ep, struct urp_buffer *buf);
 
 /* urp_qp.c -- per-QP state and selection (Phase 3a Step 2) */
 int  urp_qps_init(struct urp_endpoint *ep);
