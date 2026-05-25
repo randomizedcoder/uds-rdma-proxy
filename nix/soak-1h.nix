@@ -58,10 +58,14 @@ pkgs.writeShellApplication {
     YELLOW=$'\033[1;33m'
     NC=$'\033[0m'
 
+    # shellcheck disable=SC2329 # helpers may be unused on the happy path
     log()  { echo "''${GREEN}[+]''${NC} $*"; }
+    # shellcheck disable=SC2329
     warn() { echo "''${YELLOW}[!]''${NC} $*"; }
+    # shellcheck disable=SC2329
     fail() { echo "''${RED}[-]''${NC} $*"; }
 
+    # shellcheck disable=SC2329 # invoked indirectly via `trap cleanup EXIT`
     cleanup() {
         log "Cleaning up..."
 
@@ -236,8 +240,8 @@ pkgs.writeShellApplication {
     DMESG_ERR_COUNT=0
     if [ "$NEW_LINES" -gt 0 ]; then
         DMESG_ERR_COUNT=$(dmesg | tail -"$NEW_LINES" \
-            | grep -iE "urp:.*error|urp:.*panic|urp:.*bug|urp:.*warn" \
-            | wc -l || true)
+            | grep -ciE "urp:.*error|urp:.*panic|urp:.*bug|urp:.*warn" \
+            || true)
     fi
 
     echo ""

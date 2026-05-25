@@ -8,13 +8,22 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     flake-utils.url = "github:numtide/flake-utils";
+
+    # Phase 5: declarative microvm pair for kernel-module testing.
+    # Provides the QEMU runner; lifecycle / pair orchestration lives
+    # in nix/microvms/ (patterned after xdp2 + pcp).
+    microvm = {
+      url = "github:astro/microvm.nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, rust-overlay, flake-utils }:
+  outputs = { self, nixpkgs, rust-overlay, flake-utils, microvm }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
+        lib = nixpkgs.lib;
 
         packages = import ./nix/packages.nix { inherit pkgs; };
         envVars = import ./nix/env-vars.nix { inherit pkgs; };
@@ -61,9 +70,14 @@
           inherit pkgs urpKo urpTestClient urpCli;
         };
 
+        soak1h = import ./nix/soak-1h.nix {
+          inherit pkgs urpKo urpTestClient urpCli;
+        };
+
         testVm = import ./nix/test-vm.nix {
           inherit pkgs urpTestClient urpCli;
           inherit (nixChecks) buildUrpKo;
+          extraSystemPackages = [ soak1h ];
         };
 
         testVmDebug = import ./nix/test-vm.nix {
@@ -80,6 +94,17 @@
           inherit pkgs;
           testVm = testVmDebug;
         };
+
+        # Phase 5: microvm.nix-based VM pair for URP-to-URP kernel
+        # module testing. Two declarative microvms linked over a
+        # private QEMU socket netdev. Patterned after xdp2/pcp:
+        # dual TCP consoles, expect-driven orchestration, trap
+        # cleanup, pgrep -f process=<hostname> for VM identification.
+        # See nix/microvms/.
+        microvms = import ./nix/microvms {
+          inherit pkgs lib microvm nixpkgs urpCli;
+          inherit (nixChecks) buildUrpKo;
+        };
       in
       {
         devShells.default = devshell;
@@ -94,9 +119,10 @@
           urp-cli = urpCli;
           urp-protocol-ffi = urpProtocolFfi;
           test-kmod-k0 = testKmodK0;
+          soak-1h = soak1h;
           urp-vm = urpVm;
           urp-vm-debug = urpVmDebug;
-        };
+        } // microvms.packages;
 
         # buildUrpKo: function to build against any kernel.
         #

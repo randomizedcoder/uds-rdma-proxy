@@ -11,7 +11,8 @@
 #
 # Set enableSanitizers = true to build a debug kernel with KASAN + KMEMLEAK.
 # This triggers a full kernel rebuild (~30 min first time, cached after).
-{ pkgs, buildUrpKo, urpTestClient, urpCli, enableSanitizers ? false }:
+{ pkgs, buildUrpKo, urpTestClient, urpCli, enableSanitizers ? false,
+  extraSystemPackages ? [] }:
 
 let
   sanitizerPatches = [{
@@ -98,7 +99,7 @@ let
         testKmodK0
         urpTestClient
         urpCli
-      ];
+      ] ++ extraSystemPackages;
 
       boot.kernelModules = [ "ib_core" "rdma_cm" "rdma_rxe" ];
 

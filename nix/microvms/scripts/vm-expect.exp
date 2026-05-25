@@ -1,0 +1,109 @@
+#!/usr/bin/env expect
+###############################################################################
+# vm-expect.exp - run one command in a urp microvm via the virtio console.
+#
+# Adapted from xdp2/nix/microvms/scripts/vm-expect.exp. Hostname-based
+# prompt matching, line-by-line buffer, ANSI strip, echo skip.
+#
+# Usage:
+#   vm-expect.exp <port> <hostname> <command> [timeout] [debug_level]
+#
+# Examples:
+#   vm-expect.exp 23501 urp-test-1 "uname -a"
+#   vm-expect.exp 23511 urp-test-2 "urp show" 15 100
+#
+# Debug levels:
+#   0   - quiet, only command output
+#   10  - basic progress
+#   100 - detailed
+#   110 - verbose buffer dumps
+###############################################################################
+
+if {$argc < 3} {
+    send_user "Usage: vm-expect.exp <port> <hostname> <command> \[timeout\] \[debug_level\]\n"
+    exit 1
+}
+
+set port [lindex $argv 0]
+set hostname [lindex $argv 1]
+set command [lindex $argv 2]
+set timeout_secs [expr {$argc > 3 ? [lindex $argv 3] : 10}]
+set output_level [expr {$argc > 4 ? [lindex $argv 4] : 0}]
+
+# Matches: root@urp-test-1:~# or root@urp-test-1:/path#
+set prompt_pattern "root@${hostname}:\[^#\]*#"
+
+proc capture_output {spawn_id prompt timeout_secs} {
+    global output_level
+
+    set timeout $timeout_secs
+    set timeout_count 0
+    set max_timeouts 3
+    set lines {}
+    set skip_first 1
+
+    expect {
+        -i $spawn_id -re "\r\n" {
+            set buf $expect_out(buffer)
+            regsub {\r\n$} $buf {} buf
+            regsub -all {\r} $buf {} buf
+            regsub -all {\x1b\[[0-9;]*[a-zA-Z]} $buf {} buf
+            regsub -all {\x1b\][^\x07]*\x07} $buf {} buf
+            regsub -all {\[\?[0-9]+[a-z]} $buf {} buf
+
+            if {$output_level > 110} { send_user -- "LINE: '$buf'\n" }
+
+            if {$skip_first} {
+                set skip_first 0
+                exp_continue -continue_timer
+            } else {
+                if {[string length $buf] > 0} { lappend lines $buf }
+                exp_continue -continue_timer
+            }
+        }
+        -i $spawn_id -re $prompt {
+            if {$output_level > 10} { send_user -- "-- prompt --\n" }
+        }
+        -i $spawn_id eof {
+            if {$output_level > 0} { send_user "ERROR: console closed\n" }
+        }
+        timeout {
+            incr timeout_count
+            if {$timeout_count < $max_timeouts} {
+                if {$output_level > 10} {
+                    send_user "TIMEOUT: retry $timeout_count/$max_timeouts\n"
+                }
+                exp_continue
+            } else {
+                if {$output_level > 0} {
+                    send_user "ERROR: command timed out (${timeout_secs}s x $max_timeouts)\n"
+                }
+            }
+        }
+    }
+
+    return $lines
+}
+
+log_user 0
+
+spawn nc 127.0.0.1 $port
+set nc_id $spawn_id
+sleep 0.3
+send "\r"
+
+set timeout $timeout_secs
+expect {
+    -re $prompt_pattern {}
+    timeout { send_user "ERROR: no prompt on port $port for $hostname\n"; exit 1 }
+    eof     { send_user "ERROR: console connect failed\n"; exit 1 }
+}
+
+send "$command\r"
+set output [capture_output $nc_id $prompt_pattern $timeout_secs]
+
+foreach line $output { send_user -- "$line\n" }
+
+send "exit\r"
+expect eof
+exit 0
