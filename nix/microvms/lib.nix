@@ -123,6 +123,7 @@ in rec {
       T_URP=${toString t.urpReady}
       T_CM=${toString t.cmEstablished}
       T_ECHO=${toString t.echo}
+      # shellcheck disable=SC2034  # used inline by per-step timeout
       T_DRAIN=${toString t.drainRemove}
       T_SHUTDOWN=${toString t.shutdown}
 
@@ -462,16 +463,41 @@ in rec {
       echo ""
 
       # -----------------------------------------------------------------
-      # Phase 11 — teardown (drain, remove, rmmod)
+      # Phase 11 — teardown (drain, remove, rmmod), each step timed
+      # so the slow command pops out of the verdict table.
       # -----------------------------------------------------------------
+      if [ -n "''${URP_PAIR_KEEP_VMS:-}" ]; then
+        info "URP_PAIR_KEEP_VMS set; skipping Phase 11 teardown"
+        info "vm1 virtio: nc 127.0.0.1 $VM1_VIRTIO ; vm2 virtio: nc 127.0.0.1 $VM2_VIRTIO"
+        trap - EXIT INT TERM
+        exit 0
+      fi
       echo "--- Phase 11: teardown ---"
       P11_START=$(now_ms)
-      vm_run "$VM2_VIRTIO" "$VM2_PROC" \
-        "urp drain pair_initiator 2>/dev/null; urp remove pair_initiator 2>/dev/null; rmmod urp 2>/dev/null; echo DOWN2" "$T_DRAIN" \
-        | grep -q DOWN2 || info "vm2 teardown incomplete"
-      vm_run "$VM1_VIRTIO" "$VM1_PROC" \
-        "urp drain pair_acceptor 2>/dev/null; urp remove pair_acceptor 2>/dev/null; pkill socat 2>/dev/null; rmmod urp 2>/dev/null; echo DOWN1" "$T_DRAIN" \
-        | grep -q DOWN1 || info "vm1 teardown incomplete"
+      run_step() {
+        # $1 label, $2 marker, $3 port, $4 host, $5 cmd, $6 timeout
+        local t0 out elapsed
+        t0=$(now_ms)
+        out=$(vm_run "$3" "$4" "$5" "$6")
+        elapsed=$(( $(now_ms) - t0 ))
+        if echo "$out" | grep -q "$2"; then
+          info "$1 ''${elapsed}ms"
+        else
+          info "$1 ''${elapsed}ms (INCOMPLETE — marker $2 not seen)"
+        fi
+      }
+      run_step "vm2 urp drain"  D2D "$VM2_VIRTIO" "$VM2_PROC" \
+        "urp drain pair_initiator 2>&1; echo D2D" 10
+      run_step "vm2 urp remove" D2R "$VM2_VIRTIO" "$VM2_PROC" \
+        "urp remove pair_initiator 2>&1; echo D2R" 10
+      run_step "vm2 rmmod urp"  D2M "$VM2_VIRTIO" "$VM2_PROC" \
+        "rmmod urp 2>&1; echo D2M" 10
+      run_step "vm1 urp drain"  D1D "$VM1_VIRTIO" "$VM1_PROC" \
+        "urp drain pair_acceptor 2>&1; echo D1D" 10
+      run_step "vm1 urp remove" D1R "$VM1_VIRTIO" "$VM1_PROC" \
+        "urp remove pair_acceptor 2>&1; echo D1R" 10
+      run_step "vm1 rmmod urp"  D1M "$VM1_VIRTIO" "$VM1_PROC" \
+        "pkill socat 2>/dev/null; rmmod urp 2>&1; echo D1M" 10
       P11_MS=$(( $(now_ms) - P11_START ))
       pass "teardown done (''${P11_MS}ms)"
 
@@ -485,8 +511,16 @@ in rec {
       echo ""
 
       # -----------------------------------------------------------------
-      # Phase 12 — graceful shutdown
+      # Phase 12 — graceful shutdown (skipped via URP_PAIR_KEEP_VMS=1)
       # -----------------------------------------------------------------
+      if [ -n "''${URP_PAIR_KEEP_VMS:-}" ]; then
+        info "URP_PAIR_KEEP_VMS set; leaving VMs running for inspection"
+        info "vm1 virtio console: nc 127.0.0.1 $VM1_VIRTIO"
+        info "vm2 virtio console: nc 127.0.0.1 $VM2_VIRTIO"
+        trap - EXIT INT TERM
+        exit 0
+      fi
+
       echo "--- Phase 12: shutdown VMs ---"
       P12_START=$(now_ms)
       vm_run "$VM2_VIRTIO" "$VM2_PROC" "poweroff" 5 >/dev/null 2>&1 || true

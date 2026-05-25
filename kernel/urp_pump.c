@@ -61,15 +61,19 @@ static int urp_tx_thread_fn(void *data)
 				 * urp_socket_conn_cleanup runs on drain/CM
 				 * disconnect.
 				 *
-				 * Without this, a request/response pattern like
-				 * `echo X | socat ... UNIX-CONNECT:/tmp/sock`
-				 * loses the response: socat shutdown(WR) makes
-				 * recvmsg return 0, we set active=false, vm1's
-				 * echo reply arrives at the RX completion handler
-				 * and finds conn.active=false -> uds=NULL ->
-				 * frame dropped to the repost path.
+				 * Don't `break` out of the kthread function
+				 * here: Linux 7.0.x kthread_stop() WARNs +
+				 * NULL-derefs when called on a kthread that has
+				 * already exited via `return 0` (see
+				 * https://...). Instead, park the kthread on a
+				 * waitqueue tied to kthread_should_stop() so
+				 * the eventual urp_pump_stop() reap is normal.
 				 */
-				pr_info("urp: peer half-closed write side; pump exiting (rx still routes)\n");
+				pr_info("urp: peer half-closed write side; pump parking (rx still routes)\n");
+				while (!kthread_should_stop())
+					schedule_timeout_interruptible(HZ);
+				pr_info("urp: TX pump stopped\n");
+				return 0;
 			} else if (ret != -ERESTARTSYS && ret != -EAGAIN) {
 				pr_err("urp: kernel_recvmsg failed: %d\n", ret);
 				conn->active = false;
