@@ -439,14 +439,9 @@ in rec {
           > "/tmp/urp-microvm-pair/diag/$label.dmesg-pre.txt"
       done
 
-      # `echo X | socat` closes stdin so quickly that the urp TX pump's
-      # first kernel_recvmsg on the freshly-accepted UDS connection can
-      # return 0 (EOF) before any data is read. Keep stdin alive with a
-      # short sleep so socat doesn't tear the connection down before
-      # the pump has had a chance to drain it.
       P10_START=$(now_ms)
       RESULT=$(vm_run "$VM2_VIRTIO" "$VM2_PROC" \
-        "(echo hello-pair; sleep 2) | socat -t 5 - UNIX-CONNECT:/tmp/urp-pair.sock" "$T_ECHO" \
+        "echo hello-pair | socat -t 5 - UNIX-CONNECT:/tmp/urp-pair.sock" "$T_ECHO" \
         | tr -d '\r' | grep -v '^$' | tail -1)
       P10_MS=$(( $(now_ms) - P10_START ))
       echo "  response: '$RESULT'"
@@ -479,6 +474,14 @@ in rec {
         | grep -q DOWN1 || info "vm1 teardown incomplete"
       P11_MS=$(( $(now_ms) - P11_START ))
       pass "teardown done (''${P11_MS}ms)"
+
+      # Capture post-teardown dmesg from both VMs (before they shut
+      # down). Useful for diagnosing any drain failures.
+      for label in vm1 vm2; do
+        if [ "$label" = vm1 ]; then port=$VM1_VIRTIO host=$VM1_PROC; else port=$VM2_VIRTIO host=$VM2_PROC; fi
+        vm_run "$port" "$host" "dmesg | tail -30" 10 \
+          > "/tmp/urp-microvm-pair/diag/$label.dmesg-teardown.txt" 2>/dev/null || true
+      done
       echo ""
 
       # -----------------------------------------------------------------

@@ -274,6 +274,25 @@ void urp_socket_conn_cleanup(struct urp_endpoint *ep)
 
 void urp_socket_cleanup(struct urp_endpoint *ep)
 {
+	/*
+	 * Order matters (same principle as urp_socket_conn_cleanup):
+	 *   1. kernel_sock_shutdown(listen_sock) wakes the accept_thread
+	 *      blocked in kernel_accept with -EINTR / -ECONNABORTED.
+	 *      Without this, step 2's kthread_stop blocks for 45s+ while
+	 *      the accept syscall sits in TASK_INTERRUPTIBLE -- expect's
+	 *      command timeout fires before kthread_stop returns, the
+	 *      shell goes back to the caller, and `urp drain` looks
+	 *      hung. Driver-level teardown still finishes, just very
+	 *      slowly. This was the root cause of the 76s teardown in
+	 *      the Phase 5 pair test.
+	 *   2. kthread_stop joins the now-woken accept_thread.
+	 *   3. urp_socket_conn_cleanup handles the per-connection
+	 *      kthread + uds_sock the same way.
+	 *   4. sock_release the listen_sock.
+	 */
+	if (ep->listen_sock)
+		kernel_sock_shutdown(ep->listen_sock, SHUT_RDWR);
+
 	if (ep->accept_thread) {
 		kthread_stop(ep->accept_thread);
 		ep->accept_thread = NULL;
@@ -282,7 +301,6 @@ void urp_socket_cleanup(struct urp_endpoint *ep)
 	urp_socket_conn_cleanup(ep);
 
 	if (ep->listen_sock) {
-		kernel_sock_shutdown(ep->listen_sock, SHUT_RDWR);
 		sock_release(ep->listen_sock);
 		ep->listen_sock = NULL;
 	}

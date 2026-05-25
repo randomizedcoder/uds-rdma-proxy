@@ -276,7 +276,17 @@ void urp_endpoint_drain(struct urp_endpoint *ep)
 
 	mutex_lock(&ep->lock);
 	urp_probe_work_stop(ep);
-	urp_pump_stop(ep);
+	/*
+	 * urp_socket_cleanup is responsible for both the listen socket
+	 * and the per-connection state, and it shuts the relevant
+	 * sockets down BEFORE kthread_stop'ing the corresponding
+	 * kthreads (see comments there). Calling urp_pump_stop()
+	 * standalone first would block waiting for the TX kthread to
+	 * exit while the kthread is asleep in kernel_recvmsg with no
+	 * shutdown -- previously this hung indefinitely on the acceptor
+	 * side of the Phase 5 pair test until the harness's per-command
+	 * expect timeout fired.
+	 */
 	urp_socket_cleanup(ep);
 	urp_rdma_cleanup(ep);
 	urp_streams_destroy_all(ep);
