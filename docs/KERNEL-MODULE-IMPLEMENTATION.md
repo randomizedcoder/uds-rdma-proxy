@@ -2,7 +2,7 @@
 
 Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.md).
 
-**Last updated**: 2026-05-24 (Phase 3a + 3b + 4 complete; HEAD `c41bd61` on `phase4-k2-optimized`. 23/23 `test-kmod-k0` PASS; 1-hour soak PASS at 1240 cycles + 120 churn add/remove.)
+**Last updated**: 2026-05-24 (Phase 5 Step 1-4 done; HEAD `662b0af` on `phase5-vm-pair`. microvm.nix VM-pair harness lands, exposes + fixes rdma_connect self-deadlock under multi-cm-id, URP-to-URP echo round-trip PASS.)
 
 ---
 
@@ -17,7 +17,7 @@ Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.
 | 3b | [Probes + PSK Auth](#phase-3b-probes--psk-auth) | Complete (`dd6bab0`) | 10/10 |
 | 3 | [k1 -- Functional](#phase-3-k1----functional) | In Progress (via 3a) | 0/14 |
 | 4 | [k2 -- Optimized](#phase-4-k2----optimized) | rxe-testable scope complete (`c41bd61`) + 1-hour soak PASS | 2/8 main + 3 deferred-hardware; soak harness + on-reconnect-leak fix added |
-| 5 | [MicroVM Integration](#phase-5-microvm-integration) | Not Started | 0/8 |
+| 5 | [MicroVM Integration](#phase-5-microvm-integration) | In Progress (`662b0af`) | 1/8 (x86_64 pair PASS) |
 
 ---
 
@@ -632,11 +632,11 @@ Drain + rmmod freed 128 kB of slab beyond the in-loop measurement -- that's the 
 
 ## Phase 5: MicroVM Integration
 
-**Status**: Not Started
+**Status**: In Progress (Steps 1-4 done; `662b0af` on `phase5-vm-pair`)
 
 ### Deliverables
 
-- [ ] MicroVM x86_64 pair test passes end-to-end (boot -> load -> test -> clean -> shutdown)
+- [x] MicroVM x86_64 pair test passes end-to-end (boot -> load -> test -> clean -> shutdown) -- `662b0af`, `nix run .#urp-microvm-pair-test` -> "PASS: URP-to-URP echo round-trip succeeded"
 - [ ] MicroVM aarch64 pair test passes
 - [ ] MicroVM riscv64 pair test passes
 - [ ] KASAN/KMEMLEAK clean in all VM tests
@@ -645,13 +645,45 @@ Drain + rmmod freed 128 kB of slab beyond the in-loop measurement -- that's the 
 - [ ] Kernel version matrix: module builds and tests pass on 6.1, 6.6, 6.12, latest
 - [ ] Redpanda cluster test: produce/consume works through kernel module proxy
 
+### Step Status (x86_64 microvm harness)
+
+| Step | Commit | Subject |
+|------|--------|---------|
+| 1 | `042982a` | microvm.nix-based VM-pair test harness (replaces hand-rolled qemu-vm.nix orchestrator) |
+| 2 | `1703d72` | Finer-grained verification phases (5b/6b/8b/9b + pre/post echo diag) |
+| 3 | `2e8b5ce` | Defer rdma_connect() to fix CM self-deadlock (qp stuck in INIT under multi-cm-id) |
+| 4 | `662b0af` | Keep socat stdin alive across UDS handshake (`hello-pair` round-trip PASS) |
+
+### Variations from Plan
+
+1. **Replaced hand-rolled qemu-vm.nix harness with microvm.nix** -- The Phase 5 plan
+   implied building a custom QEMU orchestrator. Adopted xdp2/pcp patterns instead
+   (declarative microvm runner, dual TCP consoles, expect-driven interaction,
+   trap cleanup, `pgrep -f process=<hostname>`). Eliminated entire classes of bugs
+   the hand-rolled version had (silent SSH-poll timeouts, output-buffering loss,
+   orphaned QEMU on wrapper exit, vermagic drift).
+
+2. **Exposed a real urp kernel bug during smoke testing** -- The migration's
+   finer-grained lifecycle phases caught a CM self-deadlock in the multi-cm-id
+   path: `rdma_connect()` called inline from the CM event handler took
+   `id->qp_mutex` while the rdma_cm core already held it, hanging the
+   `cma_work_handler` kworker. Step 3 fixed via deferred work item.
+
+3. **socat-stay-alive workaround in test harness** -- `echo X | socat`'s stdin
+   closes so fast that the urp TX pump's first kernel_recvmsg returns 0 before
+   any bytes are read. Step 4 adds `; sleep 2` to keep the socket open across
+   the pump's first scheduling. Underlying pump teardown semantics (drain
+   pending data before exit on EOF) is a known follow-up.
+
+### Cross-Architecture Results
+
 ### Cross-Architecture Results
 
 | Architecture | Emulation | Status | Duration | Notes |
 |-------------|-----------|--------|----------|-------|
-| x86_64 | KVM (native) | | | |
-| aarch64 | QEMU TCG | | | |
-| riscv64 | QEMU TCG | | | |
+| x86_64 | KVM (native) | PASS (`662b0af`) | ~6 min full pair test | smoke + 12-phase lifecycle |
+| aarch64 | QEMU TCG | Not started | | deferred |
+| riscv64 | QEMU TCG | Not started | | deferred |
 
 ### Kernel Version Matrix
 

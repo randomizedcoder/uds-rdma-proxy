@@ -4,9 +4,8 @@ _Last updated: 2026-05-24_
 
 ## Current branch
 
-`phase4-k2-optimized` — cut from `phase3b-probes-psk` HEAD `99ac7ff`
-(Phases 3a + 3b finalized). The previous branches still exist locally
-and carry their respective phases' commits.
+`phase5-vm-pair` — cut from `phase4-k2-optimized` HEAD `a1f9c52` (Phase 4
+rxe-testable scope + 1-hour soak PASS). Phase 5 Steps 1-4 done.
 
 ## Where we are
 
@@ -19,7 +18,8 @@ and carry their respective phases' commits.
 | **3b** — probes / PSK | `docs/KERNEL-MODULE-PLAN.md` §3.6-§3.7 + `KERNEL-MODULE-IMPLEMENTATION.md` §Phase 3b | ✅ **Complete. Steps 1-10 done (`0d5c077` through `dd6bab0`). Probes (PING/PONG/RTT EWMA/state machine), PSK SHA-256 + rdma_cm `private_data` validation, auth-failure observability all wired. Test-kmod-k0 23/23 PASS. Sub-steps 8b (initiator-validates-acceptor) + 3b/test (URP-to-URP harness) pending.** |
 | 3c — KUnit hardening + soak | (deferred) | not started |
 | **4** — k2 optimized | `docs/KERNEL-MODULE-PLAN.md` §4 + `KERNEL-MODULE-IMPLEMENTATION.md` §Phase 4 | ✅ **rxe-testable scope complete + 1-hour soak PASS. Steps: 1 page_pool (`ded84a7`), 2 NUMA-aware (`78967e5`), 3 tracker (`c535c7a`), 4-5 soak harness + reconnect-leak fix (`c41bd61`). 23/23 `test-kmod-k0` + 1240 cycles + 120 churn add/remove with 0 errors, 1828 kB slab leak (budget 2048). §4.2 zero-copy / §4.3 adaptive CQ / §4.4 kthread NUMA bind / §4.5 hardware benchmarks deferred to a hardware-validation pass.** |
-| 5 / 6 | per `docs/KERNEL-MODULE-PLAN.md` | not started |
+| **5** — MicroVM integration | `docs/KERNEL-MODULE-PLAN.md` §5 + `KERNEL-MODULE-IMPLEMENTATION.md` §Phase 5 | ✅ **x86_64 pair test PASS (`662b0af`). Steps: 1 microvm.nix harness (`042982a`), 2 finer-grained verification phases (`1703d72`), 3 deferred rdma_connect fix for CM self-deadlock (`2e8b5ce`), 4 socat-stay-alive harness tweak (`662b0af`). `nix run .#urp-microvm-pair-test` -> "PASS: URP-to-URP echo round-trip succeeded". aarch64/riscv64/sanitizer/CI/Redpanda deferred.** |
+| 6 | per `docs/KERNEL-MODULE-PLAN.md` | not started |
 
 ## Phase 2 deliverables (now committed in `067829e`)
 
