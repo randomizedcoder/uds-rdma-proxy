@@ -2,7 +2,7 @@
 
 Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.md).
 
-**Last updated**: 2026-05-24 (Phase 5 Step 1-5 done; HEAD `6dbac33` on `phase5-vm-pair`. microvm.nix VM-pair harness lands; CM self-deadlock + pump half-close + drain ordering all fixed. URP-to-URP echo round-trip PASS with no harness workarounds.)
+**Last updated**: 2026-05-24 (Phase 5 Step 1-7 done; HEAD `705ae8c` on `phase5-vm-pair`. microvm.nix VM-pair harness + CM self-deadlock + pump half-close + drain ordering + expect-eof + kthread parking. URP-to-URP smoke test PASS in ~38 s (was ~330 s, 9x faster).)
 
 ---
 
@@ -17,7 +17,7 @@ Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.
 | 3b | [Probes + PSK Auth](#phase-3b-probes--psk-auth) | Complete (`dd6bab0`) | 10/10 |
 | 3 | [k1 -- Functional](#phase-3-k1----functional) | In Progress (via 3a) | 0/14 |
 | 4 | [k2 -- Optimized](#phase-4-k2----optimized) | rxe-testable scope complete (`c41bd61`) + 1-hour soak PASS | 2/8 main + 3 deferred-hardware; soak harness + on-reconnect-leak fix added |
-| 5 | [MicroVM Integration](#phase-5-microvm-integration) | In Progress (`6dbac33`) | 1/8 (x86_64 pair PASS, no workarounds) |
+| 5 | [MicroVM Integration](#phase-5-microvm-integration) | In Progress (`705ae8c`) | 1/8 (x86_64 pair PASS in ~38 s) |
 
 ---
 
@@ -654,6 +654,8 @@ Drain + rmmod freed 128 kB of slab beyond the in-loop measurement -- that's the 
 | 3 | `2e8b5ce` | Defer rdma_connect() to fix CM self-deadlock (qp stuck in INIT under multi-cm-id) |
 | 4 | `662b0af` | Keep socat stdin alive across UDS handshake (`hello-pair` round-trip PASS, harness workaround) |
 | 5 | `6dbac33` | Kernel-side fixes: pump half-close keeps conn alive for RX, drain order fix. Removes Step 4 workaround. |
+| 6 | `36236f1` | Drop the trailing `expect eof` wait in vm-expect.exp -- 20-44x speedup per vm_run; total test 330s -> 120s. |
+| 7 | `705ae8c` | Park TX pump on EOF instead of voluntary return (avoids Linux 7.0.3 kthread_stop WARN+oops). Phase 11 teardown 75s -> 2.2s, Phase 12 shutdown 41s -> 3.5s. Total test ~38s. |
 
 ### Variations from Plan
 
@@ -684,11 +686,16 @@ Drain + rmmod freed 128 kB of slab beyond the in-loop measurement -- that's the 
    yet. Step 5 removes the standalone call; `urp_socket_cleanup ->
    urp_socket_conn_cleanup` already does the shutdown-then-stop dance.
 
-5. **Test harness teardown still slow** (known follow-up) -- Kernel
+5. **Test harness teardown was slow** (fixed in Steps 6 + 7) -- Kernel
    `urp_endpoint_drain` itself completes in ~14 ms (measured via
-   instrumented build), but Phase 11 in the orchestrator takes ~75 s
-   because the expect-based vm_run retries the per-command timeout. Not
-   blocking the smoke test (Phase 10 PASSES); tracked separately.
+   instrumented build), but Phase 11 in the orchestrator initially took
+   ~75 s. Two compounding bugs: (a) every vm_run paid a `expect eof` tax
+   waiting for an EOF that NixOS auto-login getty never produced, and
+   (b) on Linux 7.0.3 `kthread_stop` on a kthread that exited via
+   `return 0` from its fn WARNs + NULL-derefs, hanging subsequent
+   `urp remove` / `rmmod` invocations. Step 6 dropped the expect-eof
+   wait; Step 7 parked the pump on a `kthread_should_stop()` loop
+   instead of voluntary exit. Full pair test now runs in ~38 s.
 
 ### Cross-Architecture Results
 
@@ -696,7 +703,7 @@ Drain + rmmod freed 128 kB of slab beyond the in-loop measurement -- that's the 
 
 | Architecture | Emulation | Status | Duration | Notes |
 |-------------|-----------|--------|----------|-------|
-| x86_64 | KVM (native) | PASS (`6dbac33`) | ~6 min full pair test | smoke + 12-phase lifecycle, no harness workarounds |
+| x86_64 | KVM (native) | PASS (`705ae8c`) | ~38 s full pair test | smoke + 12-phase lifecycle, no harness workarounds |
 | aarch64 | QEMU TCG | Not started | | deferred |
 | riscv64 | QEMU TCG | Not started | | deferred |
 
