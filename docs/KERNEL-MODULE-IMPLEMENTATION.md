@@ -2,7 +2,7 @@
 
 Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.md).
 
-**Last updated**: 2026-05-24 (Phase 5 Step 1-4 done; HEAD `662b0af` on `phase5-vm-pair`. microvm.nix VM-pair harness lands, exposes + fixes rdma_connect self-deadlock under multi-cm-id, URP-to-URP echo round-trip PASS.)
+**Last updated**: 2026-05-24 (Phase 5 Step 1-5 done; HEAD `6dbac33` on `phase5-vm-pair`. microvm.nix VM-pair harness lands; CM self-deadlock + pump half-close + drain ordering all fixed. URP-to-URP echo round-trip PASS with no harness workarounds.)
 
 ---
 
@@ -17,7 +17,7 @@ Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.
 | 3b | [Probes + PSK Auth](#phase-3b-probes--psk-auth) | Complete (`dd6bab0`) | 10/10 |
 | 3 | [k1 -- Functional](#phase-3-k1----functional) | In Progress (via 3a) | 0/14 |
 | 4 | [k2 -- Optimized](#phase-4-k2----optimized) | rxe-testable scope complete (`c41bd61`) + 1-hour soak PASS | 2/8 main + 3 deferred-hardware; soak harness + on-reconnect-leak fix added |
-| 5 | [MicroVM Integration](#phase-5-microvm-integration) | In Progress (`662b0af`) | 1/8 (x86_64 pair PASS) |
+| 5 | [MicroVM Integration](#phase-5-microvm-integration) | In Progress (`6dbac33`) | 1/8 (x86_64 pair PASS, no workarounds) |
 
 ---
 
@@ -652,7 +652,8 @@ Drain + rmmod freed 128 kB of slab beyond the in-loop measurement -- that's the 
 | 1 | `042982a` | microvm.nix-based VM-pair test harness (replaces hand-rolled qemu-vm.nix orchestrator) |
 | 2 | `1703d72` | Finer-grained verification phases (5b/6b/8b/9b + pre/post echo diag) |
 | 3 | `2e8b5ce` | Defer rdma_connect() to fix CM self-deadlock (qp stuck in INIT under multi-cm-id) |
-| 4 | `662b0af` | Keep socat stdin alive across UDS handshake (`hello-pair` round-trip PASS) |
+| 4 | `662b0af` | Keep socat stdin alive across UDS handshake (`hello-pair` round-trip PASS, harness workaround) |
+| 5 | `6dbac33` | Kernel-side fixes: pump half-close keeps conn alive for RX, drain order fix. Removes Step 4 workaround. |
 
 ### Variations from Plan
 
@@ -669,11 +670,25 @@ Drain + rmmod freed 128 kB of slab beyond the in-loop measurement -- that's the 
    `id->qp_mutex` while the rdma_cm core already held it, hanging the
    `cma_work_handler` kworker. Step 3 fixed via deferred work item.
 
-3. **socat-stay-alive workaround in test harness** -- `echo X | socat`'s stdin
-   closes so fast that the urp TX pump's first kernel_recvmsg returns 0 before
-   any bytes are read. Step 4 adds `; sleep 2` to keep the socket open across
-   the pump's first scheduling. Underlying pump teardown semantics (drain
-   pending data before exit on EOF) is a known follow-up.
+3. **Pump half-close handling** -- The kernel's TX pump was setting
+   `conn->active = false` on read-side EOF, which caused the RX completion
+   handler to drop incoming frames. With request/response patterns like
+   `echo X | socat`, the response from the remote side would arrive AFTER
+   the local pump's recvmsg returned 0 and be silently discarded. Step 5
+   fixes the pump to leave conn alive on half-close so RX can still forward
+   the response. Removes Step 4's harness workaround.
+
+4. **urp_endpoint_drain order** -- Standalone `urp_pump_stop()` ran BEFORE
+   `urp_socket_cleanup()` which led to `kthread_stop` blocking on a kthread
+   asleep in `kernel_recvmsg` against a socket that hadn't been shut down
+   yet. Step 5 removes the standalone call; `urp_socket_cleanup ->
+   urp_socket_conn_cleanup` already does the shutdown-then-stop dance.
+
+5. **Test harness teardown still slow** (known follow-up) -- Kernel
+   `urp_endpoint_drain` itself completes in ~14 ms (measured via
+   instrumented build), but Phase 11 in the orchestrator takes ~75 s
+   because the expect-based vm_run retries the per-command timeout. Not
+   blocking the smoke test (Phase 10 PASSES); tracked separately.
 
 ### Cross-Architecture Results
 
@@ -681,7 +696,7 @@ Drain + rmmod freed 128 kB of slab beyond the in-loop measurement -- that's the 
 
 | Architecture | Emulation | Status | Duration | Notes |
 |-------------|-----------|--------|----------|-------|
-| x86_64 | KVM (native) | PASS (`662b0af`) | ~6 min full pair test | smoke + 12-phase lifecycle |
+| x86_64 | KVM (native) | PASS (`6dbac33`) | ~6 min full pair test | smoke + 12-phase lifecycle, no harness workarounds |
 | aarch64 | QEMU TCG | Not started | | deferred |
 | riscv64 | QEMU TCG | Not started | | deferred |
 
