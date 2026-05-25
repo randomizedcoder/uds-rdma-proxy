@@ -305,6 +305,17 @@ in rec {
         "rdma link delete rxe_pair 2>/dev/null; rdma link add rxe_pair type rxe netdev eth1" "$T_RXE" >/dev/null
       P5_MS=$(( $(now_ms) - P5_START ))
       pass "rxe_pair on both VMs (''${P5_MS}ms)"
+
+      # Phase 5b — verify ib_device is actually present.
+      mkdir -p /tmp/urp-microvm-pair/diag
+      for label in vm1 vm2; do
+        if [ "$label" = vm1 ]; then port=$VM1_VIRTIO host=$VM1_PROC; else port=$VM2_VIRTIO host=$VM2_PROC; fi
+        out=$(vm_run "$port" "$host" "rdma link show" 5)
+        echo "$out" > "/tmp/urp-microvm-pair/diag/$label.rdma-link.txt"
+        echo "$out" | grep -q "rxe_pair" \
+          || { echo "$out" | awk '{print "    "$0}'; fail "$label: rxe_pair device not present"; }
+      done
+      pass "ib_device rxe_pair visible on both VMs"
       echo ""
 
       # -----------------------------------------------------------------
@@ -315,13 +326,29 @@ in rec {
       vm_run "$VM1_VIRTIO" "$VM1_PROC" \
         "rmmod urp 2>/dev/null; insmod \$URP_KO && echo URP1_OK" "$T_URP" \
         | tee /tmp/urp-microvm-pair/insmod1.log | grep -q URP1_OK \
-        || { cat /tmp/urp-microvm-pair/insmod1.log | awk '{print "    "$0}'; fail "vm1 insmod failed"; }
+        || { awk '{print "    "$0}' /tmp/urp-microvm-pair/insmod1.log; fail "vm1 insmod failed"; }
       vm_run "$VM2_VIRTIO" "$VM2_PROC" \
         "rmmod urp 2>/dev/null; insmod \$URP_KO && echo URP2_OK" "$T_URP" \
         | tee /tmp/urp-microvm-pair/insmod2.log | grep -q URP2_OK \
-        || { cat /tmp/urp-microvm-pair/insmod2.log | awk '{print "    "$0}'; fail "vm2 insmod failed"; }
+        || { awk '{print "    "$0}' /tmp/urp-microvm-pair/insmod2.log; fail "vm2 insmod failed"; }
       P6_MS=$(( $(now_ms) - P6_START ))
       pass "urp.ko loaded on both VMs (''${P6_MS}ms)"
+
+      # Phase 6b — verify the kernel actually accepted the module:
+      # lsmod sees it AND the module printed its boot banner to dmesg.
+      for label in vm1 vm2; do
+        if [ "$label" = vm1 ]; then port=$VM1_VIRTIO host=$VM1_PROC; else port=$VM2_VIRTIO host=$VM2_PROC; fi
+        out=$(vm_run "$port" "$host" "lsmod | grep ^urp; dmesg | grep -i '^\[.*\] urp:' | tail -10" 5)
+        echo "$out" > "/tmp/urp-microvm-pair/diag/$label.urp-loaded.txt"
+        if ! echo "$out" | grep -q "^urp"; then
+          echo "$out" | awk '{print "    "$0}'
+          fail "$label: urp not in lsmod"
+        fi
+        if ! echo "$out" | grep -q "urp: module loaded"; then
+          info "$label: no 'module loaded' banner in dmesg (may have been trimmed)"
+        fi
+      done
+      pass "urp present in lsmod + dmesg banner seen"
       echo ""
 
       # -----------------------------------------------------------------
@@ -343,13 +370,28 @@ in rec {
       vm_run "$VM1_VIRTIO" "$VM1_PROC" \
         "urp add pair_acceptor --connect-path /tmp/urp-pair-echo.sock --bind $VM1_IP:4791" "$T_URP" \
         | tee /tmp/urp-microvm-pair/add1.log | grep -q "ok:" \
-        || { cat /tmp/urp-microvm-pair/add1.log | awk '{print "    "$0}'; fail "vm1 urp add failed"; }
+        || { awk '{print "    "$0}' /tmp/urp-microvm-pair/add1.log; fail "vm1 urp add failed"; }
       vm_run "$VM2_VIRTIO" "$VM2_PROC" \
         "urp add pair_initiator --listen-path /tmp/urp-pair.sock --peer $VM1_IP:4791" "$T_URP" \
         | tee /tmp/urp-microvm-pair/add2.log | grep -q "ok:" \
-        || { cat /tmp/urp-microvm-pair/add2.log | awk '{print "    "$0}'; fail "vm2 urp add failed"; }
+        || { awk '{print "    "$0}' /tmp/urp-microvm-pair/add2.log; fail "vm2 urp add failed"; }
       P8_MS=$(( $(now_ms) - P8_START ))
       pass "both endpoints configured (''${P8_MS}ms)"
+
+      # Phase 8b — `urp show` confirms each side has its endpoint
+      # entry. Catches the case where `urp add` returned ok: but the
+      # endpoint silently failed to materialise.
+      for entry in "vm1:$VM1_VIRTIO:$VM1_PROC:pair_acceptor" \
+                   "vm2:$VM2_VIRTIO:$VM2_PROC:pair_initiator"; do
+        IFS=":" read -r label port host expected <<<"$entry"
+        out=$(vm_run "$port" "$host" "urp show" 10)
+        echo "$out" > "/tmp/urp-microvm-pair/diag/$label.urp-show.txt"
+        if ! echo "$out" | grep -q "$expected"; then
+          echo "$out" | awk '{print "    "$0}'
+          fail "$label: urp show does not list endpoint '$expected'"
+        fi
+      done
+      pass "urp show lists pair_acceptor on vm1 and pair_initiator on vm2"
       echo ""
 
       # -----------------------------------------------------------------
@@ -370,18 +412,53 @@ in rec {
       fi
       P9_MS=$(( $(now_ms) - P9_START ))
       pass "CM phase complete (''${P9_MS}ms)"
+
+      # Phase 9b — capture QP state on both sides. RTS = ready-to-send
+      # (the normal post-CM-ESTABLISHED state). If we see INIT or RTR
+      # the CM handshake hasn't fully transitioned the QP.
+      for label in vm1 vm2; do
+        if [ "$label" = vm1 ]; then port=$VM1_VIRTIO host=$VM1_PROC; else port=$VM2_VIRTIO host=$VM2_PROC; fi
+        out=$(vm_run "$port" "$host" "rdma resource show qp" 10)
+        echo "$out" > "/tmp/urp-microvm-pair/diag/$label.qp-state.txt"
+        info "$label QP state: $(echo "$out" | head -3 | tr '\n' '|' )"
+      done
       echo ""
 
       # -----------------------------------------------------------------
       # Phase 10 — data round-trip
+      #
+      # 10a: dmesg snapshot pre-echo
+      # 10:  actual echo attempt
+      # 10c: dmesg snapshot post-echo (so the diff isolates kernel
+      #      activity caused by the data path)
       # -----------------------------------------------------------------
       echo "--- Phase 10: echo round-trip ---"
+      for label in vm1 vm2; do
+        if [ "$label" = vm1 ]; then port=$VM1_VIRTIO host=$VM1_PROC; else port=$VM2_VIRTIO host=$VM2_PROC; fi
+        vm_run "$port" "$host" "dmesg | tail -40" 10 \
+          > "/tmp/urp-microvm-pair/diag/$label.dmesg-pre.txt"
+      done
+
       P10_START=$(now_ms)
       RESULT=$(vm_run "$VM2_VIRTIO" "$VM2_PROC" \
         "echo hello-pair | socat -t 5 - UNIX-CONNECT:/tmp/urp-pair.sock" "$T_ECHO" \
         | tr -d '\r' | grep -v '^$' | tail -1)
       P10_MS=$(( $(now_ms) - P10_START ))
       echo "  response: '$RESULT'"
+
+      for label in vm1 vm2; do
+        if [ "$label" = vm1 ]; then port=$VM1_VIRTIO host=$VM1_PROC; else port=$VM2_VIRTIO host=$VM2_PROC; fi
+        vm_run "$port" "$host" "dmesg | tail -40" 10 \
+          > "/tmp/urp-microvm-pair/diag/$label.dmesg-post.txt"
+      done
+      # urp show after echo: traffic counters should be > 0 on the
+      # initiator if data left the box.
+      for label in vm1 vm2; do
+        if [ "$label" = vm1 ]; then port=$VM1_VIRTIO host=$VM1_PROC; else port=$VM2_VIRTIO host=$VM2_PROC; fi
+        vm_run "$port" "$host" "urp show" 10 \
+          > "/tmp/urp-microvm-pair/diag/$label.urp-show-post.txt"
+      done
+      info "diagnostics written to /tmp/urp-microvm-pair/diag/"
       echo ""
 
       # -----------------------------------------------------------------

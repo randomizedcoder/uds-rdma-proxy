@@ -50,6 +50,10 @@ proc capture_output {spawn_id prompt timeout_secs} {
             regsub -all {\x1b\[[0-9;]*[a-zA-Z]} $buf {} buf
             regsub -all {\x1b\][^\x07]*\x07} $buf {} buf
             regsub -all {\[\?[0-9]+[a-z]} $buf {} buf
+            # Strip any stray bare ESC byte (NixOS auto-login can
+            # emit a lone 0x1b before the first prompt). Without
+            # this, ^anchor regexes downstream miss the first word.
+            regsub -all {\x1b} $buf {} buf
 
             if {$output_level > 110} { send_user -- "LINE: '$buf'\n" }
 
