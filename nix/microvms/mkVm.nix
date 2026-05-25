@@ -15,7 +15,12 @@
 #   buildUrpKo    - the buildUrpKo function from nix/checks.nix
 #   urpCli        - the urp CLI package
 #
-{ pkgs, lib, microvm, nixpkgs, vmId, buildUrpKo, urpCli }:
+{ pkgs, lib, microvm, nixpkgs, vmId, buildUrpKo, urpCli,
+  # Phase 5: enable KASAN_GENERIC + DEBUG_KMEMLEAK in the guest
+  # kernel. Triggers a full kernel rebuild (~30 min first time,
+  # cached after). The urpKo build and the guest boot use the
+  # same package, so vermagic matches.
+  withSanitizers ? false }:
 
 let
   constants = import ./constants.nix;
@@ -26,7 +31,29 @@ let
     + (if vmCfg.ipLastOctet < 16 then "0" else "")
     + lib.toHexString vmCfg.ipLastOctet;
 
-  kernelPackages = pkgs.${constants.kernelPackage};
+  baseKernelPackages = pkgs.${constants.kernelPackage};
+
+  sanitizerKernel = baseKernelPackages.kernel.override {
+    kernelPatches = baseKernelPackages.kernel.kernelPatches ++ [{
+      name = "urp-kasan-kmemleak";
+      patch = null;
+      structuredExtraConfig = with lib.kernel; {
+        KASAN              = lib.mkForce yes;
+        KASAN_GENERIC      = lib.mkForce yes;
+        KASAN_INLINE       = lib.mkForce yes;
+        DEBUG_KMEMLEAK     = lib.mkForce yes;
+        DEBUG_KMEMLEAK_AUTO_SCAN  = lib.mkForce yes;
+        DEBUG_KMEMLEAK_DEFAULT_OFF = lib.mkForce no;
+        FRAME_WARN         = lib.mkForce (freeform "8192");
+      };
+    }];
+  };
+
+  kernelPackages =
+    if withSanitizers
+    then pkgs.linuxPackagesFor sanitizerKernel
+    else baseKernelPackages;
+
   urpKo = buildUrpKo kernelPackages;
   modVer = kernelPackages.kernel.modDirVersion;
 
@@ -59,7 +86,8 @@ in
         hypervisor = "qemu";
         # Not exactly 2048: microvm.nix warns QEMU hangs at 2 GiB
         # (https://github.com/microvm-nix/microvm.nix/issues/171).
-        mem = 1536;
+        # KASAN ~2-3x RSS so debug VMs need more headroom.
+        mem = if withSanitizers then 3584 else 1536;
         vcpu = 2;
 
         # KVM on x86_64 host; null cpu triggers -enable-kvm -cpu host.
@@ -136,6 +164,14 @@ in
         # microvm.nix attaches the user-mode NIC first (eth0) and the
         # pair socket NIC second (eth1).
         "net.ifnames=0"
+      ] ++ lib.optionals withSanitizers [
+        # KMEMLEAK starts disabled by default; the kernel param turns
+        # it on at boot. Periodic scan still managed by
+        # DEBUG_KMEMLEAK_AUTO_SCAN.
+        "kmemleak=on"
+        # Slow KASAN test output to journal-only to keep the console
+        # readable while still capturing in dmesg.
+        "kasan_multi_shot"
       ];
 
       boot.initrd.availableKernelModules = [

@@ -4,12 +4,25 @@
 # Patterned after xdp2/nix/microvms/lib.nix; pair-specific extensions
 # orchestrate two VMs and drive the URP-to-URP data path.
 #
-{ pkgs, lib, constants, scriptsDir }:
+{ pkgs, lib, constants, scriptsDir,
+  # Phase 5: when sanitizer = true the pair test:
+  #   - uses .#microvm-vm1-debug / .#microvm-vm2-debug
+  #   - runs a KMEMLEAK scan after teardown
+  #   - greps dmesg on both VMs for KASAN: / kmemleak: reports,
+  #     failing the test if any are found
+  # `pairLabel` suffixes the derivation names + report dir so the
+  # default and sanitizer variants coexist in the nix store.
+  pairLabel ? "",
+  sanitizer ? false }:
 
 let
   vm1 = constants.vms.vm1;
   vm2 = constants.vms.vm2;
   t   = constants.timeouts;
+
+  vmAttr1 = "microvm-vm1${pairLabel}";
+  vmAttr2 = "microvm-vm2${pairLabel}";
+  diagDir = "/tmp/urp-microvm-pair${pairLabel}/diag";
 
   # Common runtime closure for orchestrator scripts.
   orchTools = with pkgs; [
@@ -98,9 +111,13 @@ in rec {
   # 12 phases. Trap cleanup guarantees both VMs die even on failure.
   # ==========================================================================
   fullPairTest = pkgs.writeShellApplication {
-    name = "urp-microvm-pair-test";
+    name = "urp-microvm-pair-test${pairLabel}";
     runtimeInputs = orchTools;
     text = ''
+      RUNDIR="/tmp/urp-microvm-pair${pairLabel}"
+      VM1_ATTR="${vmAttr1}"
+      VM2_ATTR="${vmAttr2}"
+      SANITIZER=${if sanitizer then "1" else "0"}
       VM1_PROC="${vm1.hostname}"
       VM2_PROC="${vm2.hostname}"
       VM1_SERIAL=${toString vm1.consoleSerialPort}
@@ -113,19 +130,21 @@ in rec {
       EXPECT_SCRIPT="${scriptsDir}/vm-expect.exp"
 
       POLL=${toString constants.pollInterval}
-      T_BUILD=${toString t.build}
+      # Sanitizer kernels: first-time build can take 30 min; runtime
+      # ~3x slowdown, so all phase timeouts inflate accordingly.
+      T_BUILD=${if sanitizer then "3600" else toString t.build}
       T_PROC=${toString t.processStart}
-      T_SERIAL=${toString t.serialReady}
-      T_VIRTIO=${toString t.virtioReady}
-      T_SERVICE=${toString t.serviceReady}
-      T_PAIRLINK=${toString t.pairLink}
-      T_RXE=${toString t.rxeReady}
-      T_URP=${toString t.urpReady}
+      T_SERIAL=${if sanitizer then "90" else toString t.serialReady}
+      T_VIRTIO=${if sanitizer then "120" else toString t.virtioReady}
+      T_SERVICE=${if sanitizer then "180" else toString t.serviceReady}
+      T_PAIRLINK=${if sanitizer then "90" else toString t.pairLink}
+      T_RXE=${if sanitizer then "30" else toString t.rxeReady}
+      T_URP=${if sanitizer then "30" else toString t.urpReady}
       T_CM=${toString t.cmEstablished}
-      T_ECHO=${toString t.echo}
+      T_ECHO=${if sanitizer then "20" else toString t.echo}
       # shellcheck disable=SC2034  # used inline by per-step timeout
-      T_DRAIN=${toString t.drainRemove}
-      T_SHUTDOWN=${toString t.shutdown}
+      T_DRAIN=${if sanitizer then "30" else toString t.drainRemove}
+      T_SHUTDOWN=${if sanitizer then "60" else toString t.shutdown}
 
       RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; NC=$'\033[0m'
       now_ms() { date +%s%3N; }
@@ -205,12 +224,12 @@ in rec {
       # -----------------------------------------------------------------
       echo "--- Phase 0: Build VMs (timeout ''${T_BUILD}s) ---"
       P0_START=$(now_ms)
-      if ! timeout "$T_BUILD" nix build .#microvm-vm1 .#microvm-vm2 \
+      if ! timeout "$T_BUILD" nix build ".#$VM1_ATTR" ".#$VM2_ATTR" \
            --print-out-paths --no-link 2>&1 | tail -10; then
         fail "build timed out / failed"
       fi
-      VM1_PATH=$(nix build .#microvm-vm1 --print-out-paths --no-link 2>/dev/null)
-      VM2_PATH=$(nix build .#microvm-vm2 --print-out-paths --no-link 2>/dev/null)
+      VM1_PATH=$(nix build ".#$VM1_ATTR" --print-out-paths --no-link 2>/dev/null)
+      VM2_PATH=$(nix build ".#$VM2_ATTR" --print-out-paths --no-link 2>/dev/null)
       [ -z "$VM1_PATH" ] && fail "vm1 build path empty"
       [ -z "$VM2_PATH" ] && fail "vm2 build path empty"
       P0_MS=$(( $(now_ms) - P0_START ))
@@ -230,13 +249,13 @@ in rec {
       # -----------------------------------------------------------------
       echo "--- Phase 1: Start VMs ---"
       P1_START=$(now_ms)
-      mkdir -p /tmp/urp-microvm-pair
-      "$VM1_PATH/bin/microvm-run" > /tmp/urp-microvm-pair/vm1.log 2>&1 &
+      mkdir -p "$RUNDIR"
+      "$VM1_PATH/bin/microvm-run" > "$RUNDIR"/vm1.log 2>&1 &
       VM1_PID=$!
       wait_for "vm1 process" "$T_PROC" pgrep -f "process=$VM1_PROC"
       pass "vm1 process up (pid $VM1_PID)"
 
-      "$VM2_PATH/bin/microvm-run" > /tmp/urp-microvm-pair/vm2.log 2>&1 &
+      "$VM2_PATH/bin/microvm-run" > "$RUNDIR"/vm2.log 2>&1 &
       VM2_PID=$!
       wait_for "vm2 process" "$T_PROC" pgrep -f "process=$VM2_PROC"
       pass "vm2 process up (pid $VM2_PID)"
@@ -308,11 +327,11 @@ in rec {
       pass "rxe_pair on both VMs (''${P5_MS}ms)"
 
       # Phase 5b — verify ib_device is actually present.
-      mkdir -p /tmp/urp-microvm-pair/diag
+      mkdir -p "$RUNDIR"/diag
       for label in vm1 vm2; do
         if [ "$label" = vm1 ]; then port=$VM1_VIRTIO host=$VM1_PROC; else port=$VM2_VIRTIO host=$VM2_PROC; fi
         out=$(vm_run "$port" "$host" "rdma link show" 5)
-        echo "$out" > "/tmp/urp-microvm-pair/diag/$label.rdma-link.txt"
+        echo "$out" > "$RUNDIR/diag/$label.rdma-link.txt"
         echo "$out" | grep -q "rxe_pair" \
           || { echo "$out" | awk '{print "    "$0}'; fail "$label: rxe_pair device not present"; }
       done
@@ -326,12 +345,12 @@ in rec {
       P6_START=$(now_ms)
       vm_run "$VM1_VIRTIO" "$VM1_PROC" \
         "rmmod urp 2>/dev/null; insmod \$URP_KO && echo URP1_OK" "$T_URP" \
-        | tee /tmp/urp-microvm-pair/insmod1.log | grep -q URP1_OK \
-        || { awk '{print "    "$0}' /tmp/urp-microvm-pair/insmod1.log; fail "vm1 insmod failed"; }
+        | tee "$RUNDIR"/insmod1.log | grep -q URP1_OK \
+        || { awk '{print "    "$0}' "$RUNDIR"/insmod1.log; fail "vm1 insmod failed"; }
       vm_run "$VM2_VIRTIO" "$VM2_PROC" \
         "rmmod urp 2>/dev/null; insmod \$URP_KO && echo URP2_OK" "$T_URP" \
-        | tee /tmp/urp-microvm-pair/insmod2.log | grep -q URP2_OK \
-        || { awk '{print "    "$0}' /tmp/urp-microvm-pair/insmod2.log; fail "vm2 insmod failed"; }
+        | tee "$RUNDIR"/insmod2.log | grep -q URP2_OK \
+        || { awk '{print "    "$0}' "$RUNDIR"/insmod2.log; fail "vm2 insmod failed"; }
       P6_MS=$(( $(now_ms) - P6_START ))
       pass "urp.ko loaded on both VMs (''${P6_MS}ms)"
 
@@ -340,7 +359,7 @@ in rec {
       for label in vm1 vm2; do
         if [ "$label" = vm1 ]; then port=$VM1_VIRTIO host=$VM1_PROC; else port=$VM2_VIRTIO host=$VM2_PROC; fi
         out=$(vm_run "$port" "$host" "lsmod | grep ^urp; dmesg | grep -i '^\[.*\] urp:' | tail -10" 5)
-        echo "$out" > "/tmp/urp-microvm-pair/diag/$label.urp-loaded.txt"
+        echo "$out" > "$RUNDIR/diag/$label.urp-loaded.txt"
         if ! echo "$out" | grep -q "^urp"; then
           echo "$out" | awk '{print "    "$0}'
           fail "$label: urp not in lsmod"
@@ -370,12 +389,12 @@ in rec {
       P8_START=$(now_ms)
       vm_run "$VM1_VIRTIO" "$VM1_PROC" \
         "urp add pair_acceptor --connect-path /tmp/urp-pair-echo.sock --bind $VM1_IP:4791" "$T_URP" \
-        | tee /tmp/urp-microvm-pair/add1.log | grep -q "ok:" \
-        || { awk '{print "    "$0}' /tmp/urp-microvm-pair/add1.log; fail "vm1 urp add failed"; }
+        | tee "$RUNDIR"/add1.log | grep -q "ok:" \
+        || { awk '{print "    "$0}' "$RUNDIR"/add1.log; fail "vm1 urp add failed"; }
       vm_run "$VM2_VIRTIO" "$VM2_PROC" \
         "urp add pair_initiator --listen-path /tmp/urp-pair.sock --peer $VM1_IP:4791" "$T_URP" \
-        | tee /tmp/urp-microvm-pair/add2.log | grep -q "ok:" \
-        || { awk '{print "    "$0}' /tmp/urp-microvm-pair/add2.log; fail "vm2 urp add failed"; }
+        | tee "$RUNDIR"/add2.log | grep -q "ok:" \
+        || { awk '{print "    "$0}' "$RUNDIR"/add2.log; fail "vm2 urp add failed"; }
       P8_MS=$(( $(now_ms) - P8_START ))
       pass "both endpoints configured (''${P8_MS}ms)"
 
@@ -386,7 +405,7 @@ in rec {
                    "vm2:$VM2_VIRTIO:$VM2_PROC:pair_initiator"; do
         IFS=":" read -r label port host expected <<<"$entry"
         out=$(vm_run "$port" "$host" "urp show" 10)
-        echo "$out" > "/tmp/urp-microvm-pair/diag/$label.urp-show.txt"
+        echo "$out" > "$RUNDIR/diag/$label.urp-show.txt"
         if ! echo "$out" | grep -q "$expected"; then
           echo "$out" | awk '{print "    "$0}'
           fail "$label: urp show does not list endpoint '$expected'"
@@ -420,7 +439,7 @@ in rec {
       for label in vm1 vm2; do
         if [ "$label" = vm1 ]; then port=$VM1_VIRTIO host=$VM1_PROC; else port=$VM2_VIRTIO host=$VM2_PROC; fi
         out=$(vm_run "$port" "$host" "rdma resource show qp" 10)
-        echo "$out" > "/tmp/urp-microvm-pair/diag/$label.qp-state.txt"
+        echo "$out" > "$RUNDIR/diag/$label.qp-state.txt"
         info "$label QP state: $(echo "$out" | head -3 | tr '\n' '|' )"
       done
       echo ""
@@ -437,7 +456,7 @@ in rec {
       for label in vm1 vm2; do
         if [ "$label" = vm1 ]; then port=$VM1_VIRTIO host=$VM1_PROC; else port=$VM2_VIRTIO host=$VM2_PROC; fi
         vm_run "$port" "$host" "dmesg | tail -40" 10 \
-          > "/tmp/urp-microvm-pair/diag/$label.dmesg-pre.txt"
+          > "$RUNDIR/diag/$label.dmesg-pre.txt"
       done
 
       P10_START=$(now_ms)
@@ -450,16 +469,16 @@ in rec {
       for label in vm1 vm2; do
         if [ "$label" = vm1 ]; then port=$VM1_VIRTIO host=$VM1_PROC; else port=$VM2_VIRTIO host=$VM2_PROC; fi
         vm_run "$port" "$host" "dmesg | tail -40" 10 \
-          > "/tmp/urp-microvm-pair/diag/$label.dmesg-post.txt"
+          > "$RUNDIR/diag/$label.dmesg-post.txt"
       done
       # urp show after echo: traffic counters should be > 0 on the
       # initiator if data left the box.
       for label in vm1 vm2; do
         if [ "$label" = vm1 ]; then port=$VM1_VIRTIO host=$VM1_PROC; else port=$VM2_VIRTIO host=$VM2_PROC; fi
         vm_run "$port" "$host" "urp show" 10 \
-          > "/tmp/urp-microvm-pair/diag/$label.urp-show-post.txt"
+          > "$RUNDIR/diag/$label.urp-show-post.txt"
       done
-      info "diagnostics written to /tmp/urp-microvm-pair/diag/"
+      info "diagnostics written to $RUNDIR/diag/"
       echo ""
 
       # -----------------------------------------------------------------
@@ -506,9 +525,42 @@ in rec {
       for label in vm1 vm2; do
         if [ "$label" = vm1 ]; then port=$VM1_VIRTIO host=$VM1_PROC; else port=$VM2_VIRTIO host=$VM2_PROC; fi
         vm_run "$port" "$host" "dmesg | tail -30" 10 \
-          > "/tmp/urp-microvm-pair/diag/$label.dmesg-teardown.txt" 2>/dev/null || true
+          > "$RUNDIR/diag/$label.dmesg-teardown.txt" 2>/dev/null || true
       done
       echo ""
+
+      # ---------------------------------------------------------------
+      # Phase 11b (sanitizer only) — trigger KMEMLEAK scan, then grep
+      # the full dmesg on both VMs for any KASAN: / kmemleak: leak
+      # reports. Any hit fails the test. Empty == clean.
+      # ---------------------------------------------------------------
+      SANITIZER_FAILED=0
+      if [ "$SANITIZER" = "1" ]; then
+        echo "--- Phase 11b: sanitizer (KASAN / KMEMLEAK) ---"
+        for label in vm1 vm2; do
+          if [ "$label" = vm1 ]; then port=$VM1_VIRTIO host=$VM1_PROC; else port=$VM2_VIRTIO host=$VM2_PROC; fi
+          # Force a fresh KMEMLEAK scan. AUTO_SCAN runs every 10 min
+          # by default; we don't want to wait that long. Then dump
+          # all leaks. Then capture the full dmesg.
+          vm_run "$port" "$host" \
+            "echo scan > /sys/kernel/debug/kmemleak 2>/dev/null; sleep 1; cat /sys/kernel/debug/kmemleak 2>/dev/null | tail -200; dmesg | grep -E 'KASAN:|kmemleak:|BUG: ' | tail -200" 30 \
+            > "$RUNDIR/diag/$label.sanitizer.txt" 2>/dev/null || true
+          if grep -qE '^unreferenced object|KASAN:|BUG: ' "$RUNDIR/diag/$label.sanitizer.txt" 2>/dev/null; then
+            SANITIZER_FAILED=1
+            fail_msg=$(head -50 "$RUNDIR/diag/$label.sanitizer.txt" || true)
+            info "$label sanitizer report (head):"
+            echo "$fail_msg" | awk '{print "    "$0}'
+          else
+            info "$label clean (no KASAN/kmemleak reports)"
+          fi
+        done
+        if [ "$SANITIZER_FAILED" -eq 1 ]; then
+          info "see $RUNDIR/diag/{vm1,vm2}.sanitizer.txt for full output"
+        else
+          pass "KASAN + KMEMLEAK clean on both VMs"
+        fi
+        echo ""
+      fi
 
       # -----------------------------------------------------------------
       # Phase 12 — graceful shutdown (skipped via URP_PAIR_KEEP_VMS=1)
@@ -558,13 +610,16 @@ in rec {
       echo "========================================"
       echo ""
 
-      if [ "$RESULT" = "hello-pair" ]; then
-        printf "%sPASS: URP-to-URP echo round-trip succeeded%s\n" "$GREEN" "$NC"
-        exit 0
-      else
+      if [ "$RESULT" != "hello-pair" ]; then
         printf "%sFAIL: expected 'hello-pair', got '%s'%s\n" "$RED" "$RESULT" "$NC"
         exit 1
       fi
+      if [ "$SANITIZER_FAILED" -eq 1 ]; then
+        printf "%sFAIL: KASAN/KMEMLEAK reports detected (see diag/*.sanitizer.txt)%s\n" "$RED" "$NC"
+        exit 1
+      fi
+      printf "%sPASS: URP-to-URP echo round-trip succeeded%s\n" "$GREEN" "$NC"
+      exit 0
     '';
   };
 
