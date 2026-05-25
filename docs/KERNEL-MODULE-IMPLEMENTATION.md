@@ -643,7 +643,7 @@ Drain + rmmod freed 128 kB of slab beyond the in-loop measurement -- that's the 
 - [ ] CI pipeline runs on every push (shared crate + CLI + namespace integration)
 - [ ] Nightly CI runs MicroVM tests + soak test
 - [ ] Kernel version matrix: module builds and tests pass on 6.1, 6.6, 6.12, latest
-- [ ] Redpanda cluster test: produce/consume works through kernel module proxy
+- [ ] **Redpanda cluster test (NEXT)**: produce/consume works through kernel module proxy. Needs Redpanda-side prep work before harness goes in. Resume here when ready.
 
 ### Step Status (x86_64 microvm harness)
 
