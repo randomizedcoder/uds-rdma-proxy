@@ -545,7 +545,14 @@ in rec {
           vm_run "$port" "$host" \
             "echo scan > /sys/kernel/debug/kmemleak 2>/dev/null; sleep 1; cat /sys/kernel/debug/kmemleak 2>/dev/null | tail -200; dmesg | grep -E 'KASAN:|kmemleak:|BUG: ' | tail -200" 30 \
             > "$RUNDIR/diag/$label.sanitizer.txt" 2>/dev/null || true
-          if grep -qE '^unreferenced object|KASAN:|BUG: ' "$RUNDIR/diag/$label.sanitizer.txt" 2>/dev/null; then
+          # Skip the first line (echoed command, which itself
+          # contains "KASAN:" / "BUG: " literals) and look for the
+          # markers KASAN and kmemleak actually emit at start of line:
+          #   ^BUG: KASAN: ...  (KASAN reports)
+          #   ^unreferenced object 0x...  (KMEMLEAK leak entry)
+          #   ^==========  (KASAN box separator)
+          if tail -n +2 "$RUNDIR/diag/$label.sanitizer.txt" 2>/dev/null \
+             | grep -qE '^(BUG: KASAN|unreferenced object|==========)'; then
             SANITIZER_FAILED=1
             fail_msg=$(head -50 "$RUNDIR/diag/$label.sanitizer.txt" || true)
             info "$label sanitizer report (head):"
