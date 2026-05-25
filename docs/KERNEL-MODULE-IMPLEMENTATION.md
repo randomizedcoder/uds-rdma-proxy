@@ -2,7 +2,7 @@
 
 Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.md).
 
-**Last updated**: 2026-05-24 (Phase 5 Step 1-7 done; HEAD `705ae8c` on `phase5-vm-pair`. microvm.nix VM-pair harness + CM self-deadlock + pump half-close + drain ordering + expect-eof + kthread parking. URP-to-URP smoke test PASS in ~38 s (was ~330 s, 9x faster).)
+**Last updated**: 2026-05-24 (Phase 5 Step 1-9 done; HEAD `1bbbf1e` on `phase5-vm-pair`. Smoke test PASS in ~38 s; debug variant PASSes under KASAN_GENERIC + DEBUG_KMEMLEAK with zero sanitizer reports.)
 
 ---
 
@@ -17,7 +17,7 @@ Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.
 | 3b | [Probes + PSK Auth](#phase-3b-probes--psk-auth) | Complete (`dd6bab0`) | 10/10 |
 | 3 | [k1 -- Functional](#phase-3-k1----functional) | In Progress (via 3a) | 0/14 |
 | 4 | [k2 -- Optimized](#phase-4-k2----optimized) | rxe-testable scope complete (`c41bd61`) + 1-hour soak PASS | 2/8 main + 3 deferred-hardware; soak harness + on-reconnect-leak fix added |
-| 5 | [MicroVM Integration](#phase-5-microvm-integration) | In Progress (`705ae8c`) | 1/8 (x86_64 pair PASS in ~38 s) |
+| 5 | [MicroVM Integration](#phase-5-microvm-integration) | In Progress (`1bbbf1e`) | 2/8 (x86_64 pair PASS in ~38 s, sanitizer PASS clean) |
 
 ---
 
@@ -639,7 +639,7 @@ Drain + rmmod freed 128 kB of slab beyond the in-loop measurement -- that's the 
 - [x] MicroVM x86_64 pair test passes end-to-end (boot -> load -> test -> clean -> shutdown) -- `662b0af`, `nix run .#urp-microvm-pair-test` -> "PASS: URP-to-URP echo round-trip succeeded"
 - [ ] MicroVM aarch64 pair test passes
 - [ ] MicroVM riscv64 pair test passes
-- [ ] KASAN/KMEMLEAK clean in all VM tests
+- [x] KASAN/KMEMLEAK clean in all VM tests -- `1bbbf1e`, `nix run .#urp-microvm-pair-test-debug` boots KASAN_GENERIC + DEBUG_KMEMLEAK kernel, runs full smoke + KMEMLEAK scan, reports zero leaks / no use-after-free
 - [ ] CI pipeline runs on every push (shared crate + CLI + namespace integration)
 - [ ] Nightly CI runs MicroVM tests + soak test
 - [ ] Kernel version matrix: module builds and tests pass on 6.1, 6.6, 6.12, latest
@@ -656,6 +656,8 @@ Drain + rmmod freed 128 kB of slab beyond the in-loop measurement -- that's the 
 | 5 | `6dbac33` | Kernel-side fixes: pump half-close keeps conn alive for RX, drain order fix. Removes Step 4 workaround. |
 | 6 | `36236f1` | Drop the trailing `expect eof` wait in vm-expect.exp -- 20-44x speedup per vm_run; total test 330s -> 120s. |
 | 7 | `705ae8c` | Park TX pump on EOF instead of voluntary return (avoids Linux 7.0.3 kthread_stop WARN+oops). Phase 11 teardown 75s -> 2.2s, Phase 12 shutdown 41s -> 3.5s. Total test ~38s. |
+| 8 | `49adc70` | Sanitizer VM scaffolding: `withSanitizers` flag on mkVm.nix, KASAN_GENERIC + DEBUG_KMEMLEAK kernel config, new `microvm-vm{1,2}-debug` + `urp-microvm-pair-test-debug` packages. Phase 11b runs `echo scan > /sys/kernel/debug/kmemleak` and greps dmesg for reports. |
+| 9 | `1bbbf1e` | Sanitizer regex tightening (was matching its own echoed command). Smoke test under KASAN + KMEMLEAK now PASSES clean. |
 
 ### Variations from Plan
 
