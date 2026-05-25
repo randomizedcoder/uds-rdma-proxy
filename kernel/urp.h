@@ -139,6 +139,17 @@ struct urp_qp {
 	 * urp_qp_select_round_robin stops dispatching on that QP.
 	 */
 	u8			health;
+
+	/*
+	 * Phase 5 Step 3: rdma_connect() takes id->qp_mutex internally
+	 * but the rdma_cm framework holds that same mutex while calling
+	 * our CM event handler -- calling rdma_connect inline from the
+	 * handler self-deadlocks the cma_work_handler kworker. Defer
+	 * the connect to this work item; CM event ROUTE_RESOLVED queues
+	 * it and returns 0, releasing the mutex, then the worker calls
+	 * rdma_connect from a context where it can acquire the mutex.
+	 */
+	struct work_struct	connect_work;
 };
 
 #define URP_QP_MISS_THRESHOLD	3
@@ -332,6 +343,9 @@ int  urp_connect_uds(struct urp_endpoint *ep, const char *path);
 int  urp_stream_connect_uds(struct urp_stream *stream, const char *path);
 
 /* urp_rdma.c */
+/* Phase 5 Step 3: deferred rdma_connect (see urp_rdma.c). */
+void urp_connect_work_fn(struct work_struct *w);
+
 int  urp_rdma_init(struct urp_endpoint *ep, const char *peer_addr,
 		   int peer_port, int bind_port, bool is_initiator);
 void urp_rdma_cleanup(struct urp_endpoint *ep);

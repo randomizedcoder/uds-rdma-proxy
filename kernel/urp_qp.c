@@ -39,6 +39,12 @@ int urp_qps_init(struct urp_endpoint *ep)
 		/* Step 5: start in QUALIFYING; RDMA_CM_EVENT_ESTABLISHED
 		 * promotes to ACTIVE (probe-driven Qualifying lands later). */
 		ep->qps[i].health = URP_QP_STATE_QUALIFYING;
+		/*
+		 * Phase 5 Step 3: ROUTE_RESOLVED schedules this to call
+		 * rdma_connect() outside the CM handler so we don't
+		 * recursively take id->qp_mutex.
+		 */
+		INIT_WORK(&ep->qps[i].connect_work, urp_connect_work_fn);
 	}
 
 	atomic_set(&ep->qps_connected, 0);
@@ -48,6 +54,12 @@ int urp_qps_init(struct urp_endpoint *ep)
 
 void urp_qps_destroy(struct urp_endpoint *ep)
 {
+	u32 i;
+
+	if (ep->qps) {
+		for (i = 0; i < ep->num_qps; i++)
+			cancel_work_sync(&ep->qps[i].connect_work);
+	}
 	kfree(ep->qps);
 	ep->qps = NULL;
 }

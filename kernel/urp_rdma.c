@@ -245,6 +245,42 @@ int urp_post_recv_for_qp(struct urp_endpoint *ep, struct ib_qp *qp, u32 count)
 	return 0;
 }
 
+/* ---- Deferred rdma_connect ---- */
+
+/*
+ * Phase 5 Step 3 fix: rdma_connect() can't be called from inside the
+ * CM event handler because the rdma_cm core holds id->qp_mutex while
+ * invoking the handler, and rdma_connect re-acquires it. We schedule
+ * this work from ROUTE_RESOLVED; it runs after the handler returns
+ * and the mutex is free.
+ */
+void urp_connect_work_fn(struct work_struct *w)
+{
+	struct urp_qp *qp = container_of(w, struct urp_qp, connect_work);
+	struct urp_endpoint *ep = qp->ep;
+	struct rdma_conn_param param = {};
+	int ret;
+
+	param.responder_resources = 1;
+	param.initiator_depth = 1;
+	param.retry_count = 7;
+	param.rnr_retry_count = 7;
+	/*
+	 * Phase 3b Step 8: include PSK auth payload in private_data when
+	 * configured. Acceptor compares the hash against its own and
+	 * rdma_reject's on mismatch.
+	 */
+	if (ep->has_password) {
+		param.private_data = ep->auth_priv;
+		param.private_data_len = sizeof(ep->auth_priv);
+	}
+
+	ret = rdma_connect(qp->cm_id, &param);
+	if (ret)
+		pr_err("urp: rdma_connect failed on qp %u: %d\n",
+		       qp->index, ret);
+}
+
 /* ---- Shared per-endpoint RDMA setup ---- */
 
 /*
@@ -765,34 +801,32 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 
 	case RDMA_CM_EVENT_ROUTE_RESOLVED:
 		ret = urp_endpoint_setup_shared(ep, id->device);
-		if (ret)
+		if (ret) {
+			pr_err("urp: setup_shared failed on qp %u: %d\n",
+			       ctx->qp_index, ret);
 			break;
+		}
 
 		ret = urp_qp_create_on_cm_id(ep, id, ctx->qp_index);
-		if (ret)
+		if (ret) {
+			pr_err("urp: qp_create_on_cm_id failed on qp %u: %d\n",
+			       ctx->qp_index, ret);
 			break;
+		}
 
 		/* Recvs are pre-posted to ep->srq in setup_shared (Step 3). */
 
-		{
-			struct rdma_conn_param param = {};
-
-			param.responder_resources = 1;
-			param.initiator_depth = 1;
-			param.retry_count = 7;
-			param.rnr_retry_count = 7;
-			/*
-			 * Phase 3b Step 8: include PSK auth payload in
-			 * private_data when configured. Acceptor compares
-			 * the hash against its own and rdma_reject's on
-			 * mismatch.
-			 */
-			if (ep->has_password) {
-				param.private_data = ep->auth_priv;
-				param.private_data_len = sizeof(ep->auth_priv);
-			}
-			ret = rdma_connect(id, &param);
-		}
+		/*
+		 * Phase 5 Step 3: rdma_connect() acquires id->qp_mutex, but
+		 * the rdma_cm framework already holds it while invoking this
+		 * handler. Calling rdma_connect inline self-deadlocks the
+		 * cma_work_handler kworker (caught by hung_task_check after
+		 * 120 s; QP stays in INIT, no ESTABLISHED ever fires).
+		 * Defer to a work item so the connect runs from a context
+		 * where it can take the mutex.
+		 */
+		schedule_work(&ep->qps[ctx->qp_index].connect_work);
+		ret = 0;
 		break;
 
 	case RDMA_CM_EVENT_ESTABLISHED:
