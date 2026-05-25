@@ -439,9 +439,14 @@ in rec {
           > "/tmp/urp-microvm-pair/diag/$label.dmesg-pre.txt"
       done
 
+      # `echo X | socat` closes stdin so quickly that the urp TX pump's
+      # first kernel_recvmsg on the freshly-accepted UDS connection can
+      # return 0 (EOF) before any data is read. Keep stdin alive with a
+      # short sleep so socat doesn't tear the connection down before
+      # the pump has had a chance to drain it.
       P10_START=$(now_ms)
       RESULT=$(vm_run "$VM2_VIRTIO" "$VM2_PROC" \
-        "echo hello-pair | socat -t 5 - UNIX-CONNECT:/tmp/urp-pair.sock" "$T_ECHO" \
+        "(echo hello-pair; sleep 2) | socat -t 5 - UNIX-CONNECT:/tmp/urp-pair.sock" "$T_ECHO" \
         | tr -d '\r' | grep -v '^$' | tail -1)
       P10_MS=$(( $(now_ms) - P10_START ))
       echo "  response: '$RESULT'"
