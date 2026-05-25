@@ -108,6 +108,12 @@ set output [capture_output $nc_id $prompt_pattern $timeout_secs]
 
 foreach line $output { send_user -- "$line\n" }
 
-send "exit\r"
-expect eof
+# NixOS auto-login getty respawns the shell immediately on exit, so the
+# nc/TCP serial connection stays open -- a plain `expect eof` here would
+# wait the full $timeout_secs (up to 15s per vm_run) for an EOF that
+# never arrives. We don't actually need to wait for EOF; once the
+# command output has been captured, just close the spawn so expect
+# exits and the orchestrator's vm_run returns immediately.
+catch { close }
+catch { wait }
 exit 0
