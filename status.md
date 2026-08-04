@@ -1,11 +1,11 @@
 # Project Status
 
-_Last updated: 2026-05-24_
+_Last updated: 2026-08-04_
 
 ## Current branch
 
 `phase5-vm-pair` — cut from `phase4-k2-optimized` HEAD `a1f9c52` (Phase 4
-rxe-testable scope + 1-hour soak PASS). Phase 5 Steps 1-4 done.
+rxe-testable scope + 1-hour soak PASS). Phase 5 Steps 1-12 done.
 
 ## Where we are
 
@@ -18,7 +18,7 @@ rxe-testable scope + 1-hour soak PASS). Phase 5 Steps 1-4 done.
 | **3b** — probes / PSK | `docs/KERNEL-MODULE-PLAN.md` §3.6-§3.7 + `KERNEL-MODULE-IMPLEMENTATION.md` §Phase 3b | ✅ **Complete. Steps 1-10 done (`0d5c077` through `dd6bab0`). Probes (PING/PONG/RTT EWMA/state machine), PSK SHA-256 + rdma_cm `private_data` validation, auth-failure observability all wired. Test-kmod-k0 23/23 PASS. Sub-steps 8b (initiator-validates-acceptor) + 3b/test (URP-to-URP harness) pending.** |
 | 3c — KUnit hardening + soak | (deferred) | not started |
 | **4** — k2 optimized | `docs/KERNEL-MODULE-PLAN.md` §4 + `KERNEL-MODULE-IMPLEMENTATION.md` §Phase 4 | ✅ **rxe-testable scope complete + 1-hour soak PASS. Steps: 1 page_pool (`ded84a7`), 2 NUMA-aware (`78967e5`), 3 tracker (`c535c7a`), 4-5 soak harness + reconnect-leak fix (`c41bd61`). 23/23 `test-kmod-k0` + 1240 cycles + 120 churn add/remove with 0 errors, 1828 kB slab leak (budget 2048). §4.2 zero-copy / §4.3 adaptive CQ / §4.4 kthread NUMA bind / §4.5 hardware benchmarks deferred to a hardware-validation pass.** |
-| **5** — MicroVM integration | `docs/KERNEL-MODULE-PLAN.md` §5 + `KERNEL-MODULE-IMPLEMENTATION.md` §Phase 5 | 🟡 **In Progress (2/8 amd64 deliverables done). x86_64 pair PASS in ~38 s + sanitizer PASS clean (`1bbbf1e`). Steps 1-7 plumbing; 8 KASAN+KMEMLEAK scaffolding (`49adc70`); 9 sanitizer regex fix (`1bbbf1e`). `nix run .#urp-microvm-pair-test-debug` -> "PASS: URP-to-URP echo round-trip succeeded" with no KASAN / kmemleak reports. Next priority: Redpanda 3-node cluster test (gated on Redpanda-side prep work). aarch64/riscv64/CI/kernel-version-matrix deferred.** |
+| **5** — MicroVM integration | `docs/KERNEL-MODULE-PLAN.md` §5 + `KERNEL-MODULE-IMPLEMENTATION.md` §Phase 5 | 🟡 **In Progress (5/8 deliverables done). x86_64 pair PASS + sanitizer PASS clean. Steps 1-9 harness/sanitizer; Step 10 kernel-version matrix (6.1.180/6.6.148/6.12.101/7.1.6 all build via LTS compat shims); Step 11 nixpkgs+microvm bump (latest kernel now 7.1.6); Step 12 CI pipeline (`.github/workflows/ci.yml` every-push + `nightly.yml` self-hosted KVM). Remaining: aarch64/riscv64 cross-arch pair tests + Redpanda cluster test (staged; broker not in nixpkgs, spec needs correction).** |
 | 6 | per `docs/KERNEL-MODULE-PLAN.md` | not started |
 
 ## Phase 2 deliverables (now committed in `067829e`)

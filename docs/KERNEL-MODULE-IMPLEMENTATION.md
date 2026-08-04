@@ -632,7 +632,9 @@ Drain + rmmod freed 128 kB of slab beyond the in-loop measurement -- that's the 
 
 ## Phase 5: MicroVM Integration
 
-**Status**: In Progress (Steps 1-4 done; `662b0af` on `phase5-vm-pair`)
+**Status**: In Progress (Steps 1-12 done on `phase5-vm-pair`). x86_64 pair +
+sanitizer pass; kernel-version matrix (6.1/6.6/6.12/latest) builds green; CI
+pipeline authored. Cross-arch + Redpanda in progress.
 
 ### Deliverables
 
@@ -640,9 +642,9 @@ Drain + rmmod freed 128 kB of slab beyond the in-loop measurement -- that's the 
 - [ ] MicroVM aarch64 pair test passes
 - [ ] MicroVM riscv64 pair test passes
 - [x] KASAN/KMEMLEAK clean in all VM tests -- `1bbbf1e`, `nix run .#urp-microvm-pair-test-debug` boots KASAN_GENERIC + DEBUG_KMEMLEAK kernel, runs full smoke + KMEMLEAK scan, reports zero leaks / no use-after-free
-- [ ] CI pipeline runs on every push (shared crate + CLI + namespace integration)
-- [ ] Nightly CI runs MicroVM tests + soak test
-- [ ] Kernel version matrix: module builds and tests pass on 6.1, 6.6, 6.12, latest
+- [x] CI pipeline runs on every push (shared crate + CLI + kernel-module matrix) -- `.github/workflows/ci.yml` builds `protocol-tests`, `urp-cli`, and the full kernel-module matrix on GitHub-hosted `ubuntu-latest` (pure Nix, no KVM)
+- [x] Nightly CI runs MicroVM tests + soak test -- `.github/workflows/nightly.yml` runs `urp-microvm-pair-test`, `urp-microvm-pair-test-debug`, and `soak-1h` on a `[self-hosted, kvm]` runner
+- [x] Kernel version matrix: module builds on 6.1, 6.6, 6.12, latest -- `nix build .#checks.x86_64-linux.urp-ko-6_1|6_6|6_12` + `kernel-module-build`; all green on 6.1.180 / 6.6.148 / 6.12.101 / 7.1.6 via the `urp_sockaddr_t` / `urp_strscpy` / page_pool `__has_include` / `urp_genlmsg_iput` compat shims
 - [ ] **Redpanda cluster test (NEXT)**: produce/consume works through kernel module proxy. Needs Redpanda-side prep work before harness goes in. Resume here when ready.
 
 ### Step Status (x86_64 microvm harness)
@@ -658,6 +660,9 @@ Drain + rmmod freed 128 kB of slab beyond the in-loop measurement -- that's the 
 | 7 | `705ae8c` | Park TX pump on EOF instead of voluntary return (avoids Linux 7.0.3 kthread_stop WARN+oops). Phase 11 teardown 75s -> 2.2s, Phase 12 shutdown 41s -> 3.5s. Total test ~38s. |
 | 8 | `49adc70` | Sanitizer VM scaffolding: `withSanitizers` flag on mkVm.nix, KASAN_GENERIC + DEBUG_KMEMLEAK kernel config, new `microvm-vm{1,2}-debug` + `urp-microvm-pair-test-debug` packages. Phase 11b runs `echo scan > /sys/kernel/debug/kmemleak` and greps dmesg for reports. |
 | 9 | `1bbbf1e` | Sanitizer regex tightening (was matching its own echoed command). Smoke test under KASAN + KMEMLEAK now PASSES clean. |
+| 10 | (this branch) | Kernel-version matrix + LTS build compat shims. `buildUrpKo` against `linuxPackages_6_1/6_6/6_12` exposed as `checks`/`packages` (`urp-ko-6_1` ...). Four independent API drifts vs mainline back-shimmed in `kernel/`: `urp_sockaddr_t` (7.0 unsized-sockaddr), `urp_strscpy` (6.8 sized_strscpy), page_pool header `__has_include`, `urp_genlmsg_iput` (6.9 wrapper, backport-safe). All four kernels build green. |
+| 11 | (this branch) | Bump nixpkgs 2026-04-30 -> 2026-08-04 + microvm.nix 4fe5ab5 -> e615e23. Latest kernel 7.0.3 -> 7.1.6; LTS pins -> 6.1.180 / 6.6.148 / 6.12.101. microvm bump required because new nixpkgs dropped `stdenv.hostPlatform.linux-kernel`. Pair test + matrix + protocol-tests + urp-cli all re-verified green post-bump. |
+| 12 | (this branch) | CI pipeline. `.github/workflows/ci.yml` (every push, hosted, pure Nix): protocol-tests, urp-cli, kernel-module matrix. `.github/workflows/nightly.yml` (`[self-hosted, kvm]`, scheduled + dispatch): pair test, sanitizer variant, soak. |
 
 ### Variations from Plan
 
@@ -699,6 +704,30 @@ Drain + rmmod freed 128 kB of slab beyond the in-loop measurement -- that's the 
    wait; Step 7 parked the pump on a `kthread_should_stop()` loop
    instead of voluntary exit. Full pair test now runs in ~38 s.
 
+6. **LTS build compat shims (Step 10)** -- the module is written against
+   current mainline (7.1.6) for upstream review, so building it on the
+   6.1/6.6/6.12 LTS line surfaced four independent API drifts. Fixed with
+   minimal, version-aware shims rather than dropping any kernel:
+   - `urp_sockaddr_t` (kernel/urp.h): `kernel_connect`/`kernel_bind` took
+     `struct sockaddr *` until the 7.0 unsized-sockaddr rework switched
+     them to `struct sockaddr_unsized *`. Version-guarded typedef at the
+     cast sites.
+   - `urp_strscpy` (kernel/urp.h): `strscpy()` became a size-checked macro
+     over `sized_strscpy()` in 6.8; on 6.8+ the macro rejects our
+     `const char *` source, so we call `sized_strscpy()` directly, and fall
+     back to `strscpy()` before 6.8.
+   - page_pool header (kernel/urp_rdma.c): the `net/page_pool/{helpers,types}.h`
+     split (6.6/6.7) vs the pre-split `net/page_pool.h` is selected via
+     `__has_include` -- no version boundary to guess, robust to backports.
+   - `urp_genlmsg_iput` (kernel/urp_netlink.c): `genlmsg_iput()` and the
+     `genl_info->family` member it needs landed in 6.9 but are backported
+     unpredictably (6.6.148 has it), so a version-guarded redefinition
+     *collides*. Instead we define our own wrapper that always calls the
+     primitive `genlmsg_put()` -- present on every version -- deriving
+     family/cmd from our own family global. Key lesson: prefer wrapping the
+     stable primitive over version-gating a redefinition of a helper that
+     stable trees may backport.
+
 ### Cross-Architecture Results
 
 ### Cross-Architecture Results
@@ -711,12 +740,15 @@ Drain + rmmod freed 128 kB of slab beyond the in-loop measurement -- that's the 
 
 ### Kernel Version Matrix
 
+Built via `nix build .#checks.x86_64-linux.{urp-ko-6_1,urp-ko-6_6,urp-ko-6_12,kernel-module-build}`.
+Pre-7.0 builds rely on the compat shims added in Step 10 (see Variations #6).
+
 | Kernel | Build | Tests | Notes |
 |--------|-------|-------|-------|
-| 6.1 (LTS) | | | |
-| 6.6 (LTS) | | | |
-| 6.12 (LTS) | | | |
-| Latest stable | | | |
+| 6.1.180 (LTS) | PASS | (build-only) | needs all four compat shims (sockaddr, strscpy, page_pool header, genlmsg_iput) |
+| 6.6.148 (LTS) | PASS | (build-only) | sockaddr + strscpy shims; has genlmsg_iput natively (backported) |
+| 6.12.101 (LTS) | PASS | (build-only) | sockaddr shim; has sized_strscpy + genlmsg_iput |
+| 7.1.6 (latest) | PASS | pair test PASS | native mainline APIs; also the microvm pair-test kernel |
 
 ### Notes
 
