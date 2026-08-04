@@ -1,0 +1,55 @@
+# Phase 5 §5.4 — every-push CI.
+#
+# Runs on GitHub-hosted ubuntu-latest (no KVM, no rdma_rxe). Everything
+# here is a pure Nix build against the flake-pinned nixpkgs, so it needs
+# nothing from the runner but Nix itself.
+#
+# The KVM-dependent tiers (MicroVM pair test, sanitizer variant, soak,
+# cross-arch full boot) live in nightly.yml on a self-hosted [self-hosted,
+# kvm] runner, because GitHub-hosted runners expose no /dev/kvm.
+#
+# We build explicit flake attrs rather than `nix flake check` on purpose:
+# `nix flake check` would also realise the microvm VM packages and the
+# KASAN+KMEMLEAK debug kernel (a ~30 min from-scratch kernel build), which
+# do not belong in an every-push gate.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nix-checks:
+    name: Nix checks (unit tests, CLI, kernel-module matrix)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Enable Nix binary cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Shared-crate unit tests (protocol, incl. no_std path)
+        run: nix build -L .#checks.x86_64-linux.protocol-tests
+
+      - name: CLI build + tests (urp-cli)
+        run: nix build -L .#urp-cli
+
+      # Kernel module build matrix (Phase 5 DoD 7). kernel-module-build is
+      # latest mainline; urp-ko-6_* are the supported LTS line. The
+      # LINUX_VERSION_CODE / __has_include compat shims in kernel/ are what
+      # keep the pre-7.0 builds green.
+      - name: Kernel module — latest mainline
+        run: nix build -L .#checks.x86_64-linux.kernel-module-build
+      - name: Kernel module — 6.1 LTS
+        run: nix build -L .#checks.x86_64-linux.urp-ko-6_1
+      - name: Kernel module — 6.6 LTS
+        run: nix build -L .#checks.x86_64-linux.urp-ko-6_6
+      - name: Kernel module — 6.12 LTS
+        run: nix build -L .#checks.x86_64-linux.urp-ko-6_12
