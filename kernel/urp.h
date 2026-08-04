@@ -13,6 +13,7 @@
 
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/version.h>
 #include <linux/kthread.h>
 #include <linux/net.h>
 #include <linux/un.h>
@@ -34,6 +35,33 @@
 #include "include/uapi/linux/urp.h"
 #include "urp_credit.h"
 #include "urp_reorder.h"
+
+/*
+ * Compat: kernel_connect() / kernel_bind() took a `struct sockaddr *`
+ * until Linux 7.0, which reworked them to take `struct sockaddr_unsized *`
+ * (the unsized-sockaddr change). Cast UDS bind/connect call sites through
+ * urp_sockaddr_t so the module builds against both the 6.1/6.6/6.12 LTS
+ * line and 7.0+ mainline.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+typedef struct sockaddr_unsized urp_sockaddr_t;
+#else
+typedef struct sockaddr urp_sockaddr_t;
+#endif
+
+/*
+ * Compat: strscpy() became a size-checked wrapper macro over the new
+ * sized_strscpy() function in Linux 6.8. On 6.8+ the strscpy() macro
+ * rejects a `const char *` source (its cstr type check trips on our
+ * @path parameter), so we must call sized_strscpy() directly; on the
+ * pre-6.8 LTS line sized_strscpy() does not exist and plain strscpy()
+ * accepts the const source. urp_strscpy() picks the right one per version.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+#define urp_strscpy(dst, src, sz) sized_strscpy((dst), (src), (sz))
+#else
+#define urp_strscpy(dst, src, sz) strscpy((dst), (src), (sz))
+#endif
 
 /* Buffer pool sizing -- defaults; per-endpoint values override at create */
 #define URP_NUM_BUFS		64

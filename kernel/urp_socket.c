@@ -98,9 +98,9 @@ int urp_stream_connect_uds(struct urp_stream *stream, const char *path)
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
-	sized_strscpy(addr.sun_path, path, sizeof(addr.sun_path));
+	urp_strscpy(addr.sun_path, path, sizeof(addr.sun_path));
 
-	ret = kernel_connect(sock, (struct sockaddr_unsized *)&addr,
+	ret = kernel_connect(sock, (urp_sockaddr_t *)&addr,
 			     offsetof(struct sockaddr_un, sun_path) +
 				     strlen(path) + 1,
 			     0);
@@ -139,14 +139,10 @@ int urp_connect_uds(struct urp_endpoint *ep, const char *path)
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
-	/*
-	 * sized_strscpy() rather than strscpy(): kernel 7.0+ requires both
-	 * args to strscpy() to be typed cstrings (arrays / string literals).
-	 * @path is a const char * parameter so the cstr type check trips.
-	 */
-	sized_strscpy(addr.sun_path, path, sizeof(addr.sun_path));
+	/* urp_strscpy(): sized_strscpy() on 6.8+, strscpy() before -- see urp.h. */
+	urp_strscpy(addr.sun_path, path, sizeof(addr.sun_path));
 
-	ret = kernel_connect(sock, (struct sockaddr_unsized *)&addr,
+	ret = kernel_connect(sock, (urp_sockaddr_t *)&addr,
 			     offsetof(struct sockaddr_un, sun_path) + strlen(path) + 1,
 			     0);
 	if (ret) {
@@ -181,9 +177,9 @@ static int urp_listen_uds(struct urp_endpoint *ep, const char *path)
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
-	sized_strscpy(addr.sun_path, path, sizeof(addr.sun_path));
+	urp_strscpy(addr.sun_path, path, sizeof(addr.sun_path));
 
-	ret = kernel_bind(sock, (struct sockaddr_unsized *)&addr,
+	ret = kernel_bind(sock, (urp_sockaddr_t *)&addr,
 			  offsetof(struct sockaddr_un, sun_path) + strlen(path) + 1);
 	if (ret) {
 		pr_err("urp: bind to %s failed: %d\n", path, ret);

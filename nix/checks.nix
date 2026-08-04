@@ -140,4 +140,15 @@ in
   # is intended for upstream review by the Linux kernel network dev team --
   # they expect new code to compile against current mainline.
   kernel-module-build = buildUrpKo pkgs.linuxPackages_latest;
+
+  # Kernel-version matrix (Phase 5 DoD 7): build urp.ko against each
+  # supported LTS in addition to `kernel-module-build` (= latest mainline).
+  # These are ordinary derivations -- the kernel dev headers come from the
+  # binary cache -- so they double as sandbox-safe `nix flake check` gates.
+  # The `urp_sockaddr_t` compat shim in kernel/urp.h is what keeps the
+  # pre-7.0 LTS builds green (kernel_connect/kernel_bind took
+  # `struct sockaddr *` before the 7.0 unsized-sockaddr rework).
+  urp-ko-6_1  = buildUrpKo pkgs.linuxPackages_6_1;
+  urp-ko-6_6  = buildUrpKo pkgs.linuxPackages_6_6;
+  urp-ko-6_12 = buildUrpKo pkgs.linuxPackages_6_12;
 }

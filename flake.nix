@@ -110,12 +110,16 @@
         devShells.default = devshell;
 
         checks = {
-          inherit (nixChecks) protocol-tests kernel-module-build;
+          inherit (nixChecks)
+            protocol-tests kernel-module-build
+            urp-ko-6_1 urp-ko-6_6 urp-ko-6_12;
         };
 
         packages = {
           urp-ko = urpKo;
           urp-ko-rust = urpKoRust;
+          # Kernel-version matrix (Phase 5 DoD 7): `nix build .#urp-ko-6_1` etc.
+          inherit (nixChecks) urp-ko-6_1 urp-ko-6_6 urp-ko-6_12;
           urp-cli = urpCli;
           urp-protocol-ffi = urpProtocolFfi;
           test-kmod-k0 = testKmodK0;

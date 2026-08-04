@@ -13,8 +13,20 @@
 #include "urp.h"
 #include <linux/inet.h>
 #include <linux/ktime.h>
+/*
+ * page_pool was reorganised into net/page_pool/{helpers,types}.h in the
+ * 6.6/6.7 era; the pre-split LTS line (6.1) still ships the single
+ * net/page_pool.h. Detect the split via __has_include so we don't hinge
+ * on an exact version boundary. The page_pool_params fields and the
+ * create / dev_alloc_pages / put_page / destroy calls we use are present
+ * in both layouts.
+ */
+#if defined(__has_include) && __has_include(<net/page_pool/helpers.h>)
 #include <net/page_pool/helpers.h>
 #include <net/page_pool/types.h>
+#else
+#include <net/page_pool.h>
+#endif
 
 /* ---- Buffer pool (Phase 4 Step 1: kernel page_pool) ----
  *

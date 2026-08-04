@@ -293,6 +293,35 @@ static int urp_parse_endpoint(struct genl_info *info,
 
 static struct genl_family urp_genl_family;
 
+/* ---- genetlink compat shims (pre-mainline LTS build support) ---- */
+
+/*
+ * urp_genlmsg_iput(): the mainline genlmsg_iput() convenience wrapper (and
+ * the genl_info->family member it relies on) arrived in 6.9, but stable
+ * trees backport it unpredictably -- so a LINUX_VERSION_CODE guard around a
+ * private genlmsg_iput() redefinition collides on kernels that already have
+ * it (e.g. 6.6.137). Instead we always call the primitive genlmsg_put(),
+ * which exists on every supported version, deriving family/cmd from our own
+ * family global and info->genlhdr->cmd -- identical to the genlmsg_put()
+ * calls already used elsewhere in this file.
+ */
+static inline void *urp_genlmsg_iput(struct sk_buff *skb,
+				     const struct genl_info *info)
+{
+	return genlmsg_put(skb, info->snd_portid, info->snd_seq,
+			   &urp_genl_family, 0, info->genlhdr->cmd);
+}
+
+#ifndef GENL_SET_ERR_MSG_FMT
+/*
+ * GENL_SET_ERR_MSG_FMT() (formatted extack) landed after the 6.1 LTS.
+ * On older kernels degrade to the plain, unformatted extack hint -- this
+ * is advisory error text only, so the lost %-formatting has no functional
+ * impact on the control plane.
+ */
+#define GENL_SET_ERR_MSG_FMT(info, msg, ...) GENL_SET_ERR_MSG((info), msg)
+#endif
+
 /* ---------------------------------------------------------------- */
 /* Command handlers                                                 */
 /* ---------------------------------------------------------------- */
@@ -507,7 +536,7 @@ static int urp_get_endpoint_doit(struct sk_buff *skb, struct genl_info *info)
 	if (!msg)
 		return -ENOMEM;
 
-	hdr = genlmsg_iput(msg, info);
+	hdr = urp_genlmsg_iput(msg, info);
 	if (!hdr) {
 		nlmsg_free(msg);
 		return -EMSGSIZE;
