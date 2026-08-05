@@ -632,9 +632,11 @@ Drain + rmmod freed 128 kB of slab beyond the in-loop measurement -- that's the 
 
 ## Phase 5: MicroVM Integration
 
-**Status**: In Progress (Steps 1-12 done on `phase5-vm-pair`). x86_64 pair +
-sanitizer pass; kernel-version matrix (6.1/6.6/6.12/latest) builds green; CI
-pipeline authored. Cross-arch + Redpanda in progress.
+**Status**: Substantially complete (Steps 1-15 on `phase5-vm-pair`; 6/8
+deliverables done + 1 partial + 1 blocked). x86_64 pair + sanitizer PASS;
+kernel-version matrix (6.1/6.6/6.12/7.1.6) builds green; CI pipeline authored;
+**aarch64 emulated pair test FULL PASS under TCG**; riscv64 build gate;
+Redpanda blocked on hermetic broker sourcing (spec corrected, design ready).
 
 ### Deliverables
 
@@ -645,7 +647,11 @@ pipeline authored. Cross-arch + Redpanda in progress.
 - [x] CI pipeline runs on every push (shared crate + CLI + kernel-module matrix) -- `.github/workflows/ci.yml` builds `protocol-tests`, `urp-cli`, and the full kernel-module matrix on GitHub-hosted `ubuntu-latest` (pure Nix, no KVM)
 - [x] Nightly CI runs MicroVM tests + soak test -- `.github/workflows/nightly.yml` runs `urp-microvm-pair-test`, `urp-microvm-pair-test-debug`, and `soak-1h` on a `[self-hosted, kvm]` runner
 - [x] Kernel version matrix: module builds on 6.1, 6.6, 6.12, latest -- `nix build .#checks.x86_64-linux.urp-ko-6_1|6_6|6_12` + `kernel-module-build`; all green on 6.1.180 / 6.6.148 / 6.12.101 / 7.1.6 via the `urp_sockaddr_t` / `urp_strscpy` / page_pool `__has_include` / `urp_genlmsg_iput` compat shims
-- [ ] **Redpanda cluster test (NEXT)**: produce/consume works through kernel module proxy. Needs Redpanda-side prep work before harness goes in. Resume here when ready.
+- [blocked] **Redpanda cluster test**: spec corrected (see below) + staged design ready, but **Stage 0 (broker packaging) is blocked on hermetic broker distribution**. Findings (2026-08-04):
+  - `redpanda-client` (= `rpk`) is in nixpkgs (unfree) but is the CLI only, not the broker.
+  - GitHub releases (`redpanda-data/redpanda` v26.2.1) publish **only `rpk`** binaries -- no broker tarball/DEB.
+  - The broker ships **only** via the Docker image (`docker.redpanda.com/redpandadata/redpanda`, which proxies to Docker Hub and **rate-limits unauthenticated pulls** -- verified `toomanyrequests`) and the token-gated `dl.redpanda.com` apt/yum repos. Neither is a clean, unauthenticated, hermetic `fetchurl`/`pullImage` source.
+  - **Path to unblock** (documented for a future session): pin a Docker image by digest and vendor via `dockerTools.pullImage` using an authenticated Docker login (or a local registry mirror), extract `/opt/redpanda/libexec/redpanda` + Seastar libs, `autoPatchelfHook`. Then Stage A: single broker on vm2, Kafka API bridged to vm1 over ONE urp tunnel via `socat` TCP<->UDS shims (reusing the existing 2-VM pair harness, swapping the echo backend), and `rpk topic create/produce/consume` from vm1. The corrected topology + staged plan are in `docs/KERNEL-MODULE-PLAN.md` §5.3.
 
 ### Step Status (x86_64 microvm harness)
 
