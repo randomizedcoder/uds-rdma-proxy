@@ -453,8 +453,19 @@ Since the project is motivated by tunneling Redpanda inter-broker traffic, integ
  +----------+                   +----------+                   +----------+
 ```
 
+> **Correction (Phase 5, Track C):** Redpanda's Seastar RPC / Kafka API
+> listeners bind TCP `{address, port}` only -- there is **no UDS listener
+> option**, so step 1 below is not achievable as written. Each Redpanda hop
+> must be bridged `redpanda(TCP) -> socat TCP↔UDS -> urp UDS↔RDMA -> urp ->
+> socat UDS↔TCP -> redpanda(TCP)`, i.e. a `socat` TCP↔UDS shim on both ends
+> of every `urp` tunnel. Also note `urp` endpoints are unidirectional
+> (`--listen-path` XOR `--connect-path`), so each direction is its own
+> endpoint. See `docs/KERNEL-MODULE-PLAN.md` §5.3 for the corrected staged
+> plan.
+
 **Test procedure**:
-1. Configure Redpanda brokers to use UDS for inter-broker communication (Kafka API listener on UDS path)
+1. Bridge each Redpanda broker's TCP Kafka/RPC port to a UDS path with a
+   `socat` shim (Redpanda cannot bind a UDS directly)
 2. Run proxy pairs between each node pair
 3. Create a topic with replication factor 3
 4. Use `rpk topic produce` to write 1M messages (1KB each)
@@ -466,7 +477,10 @@ Since the project is motivated by tunneling Redpanda inter-broker traffic, integ
 
 **Success criteria**:
 - Zero message loss or corruption
-- Produce/consume throughput within 20% of native TCP (on software RDMA; should exceed TCP on hardware)
+- Produce/consume throughput: **measured and reported, not a pass/fail
+  gate on software RDMA (rxe)**. The "within 20% of native TCP" target is a
+  hardware-RDMA expectation; rxe adds a software datapath that makes it
+  unrealistic. Gate on correctness (zero loss) + cluster stability instead.
 - No Redpanda errors or leader election instability caused by the proxy
 - Clean shutdown and restart of proxy does not cause permanent partition unavailability
 
