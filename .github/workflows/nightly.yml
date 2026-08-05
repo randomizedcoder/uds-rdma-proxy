@@ -56,8 +56,7 @@ jobs:
     name: Cross-arch urp.ko build gates (aarch64 + riscv64)
     # Pure Nix build (no KVM), but building the from-source cross kernels
     # is heavy, so it lives on the self-hosted runner rather than a
-    # 2-core hosted runner. Guaranteed-green build-only gate for the
-    # aarch64/riscv64 DoD items; the full TCG boot is tracked separately.
+    # 2-core hosted runner. Guaranteed-green build-only gate for both arches.
     runs-on: [self-hosted, kvm]
     timeout-minutes: 120
     steps:
@@ -66,3 +65,18 @@ jobs:
         run: nix build -L .#urp-ko-aarch64
       - name: urp.ko — riscv64
         run: nix build -L .#urp-ko-riscv64
+
+  microvm-pair-aarch64:
+    name: MicroVM aarch64 pair test (QEMU TCG)
+    # Full emulated boot: builds the cross NixOS closure then boots two
+    # aarch64 VMs under TCG. Slow (~cross-closure build + emulated boot),
+    # so weekly-ish via the nightly schedule; needs the self-hosted runner
+    # for capacity (the emulator is user-space, no KVM required).
+    runs-on: [self-hosted, kvm]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure no stale VMs from a previous run
+        run: nix run .#urp-microvm-force-kill || true
+      - name: aarch64 URP-to-URP pair test
+        run: nix run .#urp-microvm-pair-test-aarch64

@@ -639,8 +639,8 @@ pipeline authored. Cross-arch + Redpanda in progress.
 ### Deliverables
 
 - [x] MicroVM x86_64 pair test passes end-to-end (boot -> load -> test -> clean -> shutdown) -- `662b0af`, `nix run .#urp-microvm-pair-test` -> "PASS: URP-to-URP echo round-trip succeeded"
-- [ ] MicroVM aarch64 pair test passes
-- [ ] MicroVM riscv64 pair test passes
+- [x] MicroVM aarch64 pair test passes -- `nix run .#urp-microvm-pair-test-aarch64` boots two aarch64 VMs under QEMU TCG and PASSes the full 12-phase URP-to-URP echo (Step 15). urp.ko + rootfs cross-compiled (localSystem/crossSystem); boot needed xdp2's TCG fixes.
+- [~] MicroVM riscv64 pair test: urp.ko + kernel BUILD PASS (build-only gate shipped). Full TCG boot uses the same proven harness (`urp-microvm-pair-test-riscv64`) but was not run this session (heavier tier-2/3 cross closure + 25x TCG timeouts).
 - [x] KASAN/KMEMLEAK clean in all VM tests -- `1bbbf1e`, `nix run .#urp-microvm-pair-test-debug` boots KASAN_GENERIC + DEBUG_KMEMLEAK kernel, runs full smoke + KMEMLEAK scan, reports zero leaks / no use-after-free
 - [x] CI pipeline runs on every push (shared crate + CLI + kernel-module matrix) -- `.github/workflows/ci.yml` builds `protocol-tests`, `urp-cli`, and the full kernel-module matrix on GitHub-hosted `ubuntu-latest` (pure Nix, no KVM)
 - [x] Nightly CI runs MicroVM tests + soak test -- `.github/workflows/nightly.yml` runs `urp-microvm-pair-test`, `urp-microvm-pair-test-debug`, and `soak-1h` on a `[self-hosted, kvm]` runner
@@ -735,8 +735,8 @@ pipeline authored. Cross-arch + Redpanda in progress.
 | Architecture | Emulation | Status | Duration | Notes |
 |-------------|-----------|--------|----------|-------|
 | x86_64 | KVM (native) | PASS (`705ae8c`) | ~38 s full pair test | smoke + 12-phase lifecycle, no harness workarounds |
-| aarch64 | QEMU TCG | urp.ko BUILD PASS (Step 13) | build ~min | `nix build .#urp-ko-aarch64` -> ELF ARM aarch64; kernel has CONFIG_RDMA_RXE=m. Cross rustc + kernel cached. Full TCG boot: harness arch-table scaffolded (constants.arches); boot is the best-effort follow-on. |
-| riscv64 | QEMU TCG | urp.ko BUILD PASS (Step 13) | build ~min | `nix build .#urp-ko-riscv64` -> ELF UCB RISC-V; kernel has CONFIG_RDMA_RXE=m. Full TCG boot deferred (from-source cross closure is hours; build-only is the shipped gate). |
+| aarch64 | QEMU TCG | FULL PAIR PASS (Step 14+15) | ~2.5 min run (after closure cached) | `nix run .#urp-microvm-pair-test-aarch64` -> "PASS: URP-to-URP echo round-trip succeeded". All 12 phases: boot (login ~119 s emulated), rxe soft-RoCE, insmod urp.ko, urp endpoints, CM ESTABLISHED, echo 'hello-pair', teardown, shutdown. Needed xdp2's TCG fixes (seccomp-off qemu, accel=tcg, cortex-a72). |
+| riscv64 | QEMU TCG | urp.ko BUILD PASS (Step 13) | build ~min | `nix build .#urp-ko-riscv64` -> ELF UCB RISC-V; kernel has CONFIG_RDMA_RXE=m. Full TCG boot uses the same (now proven) harness path (`urp-microvm-pair-test-riscv64`); not run this session (riscv64 rootfs cross-closure is tier-2/3, much heavier + 25x TCG timeouts). Build-only is the shipped gate. |
 
 ### Kernel Version Matrix
 
