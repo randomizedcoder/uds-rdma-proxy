@@ -28,6 +28,7 @@ kernel/.module-common.o
 # Nix
 result
 .direnv/
+.cargo-nix/
 
 # Fuzz corpus and artifacts
 fuzz/corpus/

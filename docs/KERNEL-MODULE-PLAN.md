@@ -658,22 +658,52 @@ Phase 9: Shutdown VMs, collect results
 
 Ref: [Section 12](design/12-testing.md)
 
-3-node Redpanda cluster, each node running `urp` kernel module for inter-node RPC:
+> **Spec correction (Phase 5, Track C).** The original sketch below was
+> wrong in three concrete ways, found while scoping the harness:
+> 1. **Redpanda has no UDS listener.** Its Seastar RPC / Kafka API bind
+>    `{address, port}` TCP endpoints only; you cannot point `--connect-path`
+>    at a Redpanda RPC socket. Every Redpanda hop must go
+>    `redpanda(TCP) -> socat TCP↔UDS -> urp UDS↔RDMA -> ... -> socat -> redpanda(TCP)`.
+> 2. **`urp` endpoints are unidirectional.** `urp add` takes *either*
+>    `--listen-path` (initiator) *or* `--connect-path` (acceptor) --
+>    `crates/urp-cli/src/commands/add.rs` marks them `conflicts_with`. The
+>    single-`urp add`-with-both example is invalid; bidirectional inter-broker
+>    RPC needs **two** urp endpoints per node pair (one per direction), each
+>    on its own RDMA bind port.
+> 3. **The broker is not in nixpkgs.** Only `redpanda-client` (= `rpk`,
+>    unfree) is packaged; the C++/Seastar broker must be vendored (Docker
+>    image / DEB) -- the hermeticity gate for this deliverable.
+>
+> Corrected staged plan (produce/consume through the kernel-module proxy):
+>
+> - **Stage 0** -- vendor the broker; prove `rpk redpanda start --mode
+>   dev-container` reaches `rpk cluster health` OK in one microvm.
+> - **Stage A (the concrete DoD item)** -- single broker on vm2, its Kafka
+>   API bridged to vm1 over ONE urp tunnel via socat shims; `rpk topic
+>   create/produce/consume` from vm1 round-trips with zero loss. Reuses the
+>   existing 2-VM pair harness (swap the echo backend for the socat↔TCP
+>   shim + broker).
+> - **Stage B (follow-on, self-hosted/weekly)** -- true 3-node mesh: vm3,
+>   a QEMU multicast socket-netdev hub, per-node virtual advertised-RPC IPs,
+>   and 2 urp endpoints + 2 socats per direction per peer.
+
+Original sketch (kept for reference; the `urp add` invocation is **invalid**
+per correction #2 above):
 
 ```
 Node A: urp add peer-b --listen-path /var/run/urp/to-B.sock \
                         --connect-path /var/run/redpanda/rpc.sock \
                         --peer-address 10.0.1.2:4791 --num-qps 8
-        urp add peer-c --listen-path /var/run/urp/to-C.sock \
-                        --connect-path /var/run/redpanda/rpc.sock \
-                        --peer-address 10.0.1.3:4791 --num-qps 8
 ```
 
 Tests:
 - `rpk topic create` / `rpk topic produce` / `rpk topic consume`
 - `rpk cluster health`
 - Node restart (rmmod + insmod + urp add) -> cluster recovers
-- `rpk bench` throughput comparison: direct UDS vs kernel module proxy
+- `rpk bench` throughput comparison: direct UDS vs kernel module proxy.
+  **On soft-RoCE (rxe) treat bench as measured-and-reported, not a
+  pass/fail gate** -- the "within 20% of native TCP" target is unrealistic
+  without hardware RDMA.
 
 ### 5.4 CI Pipeline
 

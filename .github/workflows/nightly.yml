@@ -1,0 +1,82 @@
+# Phase 5 §5.4 — nightly CI (KVM-dependent tiers).
+#
+# These jobs boot real MicroVMs with soft-RoCE (rdma_rxe), so they require
+# a self-hosted runner that exposes /dev/kvm. Label such a runner with both
+# `self-hosted` and `kvm`. GitHub-hosted runners cannot run these (no KVM).
+#
+# Triggered on a nightly schedule and on demand (workflow_dispatch). The
+# fast, hosted, every-push gate lives in ci.yml.
+name: Nightly
+
+on:
+  schedule:
+    # 07:00 UTC daily. Cron input is fixed text, not user-controlled.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  microvm-pair:
+    name: MicroVM x86_64 pair test (rdma_rxe)
+    runs-on: [self-hosted, kvm]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure no stale VMs from a previous run
+        run: nix run .#urp-microvm-force-kill || true
+      - name: URP-to-URP pair test
+        run: nix run .#urp-microvm-pair-test
+
+  microvm-sanitizers:
+    name: MicroVM pair test under KASAN + KMEMLEAK
+    runs-on: [self-hosted, kvm]
+    # The debug kernel is a from-scratch KASAN+KMEMLEAK build the first
+    # time; generous budget so a cold cache does not time the job out.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure no stale VMs from a previous run
+        run: nix run .#urp-microvm-force-kill || true
+      - name: URP-to-URP pair test (sanitizer variant)
+        run: nix run .#urp-microvm-pair-test-debug
+
+  soak:
+    name: 1-hour soak (16 conn, 4 KB)
+    runs-on: [self-hosted, kvm]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Soak test
+        run: nix run .#soak-1h
+
+  cross-build:
+    name: Cross-arch urp.ko build gates (aarch64 + riscv64)
+    # Pure Nix build (no KVM), but building the from-source cross kernels
+    # is heavy, so it lives on the self-hosted runner rather than a
+    # 2-core hosted runner. Guaranteed-green build-only gate for both arches.
+    runs-on: [self-hosted, kvm]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: urp.ko — aarch64
+        run: nix build -L .#urp-ko-aarch64
+      - name: urp.ko — riscv64
+        run: nix build -L .#urp-ko-riscv64
+
+  microvm-pair-aarch64:
+    name: MicroVM aarch64 pair test (QEMU TCG)
+    # Full emulated boot: builds the cross NixOS closure then boots two
+    # aarch64 VMs under TCG. Slow (~cross-closure build + emulated boot),
+    # so weekly-ish via the nightly schedule; needs the self-hosted runner
+    # for capacity (the emulator is user-space, no KVM required).
+    runs-on: [self-hosted, kvm]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure no stale VMs from a previous run
+        run: nix run .#urp-microvm-force-kill || true
+      - name: aarch64 URP-to-URP pair test
+        run: nix run .#urp-microvm-pair-test-aarch64

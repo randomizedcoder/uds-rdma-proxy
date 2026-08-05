@@ -1,0 +1,591 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/*
+ * UDS-RDMA Proxy (urp) internal header
+ *
+ * Phase 2: multi-endpoint via GENL. Endpoints are stored in a global
+ * rhashtable keyed by name. Configuration arrives via netlink, not
+ * module_param. Stream multiplexing (multiple connections per endpoint)
+ * remains Phase 3 work; k0 single-connection model still applies inside
+ * each endpoint.
+ */
+#ifndef _URP_H
+#define _URP_H
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/version.h>
+#include <linux/kthread.h>
+#include <linux/net.h>
+#include <linux/un.h>
+#include <linux/in6.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+#include <linux/spinlock.h>
+#include <linux/list.h>
+#include <linux/atomic.h>
+#include <linux/workqueue.h>
+#include <linux/completion.h>
+#include <linux/mutex.h>
+#include <linux/rhashtable.h>
+#include <linux/rcupdate.h>
+
+#include <rdma/ib_verbs.h>
+#include <rdma/rdma_cm.h>
+
+#include "include/uapi/linux/urp.h"
+#include "urp_credit.h"
+#include "urp_reorder.h"
+
+/*
+ * Compat: kernel_connect() / kernel_bind() took a `struct sockaddr *`
+ * until Linux 7.0, which reworked them to take `struct sockaddr_unsized *`
+ * (the unsized-sockaddr change). Cast UDS bind/connect call sites through
+ * urp_sockaddr_t so the module builds against both the 6.1/6.6/6.12 LTS
+ * line and 7.0+ mainline.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+typedef struct sockaddr_unsized urp_sockaddr_t;
+#else
+typedef struct sockaddr urp_sockaddr_t;
+#endif
+
+/*
+ * Compat: strscpy() became a size-checked wrapper macro over the new
+ * sized_strscpy() function in Linux 6.8. On 6.8+ the strscpy() macro
+ * rejects a `const char *` source (its cstr type check trips on our
+ * @path parameter), so we must call sized_strscpy() directly; on the
+ * pre-6.8 LTS line sized_strscpy() does not exist and plain strscpy()
+ * accepts the const source. urp_strscpy() picks the right one per version.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+#define urp_strscpy(dst, src, sz) sized_strscpy((dst), (src), (sz))
+#else
+#define urp_strscpy(dst, src, sz) strscpy((dst), (src), (sz))
+#endif
+
+/* Buffer pool sizing -- defaults; per-endpoint values override at create */
+#define URP_NUM_BUFS		64
+#define URP_BUF_SIZE		4096	/* payload + header */
+#define URP_MAX_PAYLOAD		(URP_BUF_SIZE - URP_FRAME_HEADER_SIZE)
+#define URP_CQ_ENTRIES		(URP_NUM_BUFS * 2)	/* send + recv */
+#define URP_SQ_DEPTH		URP_NUM_BUFS
+#define URP_RQ_DEPTH		URP_NUM_BUFS
+
+/*
+ * struct urp_buffer - DMA-mapped buffer for RDMA send/recv
+ * @list:     free list linkage
+ * @page:     backing kernel page
+ * @dma_addr: DMA address for RDMA operations
+ * @data:     kernel virtual address (page_address(page))
+ * @sge:      scatter-gather entry (pre-filled for RDMA)
+ * @cqe:      CQ completion callback (per-buffer, set to send_done or recv_done)
+ * @index:    buffer index (for debugging)
+ */
+struct urp_buffer {
+	struct list_head	list;
+	struct page		*page;
+	dma_addr_t		dma_addr;
+	void			*data;
+	struct ib_sge		sge;
+	struct ib_cqe		cqe;
+	u32			index;
+};
+
+/*
+ * struct urp_stats - per-endpoint statistics
+ * Atomics for lock-free updates from TX/RX paths.
+ */
+struct urp_stats {
+	atomic64_t	tx_bytes;
+	atomic64_t	rx_bytes;
+	atomic64_t	tx_frames;
+	atomic64_t	rx_frames;
+	atomic64_t	connections;
+	/* Phase 3a Step 8: aggregate diagnostic counters. */
+	atomic64_t	credit_stalls;
+	atomic64_t	reorder_insertions;
+	atomic64_t	reorder_drops;
+	atomic64_t	buffer_alloc_fails;
+	/* Phase 3b Step 9: incremented on PSK rdma_reject. */
+	atomic64_t	auth_failures;
+};
+
+struct urp_endpoint;	/* forward decl for struct urp_qp */
+
+/*
+ * struct urp_qp - per-QP runtime state
+ *
+ * One entry per QP in ep->qps[]. Holds the verbs QP handle (set after
+ * rdma_create_qp), per-QP rdma_cm_id, connectedness, and a back-pointer
+ * to the owning endpoint for CM-event dispatch. Phase 3a Step 4 will
+ * add credit tracking; Phase 3b will add probe state (RTT EWMA,
+ * consecutive_misses).
+ */
+struct urp_qp {
+	struct urp_endpoint	*ep;		/* back-pointer */
+	struct rdma_cm_id	*cm_id;		/* per-QP CM id */
+	struct ib_qp		*qp;
+	u32			index;		/* position in ep->qps[] */
+	bool			established;	/* set on RDMA_CM_EVENT_ESTABLISHED */
+
+	/*
+	 * Step 4: per-QP credit-based flow control state. Initialized on
+	 * QP allocation; not yet wired into TX/RX (Step 4b adds the
+	 * consume-and-block + grant-frame emission).
+	 */
+	struct urp_credit	credit;
+
+	/* Step 8: per-QP counters surfaced via GENL urp_fill_endpoint */
+	atomic64_t		tx_bytes;
+	atomic64_t		rx_bytes;
+	atomic64_t		tx_frames;
+	atomic64_t		rx_frames;
+
+	/*
+	 * Phase 3b QP health-probe state (design 08a). probe_seq is the
+	 * next outgoing PING sequence number. last_ping_ns is the
+	 * monotonic timestamp of the last PING we sent on this QP, used
+	 * to compute RTT when the PONG arrives. consecutive_misses
+	 * counts PINGs that didn't get a PONG within the timeout (used
+	 * by the qualifying / draining state machine). rtt_ewma_ns is
+	 * the exponentially-weighted RTT in nanoseconds (alpha = 0.2);
+	 * 0 until the first PONG lands.
+	 */
+	u32			probe_seq;
+	u32			consecutive_misses;
+	u32			consecutive_pongs;
+	u64			last_ping_ns;
+	u64			rtt_ewma_ns;
+
+	/*
+	 * Phase 3b Step 5: per-QP health state machine (design 08a §8a.9).
+	 * Values are from UAPI `enum urp_qp_state`
+	 * (QUALIFYING / ACTIVE / DRAINING / REMOVED). For now QPs start
+	 * directly in ACTIVE on RDMA_CM_EVENT_ESTABLISHED (Qualifying is
+	 * skipped pending a slow-interval probe phase); on >= 3
+	 * consecutive missed PONGs the state transitions to DRAINING and
+	 * urp_qp_select_round_robin stops dispatching on that QP.
+	 */
+	u8			health;
+
+	/*
+	 * Phase 5 Step 3: rdma_connect() takes id->qp_mutex internally
+	 * but the rdma_cm framework holds that same mutex while calling
+	 * our CM event handler -- calling rdma_connect inline from the
+	 * handler self-deadlocks the cma_work_handler kworker. Defer
+	 * the connect to this work item; CM event ROUTE_RESOLVED queues
+	 * it and returns 0, releasing the mutex, then the worker calls
+	 * rdma_connect from a context where it can acquire the mutex.
+	 */
+	struct work_struct	connect_work;
+};
+
+#define URP_QP_MISS_THRESHOLD	3
+
+/* Phase 3b: PSK auth (design 17 / Tier 0.5). */
+#define URP_PSK_HASH_LEN	32	/* SHA-256 digest size */
+#define URP_PSK_AUTH_METHOD_SHA256	1
+
+/*
+ * struct urp_cm_ctx - context attached to every rdma_cm_id created by urp
+ *
+ * Allocated by urp_rdma_init (or by the listener handler when a child
+ * cm_id is accepted) and stashed in id->context. The CM handler reads
+ * this on every event so the per-cm-id work can find both the owning
+ * endpoint and (for per-QP cm_ids) the QP slot to update.
+ *
+ * Freed at cm_id destroy time. For the listener cm_id, is_listener is
+ * true and qp_index is unused.
+ */
+struct urp_cm_ctx {
+	struct urp_endpoint	*ep;
+	u32			qp_index;
+	bool			is_listener;
+};
+
+/*
+ * struct urp_connection - per-UDS-connection state (k0: single connection)
+ * @uds_sock:   accepted UDS socket
+ * @tx_thread:  TX pump kthread
+ * @seq:        next sequence number for outgoing frames
+ * @active:     connection is active (cleared on shutdown)
+ */
+struct urp_connection {
+	struct socket		*uds_sock;
+	struct task_struct	*tx_thread;
+	u64			seq;
+	bool			active;
+};
+
+/*
+ * struct urp_stream - one multiplexed connection over the endpoint's
+ *                     QP set (Phase 3a Step 6).
+ *
+ * Each accepted UDS connection (Step 7) maps to one stream.  Sequence
+ * spaces are per-stream (design 09 §9.6); reorder buffer + credit
+ * state are per-stream because multi-QP delivery across an endpoint is
+ * shared by all of its streams.
+ *
+ * Lifecycle is mediated by call_rcu so concurrent rhashtable walks see
+ * a stable view until their read-side critical section ends, matching
+ * the pattern used by the endpoint table.
+ */
+struct urp_stream {
+	struct urp_endpoint	*ep;		/* back-pointer */
+	u32			id;		/* rhashtable key */
+	enum urp_stream_state	state;
+	struct mutex		lock;		/* serializes state changes */
+
+	u64			tx_seq;		/* next outgoing seq */
+	u64			rx_next;	/* next expected incoming seq */
+
+	struct urp_credit	credit;		/* per-stream flow control */
+	struct urp_reorder	*reorder;	/* per-stream reorder buffer */
+
+	struct socket		*uds_sock;	/* this stream's UDS endpoint */
+	struct task_struct	*tx_thread;	/* per-stream TX kthread (Step 7c) */
+
+	struct rhash_head	ht_node;
+	struct rcu_head		rcu;
+};
+
+/*
+ * struct urp_endpoint - one configured proxy endpoint
+ *
+ * Multiple endpoints exist concurrently; lookup is by name via the global
+ * urp_endpoints rhashtable. Lifecycle transitions are serialized by @lock;
+ * teardown uses kfree_rcu so dump walks see consistent state.
+ */
+struct urp_endpoint {
+	/* Identity / configuration -- set at create, immutable except where noted */
+	char			name[URP_NAME_MAX];	/* lookup key */
+	char			listen_path[URP_PATH_MAX_LEN];
+	char			connect_path[URP_PATH_MAX_LEN];
+	char			rdma_device[URP_DEVICE_MAX];	/* "" = auto */
+	struct sockaddr_in6	peer_addr;
+	struct sockaddr_in6	bind_addr;
+	bool			has_peer_addr;
+	bool			has_bind_addr;
+	u32			num_qps;		/* mutable via SET */
+	u32			buffer_count;		/* mutable via SET */
+	u32			buffer_size;
+	u8			password[URP_PASSWORD_MAX];	/* raw input from netlink (cfg only) */
+	bool			has_password;
+	/*
+	 * Phase 3b Step 7: SHA-256(password) lives here once
+	 * urp_endpoint_create runs. The raw 16-byte input is discarded
+	 * after hashing; ep->password is zeroed for the live endpoint.
+	 */
+	u8			password_hash[URP_PSK_HASH_LEN];
+	/*
+	 * Phase 3b Step 8: pre-built private_data buffer for rdma_connect
+	 * / rdma_accept. Layout:
+	 *   [0]    auth_method (URP_PSK_AUTH_METHOD_SHA256)
+	 *   [1..]  password_hash
+	 * Built once at endpoint create time.
+	 */
+	u8			auth_priv[1 + URP_PSK_HASH_LEN];
+
+	/* Lifecycle */
+	enum urp_endpoint_state	state;
+	struct mutex		lock;			/* serializes state transitions */
+	struct rhash_head	ht_node;		/* urp_endpoints rhashtable linkage */
+	struct rcu_head		rcu;			/* deferred free */
+	bool			is_initiator;		/* derived from listen_path != "" */
+
+	/* UDS side */
+	struct socket		*listen_sock;
+	struct task_struct	*accept_thread;
+	struct urp_connection	conn;
+
+	/* RDMA side -- shared across all QPs of this endpoint */
+	struct rdma_cm_id	*listen_id;	/* acceptor: listener CM ID */
+	struct ib_device	*ib_dev;	/* cached on first QP setup */
+	struct ib_pd		*pd;
+	struct ib_cq		*send_cq;
+	struct ib_cq		*recv_cq;
+	struct ib_srq		*srq;		/* shared receive queue (Step 3) */
+	u32			srq_pool_target;
+
+	/* Phase 4 Step 1: kernel page_pool backing the buffer cache. */
+	struct page_pool	*page_pool;
+
+	/* Multi-QP state (Phase 3a Step 2 scaffold; Step 2b fills it) */
+	struct urp_qp	*qps;		/* array of num_qps entries; allocated in activate */
+	atomic_t		qps_connected;	/* count of QPs in ESTABLISHED state */
+	atomic_t		qps_accepted;	/* acceptor: count of CONNECT_REQUESTs processed */
+	atomic_t		rr_counter;	/* round-robin selector cursor */
+
+	/* Stream multiplexing (Phase 3a Step 6) */
+	struct rhashtable	streams;	/* keyed by u32 stream_id */
+	bool			streams_inited;
+	atomic_t		next_stream_id;	/* monotonic per-direction allocator */
+
+	/* Buffer pool */
+	struct urp_buffer	bufs[URP_NUM_BUFS];
+	struct list_head	send_free;
+	struct list_head	recv_free;
+	spinlock_t		send_lock;
+	spinlock_t		recv_lock;
+
+	/* Runtime state */
+	struct urp_stats	stats;
+	struct completion	cm_done;
+	int			cm_status;
+	bool			connected;
+
+	/* RX work */
+	struct work_struct	rx_work;
+	struct workqueue_struct	*rx_wq;
+
+	/* Phase 3b: per-endpoint probe ticker. Fires every
+	 * URP_PROBE_INTERVAL_MS on the system workqueue, emits one PING
+	 * per established QP, reschedules itself. Cancelled in
+	 * urp_endpoint_drain. */
+	struct delayed_work	probe_work;
+	bool			probe_active;
+
+	/* /proc/urp/<name>/stats entry (set by urp_endpoint_proc_create) */
+	struct proc_dir_entry	*proc_dir;
+};
+
+/* Module-global endpoint store (defined in urp_endpoint.c) */
+extern struct rhashtable	urp_endpoints;
+extern bool			urp_endpoints_inited;
+
+/* urp_endpoint.c -- lifecycle */
+int  urp_endpoint_table_init(void);
+void urp_endpoint_table_destroy(void);
+int  urp_endpoint_create(struct urp_endpoint *cfg, struct urp_endpoint **out);
+int  urp_endpoint_activate(struct urp_endpoint *ep);
+void urp_endpoint_drain(struct urp_endpoint *ep);
+void urp_endpoint_destroy(struct urp_endpoint *ep);
+struct urp_endpoint *urp_endpoint_lookup(const char *name);
+void urp_endpoint_drain_all(void);
+
+/* urp_socket.c */
+int  urp_socket_init(struct urp_endpoint *ep, const char *path);
+void urp_socket_cleanup(struct urp_endpoint *ep);
+void urp_socket_conn_cleanup(struct urp_endpoint *ep);
+int  urp_connect_uds(struct urp_endpoint *ep, const char *path);
+int  urp_stream_connect_uds(struct urp_stream *stream, const char *path);
+
+/* urp_rdma.c */
+/* Phase 5 Step 3: deferred rdma_connect (see urp_rdma.c). */
+void urp_connect_work_fn(struct work_struct *w);
+
+int  urp_rdma_init(struct urp_endpoint *ep, const char *peer_addr,
+		   int peer_port, int bind_port, bool is_initiator);
+void urp_rdma_cleanup(struct urp_endpoint *ep);
+struct urp_buffer *urp_buf_alloc_send(struct urp_endpoint *ep);
+void urp_buf_free_send(struct urp_endpoint *ep, struct urp_buffer *buf);
+struct urp_buffer *urp_buf_alloc_recv(struct urp_endpoint *ep);
+void urp_buf_free_recv(struct urp_endpoint *ep, struct urp_buffer *buf);
+int  urp_post_recv(struct urp_endpoint *ep, struct ib_qp *qp, struct urp_buffer *buf);
+int  urp_post_recv_for_qp(struct urp_endpoint *ep, struct ib_qp *qp, u32 count);
+
+/* urp_srq.c -- Shared Receive Queue (Phase 3a Step 3) */
+int  urp_srq_create(struct urp_endpoint *ep);
+void urp_srq_destroy(struct urp_endpoint *ep);
+int  urp_srq_post_initial(struct urp_endpoint *ep);
+int  urp_post_srq_recv(struct urp_endpoint *ep, struct urp_buffer *buf);
+
+/* urp_qp.c -- per-QP state and selection (Phase 3a Step 2) */
+int  urp_qps_init(struct urp_endpoint *ep);
+void urp_qps_destroy(struct urp_endpoint *ep);
+struct urp_qp *urp_qp_select_round_robin(struct urp_endpoint *ep);
+int  urp_qp_index_of(struct urp_endpoint *ep, struct ib_qp *qp);
+
+/* urp_stream.c -- stream multiplexing core (Phase 3a Step 6) */
+int  urp_streams_init(struct urp_endpoint *ep);
+void urp_streams_destroy_all(struct urp_endpoint *ep);
+u32  urp_stream_next_id(struct urp_endpoint *ep);
+int  urp_stream_create(struct urp_endpoint *ep, u32 stream_id,
+		       struct urp_stream **out_stream);
+struct urp_stream *urp_stream_lookup(struct urp_endpoint *ep, u32 stream_id);
+void urp_stream_destroy(struct urp_endpoint *ep, struct urp_stream *s);
+
+/* urp_stream.c -- lifecycle handlers (Phase 3a Step 7) */
+int  urp_stream_rx_syn(struct urp_endpoint *ep, u32 stream_id,
+		       struct urp_stream **out_stream);
+int  urp_stream_rx_fin(struct urp_stream *s);
+int  urp_stream_rx_rst(struct urp_stream *s);
+void urp_stream_tx_fin(struct urp_stream *s);
+void urp_stream_tx_rst(struct urp_stream *s);
+int  urp_stream_rx_dispatch(struct urp_endpoint *ep, u32 stream_id, u8 flags,
+			    struct urp_stream **out_stream);
+
+/* urp_pump.c */
+int  urp_pump_start(struct urp_endpoint *ep);
+void urp_pump_stop(struct urp_endpoint *ep);
+int  urp_stream_pump_start(struct urp_stream *stream);
+void urp_stream_pump_stop(struct urp_stream *stream);
+int  urp_emit_credit_frame(struct urp_endpoint *ep, struct urp_qp *qps,
+			   u32 stream_id, u16 grants);
+int  urp_emit_pong_on(struct urp_endpoint *ep, struct ib_qp *qp,
+		      const void *ping_payload);
+void urp_probe_work_start(struct urp_endpoint *ep);
+void urp_probe_work_stop(struct urp_endpoint *ep);
+
+/* CQ completion callbacks (urp_rdma.c) -- used by pump when posting sends */
+void urp_send_done(struct ib_cq *cq, struct ib_wc *wc);
+
+/* urp_proc.c */
+int  urp_proc_init(void);
+void urp_proc_cleanup(void);
+int  urp_endpoint_proc_create(struct urp_endpoint *ep);
+void urp_endpoint_proc_remove(struct urp_endpoint *ep);
+
+/* urp_netlink.c */
+int  urp_genl_register(void);
+void urp_genl_unregister(void);
+void urp_send_event(struct urp_endpoint *ep);
+
+/* Frame encode/decode (inline, matches shared Rust crate wire format) */
+
+/*
+ * Wire format (20 bytes, little-endian):
+ *   [0..4)   stream_id       u32
+ *   [4..12)  sequence_number u64
+ *   [12]     frame_type      u8
+ *   [13]     flags           u8
+ *   [14..16) credits_granted u16
+ *   [16..20) payload_length  u32
+ */
+
+static inline void urp_frame_encode(void *buf, u32 stream_id, u64 seq,
+				    u8 frame_type, u8 flags,
+				    u16 credits, u32 payload_len)
+{
+	u8 *p = buf;
+
+	put_unaligned_le32(stream_id, p);
+	put_unaligned_le64(seq, p + 4);
+	p[12] = frame_type;
+	p[13] = flags;
+	put_unaligned_le16(credits, p + 14);
+	put_unaligned_le32(payload_len, p + 16);
+}
+
+static inline u32 urp_frame_decode_payload_len(const void *buf)
+{
+	const u8 *p = buf;
+
+	return get_unaligned_le32(p + 16);
+}
+
+static inline u32 urp_frame_decode_stream_id(const void *buf)
+{
+	const u8 *p = buf;
+
+	return get_unaligned_le32(p);
+}
+
+static inline u16 urp_frame_decode_credits(const void *buf)
+{
+	const u8 *p = buf;
+
+	return get_unaligned_le16(p + 14);
+}
+
+/*
+ * QP health probe wire payloads (Phase 3b, design 08a §8a.2).
+ * Carried inside a frame_type == URP_FRAME_TYPE_PROBE frame; flags
+ * distinguish PING (0) from PONG (URP_PROBE_FLAG_PONG).
+ *
+ * PING (32 bytes, little-endian):
+ *   [0..4)   probe_seq        u32
+ *   [4..6)   qp_index         u16
+ *   [6]      clock_flags      u8
+ *   [7]      reserved         u8
+ *   [8..16)  t_send_mono      u64  (initiator's CLOCK_MONOTONIC at send)
+ *   [16..24) t_send_real      u64  (initiator's CLOCK_REALTIME at send)
+ *   [24..32) padding          u64
+ *
+ * PONG (48 bytes): same layout for fields 0..16 as PING (echoed),
+ *   then [24..32) t_recv_real, [32..40) t_pong_mono, [40..48) t_pong_real.
+ *
+ * Sizes match crates/uds-rdma-protocol/src/probe.rs.
+ */
+#define URP_PING_PAYLOAD_SIZE	32
+#define URP_PONG_PAYLOAD_SIZE	48
+#define URP_PROBE_FLAG_PONG	(1 << 0)
+
+static inline void urp_ping_encode(void *buf, u32 probe_seq, u16 qp_index,
+				   u64 t_send_mono, u64 t_send_real)
+{
+	u8 *p = buf;
+
+	put_unaligned_le32(probe_seq, p);
+	put_unaligned_le16(qp_index, p + 4);
+	p[6] = 0;	/* clock_flags */
+	p[7] = 0;	/* reserved */
+	put_unaligned_le64(t_send_mono, p + 8);
+	put_unaligned_le64(t_send_real, p + 16);
+	put_unaligned_le64(0, p + 24);
+}
+
+static inline u32 urp_ping_decode_seq(const void *buf)
+{
+	return get_unaligned_le32((const u8 *)buf);
+}
+
+static inline u16 urp_ping_decode_qp_index(const void *buf)
+{
+	return get_unaligned_le16((const u8 *)buf + 4);
+}
+
+static inline u64 urp_ping_decode_t_send_mono(const void *buf)
+{
+	return get_unaligned_le64((const u8 *)buf + 8);
+}
+
+static inline u64 urp_ping_decode_t_send_real(const void *buf)
+{
+	return get_unaligned_le64((const u8 *)buf + 16);
+}
+
+/* Encode a PONG by echoing the PING fields and appending responder
+ * timestamps. ping must point to the received PING payload. */
+static inline void urp_pong_encode(void *buf, const void *ping,
+				   u64 t_recv_real, u64 t_pong_mono,
+				   u64 t_pong_real)
+{
+	u8 *p = buf;
+	const u8 *q = ping;
+
+	/* Echo PING [0..24) -- probe_seq, qp_index, clock_flags, reserved,
+	 * t_send_mono, t_send_real. */
+	memcpy(p, q, 24);
+	put_unaligned_le64(t_recv_real, p + 24);
+	put_unaligned_le64(t_pong_mono, p + 32);
+	put_unaligned_le64(t_pong_real, p + 40);
+}
+
+static inline u64 urp_pong_decode_t_pong_mono(const void *buf)
+{
+	return get_unaligned_le64((const u8 *)buf + 32);
+}
+
+static inline u64 urp_frame_decode_seq(const void *buf)
+{
+	const u8 *p = buf;
+
+	return get_unaligned_le64(p + 4);
+}
+
+static inline u8 urp_frame_decode_type(const void *buf)
+{
+	const u8 *p = buf;
+
+	return p[12];
+}
+
+static inline u8 urp_frame_decode_flags(const void *buf)
+{
+	const u8 *p = buf;
+
+	return p[13];
+}
+
+#endif /* _URP_H */
