@@ -88,4 +88,48 @@ rec {
   # assertion in mkVm.nix verifies they agree (vermagic match).
   #
   kernelPackage = "linuxPackages_latest";
+
+  # ==========================================================================
+  # Per-architecture VM config (Phase 5 cross-arch, Track B)
+  # ==========================================================================
+  #
+  # x86_64 boots under KVM (cpu = null => -enable-kvm -cpu host). aarch64 and
+  # riscv64 have no KVM on an x86 host, so a non-null cpu forces QEMU TCG
+  # (full-system emulation) -- microvm.nix gates -enable-kvm purely on
+  # cpu == null. Under emulation everything is ~10-25x slower, so each arch
+  # carries a timeout multiplier applied on top of the base `timeouts` above.
+  #
+  #   arch          qemu.machine  cpu     serialConsole  timeoutMultiplier
+  #   x86_64        pc            null    ttyS0          1
+  #   aarch64       virt          max     ttyAMA0        12
+  #   riscv64       virt          max     ttyS0          25   (build-only; boot best-effort)
+  #
+  # machineOpts is only overridden where microvm.nix lacks a default for the
+  # target system (riscv64-linux); aarch64 has one upstream.
+  arches = {
+    x86_64 = {
+      qemuMachine       = "pc";
+      cpu               = null;   # null => KVM
+      serialConsole     = "ttyS0";
+      mem               = 1536;
+      timeoutMultiplier = 1;
+      machineOpts       = null;   # use microvm.nix default
+    };
+    aarch64 = {
+      qemuMachine       = "virt";
+      cpu               = "max";  # non-null => TCG
+      serialConsole     = "ttyAMA0";
+      mem               = 3072;
+      timeoutMultiplier = 12;
+      machineOpts       = null;   # aarch64-linux has an upstream default
+    };
+    riscv64 = {
+      qemuMachine       = "virt";
+      cpu               = "max";  # non-null => TCG
+      serialConsole     = "ttyS0";
+      mem               = 3072;
+      timeoutMultiplier = 25;
+      machineOpts       = { accel = "tcg"; };  # no upstream default for riscv64-linux
+    };
+  };
 }

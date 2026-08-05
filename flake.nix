@@ -105,6 +105,19 @@
           inherit pkgs lib microvm nixpkgs urpCli;
           inherit (nixChecks) buildUrpKo;
         };
+
+        # Phase 5 cross-arch (Track B): build urp.ko for aarch64 / riscv64
+        # via pkgsCross. Guaranteed-green, build-only gates; the full
+        # emulated pair-boot lives in the per-arch microvm packages.
+        # Re-import checks.nix with the cross pkgs so buildUrpKoWith runs
+        # under the cross stdenv (nativeBuildInputs splice to native
+        # buildPackages automatically) and threads ARCH/CROSS_COMPILE.
+        crossUrpKo = crossName: kpkgs:
+          let cross = pkgs.pkgsCross.${crossName};
+              c = import ./nix/checks.nix { pkgs = cross; rustToolchain = null; };
+          in c.buildUrpKo cross.${kpkgs};
+        urpKoAarch64 = crossUrpKo "aarch64-multiplatform" "linuxPackages_latest";
+        urpKoRiscv64 = crossUrpKo "riscv64" "linuxPackages_latest";
       in
       {
         devShells.default = devshell;
@@ -126,6 +139,8 @@
           soak-1h = soak1h;
           urp-vm = urpVm;
           urp-vm-debug = urpVmDebug;
+          urp-ko-aarch64 = urpKoAarch64;
+          urp-ko-riscv64 = urpKoRiscv64;
         } // microvms.packages;
 
         # buildUrpKo: function to build against any kernel.

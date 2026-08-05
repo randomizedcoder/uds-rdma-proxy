@@ -80,11 +80,17 @@ let
             export KCFLAGS="-DCONFIG_URP_REORDER_RUST=1"
             export CONFIG_URP_REORDER_RUST=y
           '';
+          # Cross-compilation (Phase 5 cross-arch): derive ARCH +
+          # CROSS_COMPILE from this derivation's own target platform. For a
+          # native build pkgs.stdenv.hostPlatform is x86_64 -> ARCH=x86,
+          # targetPrefix="" (both no-ops matching the kernel's own default).
+          # When checks.nix is imported with a pkgsCross.<arch> pkgs the same
+          # expressions yield e.g. ARCH=arm64 CROSS_COMPILE=aarch64-...-.
+          crossVars = "ARCH=${pkgs.stdenv.hostPlatform.linuxArch} CROSS_COMPILE=${pkgs.stdenv.cc.targetPrefix}";
+          rustVar = if rustFfi == null then "" else "CONFIG_URP_REORDER_RUST=y";
         in ''
           ${extraCfg}
-          make -C ${kdir} M=$PWD/kernel \
-            ${if rustFfi == null then "" else "CONFIG_URP_REORDER_RUST=y"} \
-            modules
+          make -C ${kdir} M=$PWD/kernel ${crossVars} ${rustVar} modules
         '';
       installPhase = ''
         mkdir -p $out/lib/modules/${kernelPackages.kernel.modDirVersion}
