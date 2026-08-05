@@ -20,10 +20,16 @@
   # kernel. Triggers a full kernel rebuild (~30 min first time,
   # cached after). The urpKo build and the guest boot use the
   # same package, so vermagic matches.
-  withSanitizers ? false }:
+  withSanitizers ? false,
+  # Phase 5 cross-arch (Track B): "x86_64" | "aarch64" | "riscv64".
+  # For non-x86 arches the caller passes a pkgsCross.<arch> `pkgs`
+  # (so kernel + rootfs + urpCli are the target arch) and this selects
+  # the matching qemu machine / cpu (null=KVM vs max=TCG) / console.
+  arch ? "x86_64" }:
 
 let
   constants = import ./constants.nix;
+  archCfg = constants.arches.${arch};
   vmCfg = constants.vms.${vmId};
   hostname = vmCfg.hostname;
   pairOctet = toString vmCfg.ipLastOctet;
@@ -87,11 +93,13 @@ in
         # Not exactly 2048: microvm.nix warns QEMU hangs at 2 GiB
         # (https://github.com/microvm-nix/microvm.nix/issues/171).
         # KASAN ~2-3x RSS so debug VMs need more headroom.
-        mem = if withSanitizers then 3584 else 1536;
+        mem = if withSanitizers then 3584 else archCfg.mem;
         vcpu = 2;
 
-        # KVM on x86_64 host; null cpu triggers -enable-kvm -cpu host.
-        cpu = null;
+        # x86_64: null cpu => -enable-kvm -cpu host (microvm.nix gates KVM
+        # on cpu == null). aarch64/riscv64 on an x86 host have no KVM, so
+        # archCfg.cpu is "max", which forces QEMU TCG (full emulation).
+        cpu = archCfg.cpu;
 
         volumes = [];
 
@@ -116,8 +124,15 @@ in
 
         qemu = {
           serialConsole = false;
-          machine = "pc";
-          package = pkgs.qemu_kvm;
+          machine = archCfg.qemuMachine;
+          # Native KVM build for x86 (cpu==null); for the emulated arches the
+          # qemu binary must come from buildPackages (native, all-targets) so
+          # it can run qemu-system-<arch> against the cross guest.
+          package = if archCfg.cpu == null then pkgs.qemu_kvm else pkgs.buildPackages.qemu;
+        } // lib.optionalAttrs (archCfg.machineOpts != null) {
+          # riscv64-linux has no machineOpts default in microvm.nix -> set it.
+          machineOpts = archCfg.machineOpts;
+        } // {
 
           extraArgs = [
             # pgrep-friendly process name (-name <hostname>,process=<hostname>
@@ -138,7 +153,7 @@ in
             # Kernel command line. microvm.nix's qemu-vm-like
             # machine type doesn't auto-append init=, so we do.
             "-append" (builtins.concatStringsSep " " ([
-              "console=ttyS0,115200"
+              "console=${archCfg.serialConsole},115200"
               "console=hvc0"
               "reboot=t"
               "panic=-1"
@@ -155,7 +170,7 @@ in
       boot.kernelPackages = kernelPackages;
 
       boot.kernelParams = [
-        "console=ttyS0,115200"
+        "console=${archCfg.serialConsole},115200"
         "console=hvc0"
         "systemd.default_standard_error=journal+console"
         "systemd.show_status=true"

@@ -13,12 +13,16 @@
   # `pairLabel` suffixes the derivation names + report dir so the
   # default and sanitizer variants coexist in the nix store.
   pairLabel ? "",
-  sanitizer ? false }:
+  sanitizer ? false,
+  # Phase 5 cross-arch (Track B): scales every phase timeout for the slow
+  # TCG-emulated arches (aarch64 ~12x, riscv64 ~25x). 1 for native x86_64.
+  timeoutMultiplier ? 1 }:
 
 let
   vm1 = constants.vms.vm1;
   vm2 = constants.vms.vm2;
   t   = constants.timeouts;
+  mult = timeoutMultiplier;
 
   vmAttr1 = "microvm-vm1${pairLabel}";
   vmAttr2 = "microvm-vm2${pairLabel}";
@@ -132,19 +136,21 @@ in rec {
       POLL=${toString constants.pollInterval}
       # Sanitizer kernels: first-time build can take 30 min; runtime
       # ~3x slowdown, so all phase timeouts inflate accordingly.
-      T_BUILD=${if sanitizer then "3600" else toString t.build}
-      T_PROC=${toString t.processStart}
-      T_SERIAL=${if sanitizer then "90" else toString t.serialReady}
-      T_VIRTIO=${if sanitizer then "120" else toString t.virtioReady}
-      T_SERVICE=${if sanitizer then "180" else toString t.serviceReady}
-      T_PAIRLINK=${if sanitizer then "90" else toString t.pairLink}
-      T_RXE=${if sanitizer then "30" else toString t.rxeReady}
-      T_URP=${if sanitizer then "30" else toString t.urpReady}
-      T_CM=${toString t.cmEstablished}
-      T_ECHO=${if sanitizer then "20" else toString t.echo}
+      # Cross-arch: TCG emulation is ~mult x slower; base timeouts scale
+      # by `mult` (sanitizer and cross are mutually exclusive in practice).
+      T_BUILD=${if sanitizer then "3600" else toString (t.build * mult)}
+      T_PROC=${toString (t.processStart * mult)}
+      T_SERIAL=${if sanitizer then "90" else toString (t.serialReady * mult)}
+      T_VIRTIO=${if sanitizer then "120" else toString (t.virtioReady * mult)}
+      T_SERVICE=${if sanitizer then "180" else toString (t.serviceReady * mult)}
+      T_PAIRLINK=${if sanitizer then "90" else toString (t.pairLink * mult)}
+      T_RXE=${if sanitizer then "30" else toString (t.rxeReady * mult)}
+      T_URP=${if sanitizer then "30" else toString (t.urpReady * mult)}
+      T_CM=${toString (t.cmEstablished * mult)}
+      T_ECHO=${if sanitizer then "20" else toString (t.echo * mult)}
       # shellcheck disable=SC2034  # used inline by per-step timeout
-      T_DRAIN=${if sanitizer then "30" else toString t.drainRemove}
-      T_SHUTDOWN=${if sanitizer then "60" else toString t.shutdown}
+      T_DRAIN=${if sanitizer then "30" else toString (t.drainRemove * mult)}
+      T_SHUTDOWN=${if sanitizer then "60" else toString (t.shutdown * mult)}
 
       RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; NC=$'\033[0m'
       now_ms() { date +%s%3N; }

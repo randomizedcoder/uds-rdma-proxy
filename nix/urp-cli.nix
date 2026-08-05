@@ -2,7 +2,14 @@
 #
 # It speaks the kernel module's generic-netlink ("urp") family to add /
 # remove / inspect endpoints. Pure Rust, no extra link deps.
-{ pkgs, rustToolchain }:
+#
+# rustToolchain is optional: when provided (native builds) it is prepended
+# to PATH so the workspace's pinned nightly toolchain is used. When omitted
+# -- as for the Phase 5 cross-arch builds where `pkgs` is a pkgsCross.<arch>
+# set -- the derivation falls back to `pkgs.rustPlatform` (nixpkgs' stable,
+# cross-aware toolchain). urp-cli is edition-2021 with no nightly features,
+# so stable builds it fine.
+{ pkgs, rustToolchain ? null }:
 
 let
   src = builtins.path {
@@ -43,7 +50,11 @@ pkgs.rustPlatform.buildRustPackage {
   cargoBuildFlags = [ "-p" "urp-cli" ];
   cargoTestFlags  = [ "-p" "urp-cli" ];
 
-  nativeBuildInputs = [ rustToolchain ];
+  # Cross builds run the CLI's tests under an emulator they may not have,
+  # so skip the check phase when cross-compiling (rustToolchain == null).
+  doCheck = rustToolchain != null;
+
+  nativeBuildInputs = pkgs.lib.optional (rustToolchain != null) rustToolchain;
 
   meta = with pkgs.lib; {
     description = "Control plane CLI for the urp kernel module (generic netlink)";
