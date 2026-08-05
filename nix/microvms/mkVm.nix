@@ -125,10 +125,15 @@ in
         qemu = {
           serialConsole = false;
           machine = archCfg.qemuMachine;
-          # Native KVM build for x86 (cpu==null); for the emulated arches the
+          # Native KVM build for x86 (cpu==null). For the emulated arches the
           # qemu binary must come from buildPackages (native, all-targets) so
-          # it can run qemu-system-<arch> against the cross guest.
-          package = if archCfg.cpu == null then pkgs.qemu_kvm else pkgs.buildPackages.qemu;
+          # it can run qemu-system-<arch> against the cross guest -- AND with
+          # seccompSupport disabled, because microvm.nix passes `-sandbox on`
+          # which does not work for cross-arch qemu (per xdp2's TCG harness).
+          package =
+            if archCfg.cpu == null
+            then pkgs.qemu_kvm
+            else pkgs.buildPackages.qemu.override { seccompSupport = false; };
         } // lib.optionalAttrs (archCfg.machineOpts != null) {
           # riscv64-linux has no machineOpts default in microvm.nix -> set it.
           machineOpts = archCfg.machineOpts;

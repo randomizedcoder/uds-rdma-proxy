@@ -117,15 +117,18 @@ rec {
     };
     aarch64 = {
       qemuMachine       = "virt";
-      cpu               = "max";  # non-null => TCG
+      # Specific TCG-stable model (matches xdp2); "max" can be slower/buggier
+      # under emulation. Non-null cpu => TCG (microvm.nix skips -enable-kvm).
+      cpu               = "cortex-a72";
       serialConsole     = "ttyAMA0";
       mem               = 3072;
       timeoutMultiplier = 12;
-      machineOpts       = null;   # aarch64-linux has an upstream default
+      # Force TCG explicitly (xdp2 sets this for aarch64 too, not just riscv64).
+      machineOpts       = { accel = "tcg"; };
     };
     riscv64 = {
       qemuMachine       = "virt";
-      cpu               = "max";  # non-null => TCG
+      cpu               = "rv64";  # non-null => TCG
       serialConsole     = "ttyS0";
       mem               = 3072;
       timeoutMultiplier = 25;
