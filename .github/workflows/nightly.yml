@@ -51,3 +51,18 @@ jobs:
       - uses: actions/checkout@v4
       - name: Soak test
         run: nix run .#soak-1h
+
+  cross-build:
+    name: Cross-arch urp.ko build gates (aarch64 + riscv64)
+    # Pure Nix build (no KVM), but building the from-source cross kernels
+    # is heavy, so it lives on the self-hosted runner rather than a
+    # 2-core hosted runner. Guaranteed-green build-only gate for the
+    # aarch64/riscv64 DoD items; the full TCG boot is tracked separately.
+    runs-on: [self-hosted, kvm]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: urp.ko — aarch64
+        run: nix build -L .#urp-ko-aarch64
+      - name: urp.ko — riscv64
+        run: nix build -L .#urp-ko-riscv64

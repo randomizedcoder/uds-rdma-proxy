@@ -735,8 +735,8 @@ pipeline authored. Cross-arch + Redpanda in progress.
 | Architecture | Emulation | Status | Duration | Notes |
 |-------------|-----------|--------|----------|-------|
 | x86_64 | KVM (native) | PASS (`705ae8c`) | ~38 s full pair test | smoke + 12-phase lifecycle, no harness workarounds |
-| aarch64 | QEMU TCG | Not started | | deferred |
-| riscv64 | QEMU TCG | Not started | | deferred |
+| aarch64 | QEMU TCG | urp.ko BUILD PASS (Step 13) | build ~min | `nix build .#urp-ko-aarch64` -> ELF ARM aarch64; kernel has CONFIG_RDMA_RXE=m. Cross rustc + kernel cached. Full TCG boot: harness arch-table scaffolded (constants.arches); boot is the best-effort follow-on. |
+| riscv64 | QEMU TCG | urp.ko BUILD PASS (Step 13) | build ~min | `nix build .#urp-ko-riscv64` -> ELF UCB RISC-V; kernel has CONFIG_RDMA_RXE=m. Full TCG boot deferred (from-source cross closure is hours; build-only is the shipped gate). |
 
 ### Kernel Version Matrix
 
