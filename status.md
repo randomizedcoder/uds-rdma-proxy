@@ -1,6 +1,6 @@
 # Project Status
 
-_Last updated: 2026-08-04_
+_Last updated: 2026-08-08_
 
 ## Current branch
 
@@ -18,7 +18,7 @@ rxe-testable scope + 1-hour soak PASS). Phase 5 Steps 1-12 done.
 | **3b** — probes / PSK | `docs/KERNEL-MODULE-PLAN.md` §3.6-§3.7 + `KERNEL-MODULE-IMPLEMENTATION.md` §Phase 3b | ✅ **Complete. Steps 1-10 done (`0d5c077` through `dd6bab0`). Probes (PING/PONG/RTT EWMA/state machine), PSK SHA-256 + rdma_cm `private_data` validation, auth-failure observability all wired. Test-kmod-k0 23/23 PASS. Sub-steps 8b (initiator-validates-acceptor) + 3b/test (URP-to-URP harness) pending.** |
 | 3c — KUnit hardening + soak | (deferred) | not started |
 | **4** — k2 optimized | `docs/KERNEL-MODULE-PLAN.md` §4 + `KERNEL-MODULE-IMPLEMENTATION.md` §Phase 4 | ✅ **rxe-testable scope complete + 1-hour soak PASS. Steps: 1 page_pool (`ded84a7`), 2 NUMA-aware (`78967e5`), 3 tracker (`c535c7a`), 4-5 soak harness + reconnect-leak fix (`c41bd61`). 23/23 `test-kmod-k0` + 1240 cycles + 120 churn add/remove with 0 errors, 1828 kB slab leak (budget 2048). §4.2 zero-copy / §4.3 adaptive CQ / §4.4 kthread NUMA bind / §4.5 hardware benchmarks deferred to a hardware-validation pass.** |
-| **5** — MicroVM integration | `docs/KERNEL-MODULE-PLAN.md` §5 + `KERNEL-MODULE-IMPLEMENTATION.md` §Phase 5 | 🟢 **Substantially complete (6/8 deliverables done, +1 partial, 1 blocked). Steps 1-9 x86_64 harness/sanitizer PASS. Step 10 kernel-version matrix (6.1.180/6.6.148/6.12.101/7.1.6 build via 4 LTS compat shims). Step 11 nixpkgs+microvm bump (latest kernel 7.1.6). Step 12 CI (`ci.yml` every-push + `nightly.yml` self-hosted KVM). Steps 13-14 cross-arch harness (localSystem/crossSystem, xdp2-aligned). Step 15 aarch64 emulated pair test FULL PASS under TCG. riscv64: urp.ko build gate (boot via same harness, not run). Redpanda: spec corrected + staged design ready, but Stage 0 blocked -- broker has no hermetic public source (GitHub=rpk-only, Docker Hub=rate-limited, apt=token-gated).** |
+| **5** — MicroVM integration | `docs/KERNEL-MODULE-PLAN.md` §5 + `KERNEL-MODULE-IMPLEMENTATION.md` §Phase 5 | 🟢 **Substantially complete (6/8 deliverables done, +1 partial, 1 blocked). Steps 1-9 x86_64 harness/sanitizer PASS. Step 10 kernel-version matrix (6.1.180/6.6.148/6.12.101/7.1.6 build via 4 LTS compat shims). Step 11 nixpkgs+microvm bump (latest kernel 7.1.6). Step 12 CI (`ci.yml` every-push + `nightly.yml` self-hosted KVM). Steps 13-14 cross-arch harness (localSystem/crossSystem, xdp2-aligned). Step 15 aarch64 emulated pair test FULL PASS under TCG. riscv64: urp.ko build gate (boot via same harness, not run). Redpanda: **Stage A metadata round-trip PASSES** (Stage 0 unblocked -- broker built hermetically via the redpanda fork's Nix flake; see below).** |
 | 6 | per `docs/KERNEL-MODULE-PLAN.md` | not started |
 
 ## Phase 2 deliverables (now committed in `067829e`)
@@ -87,6 +87,34 @@ existing test uses the default `num_qps = 1`.
 The full step-by-step file-level plan remains at
 `~/.claude/profiles/siden/plans/floofy-stirring-donut.md`; the active
 session plan is `~/.claude/profiles/runpod/plans/this-repo-has-a-abundant-fern.md`.
+
+## Redpanda Stage A -- metadata round-trip over UDS-over-RDMA (PASS)
+
+A real Kafka client (`rpk`) fetches cluster metadata from a real Redpanda broker
+with the Kafka bytes carried over the URP RDMA data path. Single host, soft-RoCE
+(`rdma_rxe`), RDMA loopback over one device:
+
+```
+rpk --UDS--> urp initiator ==RDMA/rxe==> urp acceptor --UDS--> redpanda
+  unix://rpk.sock                                       kafka_api unix_path (+ TCP for advertisement)
+```
+
+- Harness: `nix/test-redpanda-uds.nix` (`nix run .#test-redpanda-uds`, needs root).
+- Broker + `rpk` built from the redpanda fork's Nix flake (`redpanda` flake input,
+  pinned to `randomizedcoder/redpanda@d4b44629`), which carries the native Kafka
+  UDS listener (PR #30240). This unblocks the old "Stage 0" hermetic-source gap.
+- Result: **9/9 checks pass.** `rpk cluster info -X brokers=unix://.../rpk.sock`
+  returns the real cluster id + broker list; `urp show` counters confirm the
+  53 B metadata request / 424 B response crossed the RDMA tunnel; a negative
+  check proves attribution (breaks when the acceptor is removed; direct TCP
+  unaffected).
+- Two fixes were required in the fork: build `rpk` from local source (was
+  fetching an upstream rev predating the UDS client support) and build the
+  broker with clang 22 (llvm 23 RC miscompiled it). See the fork commit.
+
+Scope note: `rpk`/franz use UDS only for the initial Metadata bootstrap (UDS is
+non-advertisable by design), so full produce/consume over RDMA is a follow-up
+(advertised TCP data-plane bridging) -- see `docs/design/25-provisioning-layer.md`.
 
 ## Working-tree hygiene notes
 
