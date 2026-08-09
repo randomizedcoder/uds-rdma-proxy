@@ -188,8 +188,10 @@ static int urp_fill_endpoint(struct sk_buff *skb, struct urp_endpoint *ep,
 
 				if (nla_put_u32(skb, URP_STREAM_A_ID, s->id) ||
 				    nla_put_u8(skb, URP_STREAM_A_STATE, (u8)s->state) ||
-				    nla_put_u64_64bit(skb, URP_STREAM_A_TX_BYTES, 0, 0) ||
-				    nla_put_u64_64bit(skb, URP_STREAM_A_RX_BYTES, 0, 0) ||
+				    nla_put_u64_64bit(skb, URP_STREAM_A_TX_BYTES,
+						      atomic64_read(&s->tx_bytes), 0) ||
+				    nla_put_u64_64bit(skb, URP_STREAM_A_RX_BYTES,
+						      atomic64_read(&s->rx_bytes), 0) ||
 				    nla_put_u32(skb, URP_STREAM_A_REORDER_DEPTH,
 						(u32)urp_reorder_gap_count(s->reorder)) ||
 				    nla_put_u16(skb, URP_STREAM_A_CREDITS_LOCAL,

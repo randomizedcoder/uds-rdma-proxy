@@ -232,9 +232,12 @@ static int urp_stream_tx_fn(void *data)
 			else if (ret != -ERESTARTSYS && ret != -EAGAIN)
 				pr_err("urp: stream %u recvmsg failed: %d\n",
 				       stream->id, ret);
-			/* The stream goes to FIN_WAIT; full teardown happens
-			 * in the drain path. */
 			urp_stream_tx_fin(stream);
+			/* Mark reapable and stop reading, but do NOT return --
+			 * fall through to the park loop below so kthread_stop()
+			 * (from urp_stream_destroy) remains the sole terminator. */
+			WRITE_ONCE(stream->tx_done, true);
+			atomic_inc(&ep->pending_reap);
 			break;
 		}
 
@@ -287,9 +290,18 @@ static int urp_stream_tx_fn(void *data)
 
 		atomic64_add(len, &ep->stats.tx_bytes);
 		atomic64_inc(&ep->stats.tx_frames);
+		atomic64_add(len, &stream->tx_bytes);
 		atomic64_add(len, &qps->tx_bytes);
 		atomic64_inc(&qps->tx_frames);
 	}
+
+	/* Park until kthread_stop(). We deliberately never return on our own:
+	 * that would let the task_struct be reaped before urp_stream_destroy's
+	 * kthread_stop() runs, underflowing its refcount. urp_stream_destroy
+	 * shuts the UDS before kthread_stop(), so the recvmsg above unblocks
+	 * and we land here promptly. tx_done was set on the EOF path. */
+	while (!kthread_should_stop())
+		schedule_timeout_interruptible(msecs_to_jiffies(100));
 
 	pr_info("urp: stream %u TX pump stopped\n", stream->id);
 	return 0;

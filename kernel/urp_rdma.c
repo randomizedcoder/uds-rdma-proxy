@@ -444,6 +444,7 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 	struct urp_buffer *buf = container_of(wc->wr_cqe, struct urp_buffer, cqe);
 	struct urp_endpoint *ep = cq->cq_context;
 	struct socket *uds = NULL;
+	struct urp_stream *rx_stream = NULL;
 	struct msghdr msg = {};
 	struct kvec iov;
 	u32 payload_len;
@@ -459,6 +460,17 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 		urp_buf_free_recv(ep, buf);
 		return;
 	}
+
+	/*
+	 * NOTE: eager reap-on-close is intentionally NOT done here. Reaping on
+	 * tx_done (client half-closed its write) races an in-flight response:
+	 * `echo X | socat - UNIX-CONNECT` half-closes after sending, so the
+	 * stream would be destroyed before the reply is delivered back, losing
+	 * it. Correct reap-on-close needs the FIN handshake (reap when the PEER
+	 * closes), which is a follow-up. Streams are still reaped safely at
+	 * endpoint drain (urp_streams_destroy_all), so nothing leaks per
+	 * endpoint lifetime. See urp_streams_reap() (retained for that work).
+	 */
 
 	payload_len = urp_frame_decode_payload_len(buf->data);
 	if (payload_len > URP_MAX_PAYLOAD) {
@@ -551,12 +563,30 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 			uds = ep->conn.uds_sock;
 	} else {
 		struct urp_stream *s = NULL;
+		bool need_backend = false;
 
 		rcu_read_lock();
 		(void)urp_stream_rx_dispatch(ep, stream_id, flags, &s);
-		if (s)
+		if (s) {
 			uds = s->uds_sock;
+			need_backend = urp_stream_needs_backend(ep, s);
+		}
 		rcu_read_unlock();
+
+		/*
+		 * Acceptor: a freshly SYN'd stream has no backend UDS yet.
+		 * Do the (blocking) connect here, OUTSIDE rcu_read_lock. Safe
+		 * because the recv CQ is IB_POLL_WORKQUEUE (sleepable) and its
+		 * completions are serialized, so `s` cannot be freed between the
+		 * rcu_read_unlock and here (RST frees it, but rx_dispatch returns
+		 * s == NULL for RST, and drain only runs after the data path
+		 * quiesces).
+		 */
+		if (need_backend) {
+			urp_stream_open_backend(s);
+			uds = s->uds_sock;
+		}
+		rx_stream = s;
 	}
 
 	if (!uds) {
@@ -577,6 +607,8 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 
 		atomic64_add(payload_len, &ep->stats.rx_bytes);
 		atomic64_inc(&ep->stats.rx_frames);
+		if (rx_stream)
+			atomic64_add(payload_len, &rx_stream->rx_bytes);
 		/* Step 8: per-QP RX counters. wc->qp identifies the source
 		 * QP; linear scan is fine for the supported num_qps range. */
 		qp_idx = urp_qp_index_of(ep, wc->qp);

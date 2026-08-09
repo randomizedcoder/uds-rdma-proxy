@@ -50,9 +50,50 @@ int urp_streams_init(struct urp_endpoint *ep)
 		return ret;
 
 	ep->streams_inited = true;
+	atomic_set(&ep->pending_reap, 0);
 	/* Initiator gets odd, acceptor gets even. Start past 0 (control). */
 	atomic_set(&ep->next_stream_id, ep->is_initiator ? 1 : 2);
 	return 0;
+}
+
+/*
+ * Reap streams whose TX pump has exited (client closed its UDS). Called
+ * ONLY from urp_recv_done, whose recv-CQ completions are serialized, so
+ * this never runs concurrently with the lock-free stream lookups /
+ * post-rcu backend-connect there. That serialization is what lets us
+ * destroy streams here without per-stream refcounting.
+ *
+ * tx_done is set at the end of urp_stream_tx_fn, which runs only after the
+ * pump kthread has returned -- so urp_stream_destroy's kthread_stop is a
+ * no-op join rather than a cancel.
+ */
+void urp_streams_reap(struct urp_endpoint *ep)
+{
+	struct rhashtable_iter iter;
+	struct urp_stream *s;
+
+	if (!ep->streams_inited)
+		return;
+	/* Fast path: nothing marked. Claim the pending count so we only
+	 * walk the table when a pump has actually signalled a close. */
+	if (atomic_xchg(&ep->pending_reap, 0) == 0)
+		return;
+
+	rhashtable_walk_enter(&ep->streams, &iter);
+	rhashtable_walk_start(&iter);
+	while ((s = rhashtable_walk_next(&iter)) != NULL) {
+		if (IS_ERR(s))
+			continue;
+		if (!READ_ONCE(s->tx_done))
+			continue;
+		/* Drop the walk lock across the (sleeping) destroy, then
+		 * restart the walk -- rhashtable_walk_next tolerates this. */
+		rhashtable_walk_stop(&iter);
+		urp_stream_destroy(ep, s);
+		rhashtable_walk_start(&iter);
+	}
+	rhashtable_walk_stop(&iter);
+	rhashtable_walk_exit(&iter);
 }
 
 /*
@@ -104,6 +145,9 @@ int urp_stream_create(struct urp_endpoint *ep, u32 stream_id,
 	s->state = URP_STREAM_STATE_SYN_SENT;
 	s->tx_seq = 0;
 	s->rx_next = 0;
+	atomic64_set(&s->tx_bytes, 0);
+	atomic64_set(&s->rx_bytes, 0);
+	s->tx_done = false;
 	mutex_init(&s->lock);
 	urp_credit_init(&s->credit, URP_NUM_BUFS / 2);
 
@@ -151,12 +195,19 @@ void urp_stream_destroy(struct urp_endpoint *ep, struct urp_stream *s)
 
 	rhashtable_remove_fast(&ep->streams, &s->ht_node, urp_stream_params);
 
-	/* Stop the per-stream TX kthread before we release its uds_sock,
-	 * so the kthread never reads from a half-freed socket. (Step 7c) */
+	/* Ordering is critical: shut the UDS FIRST so a pump blocked in
+	 * kernel_recvmsg() returns immediately, THEN stop the kthread.
+	 * kthread_stop() before the shutdown would wait forever for a thread
+	 * parked in recvmsg. urp_stream_tx_fn never self-terminates (it parks
+	 * on kthread_should_stop after EOF), so kthread_stop is always the
+	 * sole terminator -- avoiding the task_struct refcount underflow that
+	 * a self-exit + later kthread_stop triggers. */
+	if (s->uds_sock)
+		kernel_sock_shutdown(s->uds_sock, SHUT_RDWR);
+
 	urp_stream_pump_stop(s);
 
 	if (s->uds_sock) {
-		kernel_sock_shutdown(s->uds_sock, SHUT_RDWR);
 		sock_release(s->uds_sock);
 		s->uds_sock = NULL;
 	}
@@ -209,24 +260,41 @@ int urp_stream_rx_syn(struct urp_endpoint *ep, u32 stream_id,
 	mutex_unlock(&s->lock);
 
 	/*
-	 * Acceptor-side multi-stream wiring (Phase 3a Step 7c). When the
-	 * endpoint has a connect_path (we're the URP acceptor of an external
-	 * peer's RDMA connection), open a fresh UDS to the backend for this
-	 * stream and spin up its TX pump. The initiator side instead
-	 * populates uds_sock from its UDS accept loop and starts the pump
-	 * there.
-	 *
-	 * Failure here doesn't tear the stream down -- we leave it in
-	 * SYN_RECEIVED with no UDS, RX dispatch will drop subsequent frames
-	 * (counted in buffer_alloc_fails), and the drain path cleans up.
+	 * Acceptor-side backend UDS connect (Phase 3a Step 7d) is NOT done
+	 * here: urp_stream_connect_uds() blocks in kernel_connect(), and this
+	 * function runs under rcu_read_lock() on the RX completion path
+	 * (urp_recv_done). Sleeping under RCU is illegal. Instead we leave the
+	 * fresh stream in SYN_RECEIVED with uds_sock == NULL; the caller
+	 * (urp_recv_done) detects the missing backend and performs the connect
+	 * + pump start outside the RCU section. See urp_stream_needs_backend().
 	 */
-	if (!ep->is_initiator && ep->connect_path[0]) {
-		if (urp_stream_connect_uds(s, ep->connect_path) == 0)
-			urp_stream_pump_start(s);
-	}
-
 	*out_stream = s;
 	return 0;
+}
+
+/*
+ * True when @s is an acceptor-side stream that has been created (via an
+ * incoming SYN) but does not yet have its backend UDS connection. The RX
+ * path uses this to decide whether to run the (blocking) backend connect
+ * outside rcu_read_lock. Cheap, lock-free field reads.
+ */
+bool urp_stream_needs_backend(struct urp_endpoint *ep, struct urp_stream *s)
+{
+	return s && !s->uds_sock && !ep->is_initiator && ep->connect_path[0];
+}
+
+/*
+ * Acceptor-side: connect this stream's backend UDS and start its TX pump.
+ * Called from urp_recv_done OUTSIDE rcu_read_lock (kernel_connect blocks).
+ * Failure leaves uds_sock NULL; RX dispatch then drops frames for the
+ * stream (counted in buffer_alloc_fails) until drain reaps it.
+ */
+void urp_stream_open_backend(struct urp_stream *s)
+{
+	if (!s || s->uds_sock)
+		return;
+	if (urp_stream_connect_uds(s, s->ep->connect_path) == 0)
+		urp_stream_pump_start(s);
 }
 
 /*

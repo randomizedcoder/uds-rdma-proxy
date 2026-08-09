@@ -239,11 +239,16 @@ struct urp_stream {
 	u64			tx_seq;		/* next outgoing seq */
 	u64			rx_next;	/* next expected incoming seq */
 
+	atomic64_t		tx_bytes;	/* payload bytes sent on this stream */
+	atomic64_t		rx_bytes;	/* payload bytes delivered to its UDS */
+
 	struct urp_credit	credit;		/* per-stream flow control */
 	struct urp_reorder	*reorder;	/* per-stream reorder buffer */
 
 	struct socket		*uds_sock;	/* this stream's UDS endpoint */
 	struct task_struct	*tx_thread;	/* per-stream TX kthread (Step 7c) */
+	bool			tx_done;	/* TX pump exited (client closed);
+						 * eligible for reap-on-close */
 
 	struct rhash_head	ht_node;
 	struct rcu_head		rcu;
@@ -320,6 +325,8 @@ struct urp_endpoint {
 	struct rhashtable	streams;	/* keyed by u32 stream_id */
 	bool			streams_inited;
 	atomic_t		next_stream_id;	/* monotonic per-direction allocator */
+	atomic_t		pending_reap;	/* # of tx_done streams awaiting reap;
+						 * swept from the serialized RX path */
 
 	/* Buffer pool */
 	struct urp_buffer	bufs[URP_NUM_BUFS];
@@ -399,6 +406,10 @@ int  urp_qp_index_of(struct urp_endpoint *ep, struct ib_qp *qp);
 /* urp_stream.c -- stream multiplexing core (Phase 3a Step 6) */
 int  urp_streams_init(struct urp_endpoint *ep);
 void urp_streams_destroy_all(struct urp_endpoint *ep);
+/* Reap tx_done (client-closed) streams. MUST be called only from the
+ * serialized RX completion path (urp_recv_done) so it never races the
+ * lock-free stream lookups there. Cheap no-op when nothing is pending. */
+void urp_streams_reap(struct urp_endpoint *ep);
 u32  urp_stream_next_id(struct urp_endpoint *ep);
 int  urp_stream_create(struct urp_endpoint *ep, u32 stream_id,
 		       struct urp_stream **out_stream);
@@ -414,6 +425,11 @@ void urp_stream_tx_fin(struct urp_stream *s);
 void urp_stream_tx_rst(struct urp_stream *s);
 int  urp_stream_rx_dispatch(struct urp_endpoint *ep, u32 stream_id, u8 flags,
 			    struct urp_stream **out_stream);
+/* Acceptor-side backend-connect split (Step 7d): needs_backend() is a cheap
+ * predicate safe to call under rcu_read_lock; open_backend() does the blocking
+ * kernel_connect and must be called outside it. */
+bool urp_stream_needs_backend(struct urp_endpoint *ep, struct urp_stream *s);
+void urp_stream_open_backend(struct urp_stream *s);
 
 /* urp_pump.c */
 int  urp_pump_start(struct urp_endpoint *ep);

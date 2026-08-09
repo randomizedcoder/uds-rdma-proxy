@@ -18,9 +18,15 @@
 /*
  * Accept loop kthread (initiator mode).
  *
- * Waits for a client to connect to the listening UDS socket,
- * then starts the TX/RX pump for that connection. k0 handles
- * only one connection at a time — subsequent accepts are rejected.
+ * Waits for clients to connect to the listening UDS socket. Phase 3a
+ * Step 7d: each accepted connection becomes its own stream (multiplexed
+ * over the shared QP set) rather than the single k0 ep->conn. This is
+ * what lets a real client -- e.g. franz-go, which opens a separate
+ * connection per broker beyond the metadata bootstrap -- work end to end.
+ *
+ * urp_stream_create allocates the next odd stream_id; the per-stream TX
+ * pump (urp_stream_tx_fn) emits a SYN-flagged first frame, which makes
+ * the acceptor open a matching backend UDS for this stream.
  */
 static int urp_accept_thread_fn(void *data)
 {
@@ -29,6 +35,8 @@ static int urp_accept_thread_fn(void *data)
 	int ret;
 
 	while (!kthread_should_stop()) {
+		struct urp_stream *s = NULL;
+
 		ret = kernel_accept(ep->listen_sock, &new_sock, 0);
 		if (ret < 0) {
 			if (ret == -EAGAIN || ret == -ERESTARTSYS)
@@ -37,38 +45,40 @@ static int urp_accept_thread_fn(void *data)
 			break;
 		}
 
-		if (ep->conn.active) {
-			pr_warn("urp: k0 only supports one connection, rejecting\n");
-			sock_release(new_sock);
-			new_sock = NULL;
-			continue;
-		}
-
 		pr_info("urp: UDS connection accepted\n");
-		ep->conn.uds_sock = new_sock;
-		ep->conn.seq = 0;
-		ep->conn.active = true;
-		atomic64_inc(&ep->stats.connections);
 
-		/* Wait for RDMA to be ready before starting pump */
+		/* Wait for RDMA to be ready before opening a stream. */
 		if (!ep->connected) {
 			pr_info("urp: waiting for RDMA connection...\n");
 			wait_for_completion_interruptible(&ep->cm_done);
 			if (!ep->connected) {
 				pr_err("urp: RDMA connection failed\n");
-				ep->conn.active = false;
 				sock_release(new_sock);
-				ep->conn.uds_sock = NULL;
+				new_sock = NULL;
 				continue;
 			}
 		}
 
-		ret = urp_pump_start(ep);
+		ret = urp_stream_create(ep, 0, &s);
 		if (ret) {
-			pr_err("urp: pump start failed: %d\n", ret);
-			ep->conn.active = false;
+			pr_err("urp: stream create failed: %d\n", ret);
 			sock_release(new_sock);
-			ep->conn.uds_sock = NULL;
+			new_sock = NULL;
+			continue;
+		}
+
+		/* Ownership of new_sock transfers to the stream; it is
+		 * released by urp_stream_destroy (drain / RST). */
+		s->uds_sock = new_sock;
+		new_sock = NULL;
+		atomic64_inc(&ep->stats.connections);
+
+		ret = urp_stream_pump_start(s);
+		if (ret) {
+			pr_err("urp: stream %u pump start failed: %d\n",
+			       s->id, ret);
+			urp_stream_destroy(ep, s);
+			continue;
 		}
 	}
 
