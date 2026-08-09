@@ -16,9 +16,20 @@
       url = "github:astro/microvm.nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
+    # Redpanda broker + rpk client with the native Kafka UDS listener
+    # (PR #30240), built via that fork's own Nix/Bazel flake. Consumed only by
+    # packages.test-redpanda-uds. Pinned to a specific fork commit so the test
+    # is reproducible. Deliberately NOT `inputs.nixpkgs.follows = nixpkgs` --
+    # the Redpanda build pins its own nixpkgs and the binaries are
+    # self-contained subprocesses, so we keep its locked nixpkgs.
+    #
+    # Note: this is a heavy input (fetches the redpanda repo); it is only built
+    # by `.#test-redpanda-uds` and is kept out of `checks`/CI.
+    redpanda.url = "github:randomizedcoder/redpanda/d4b44629a5a8d06c4559e941428fd0249a5be643";
   };
 
-  outputs = { self, nixpkgs, rust-overlay, flake-utils, microvm }:
+  outputs = { self, nixpkgs, rust-overlay, flake-utils, microvm, redpanda }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
@@ -118,6 +129,19 @@
           in c.buildUrpKo cross.${kpkgs};
         urpKoAarch64 = crossUrpKo "aarch64-multiplatform" "linuxPackages_latest";
         urpKoRiscv64 = crossUrpKo "riscv64" "linuxPackages_latest";
+
+        # Redpanda UDS-over-RDMA test. Only wired on the Linux systems the
+        # Redpanda flake actually builds for (x86_64-linux / aarch64-linux);
+        # absent on darwin so eval doesn't fault on a missing package set.
+        hasRedpanda = redpanda.packages ? ${system};
+        redpandaUdsTest = lib.optionalAttrs hasRedpanda {
+          test-redpanda-uds = import ./nix/test-redpanda-uds.nix {
+            inherit pkgs urpCli;
+            urpKo = urpKo;
+            redpanda = redpanda.packages.${system}.redpanda;
+            rpk = redpanda.packages.${system}.rpk;
+          };
+        };
       in
       {
         devShells.default = devshell;
@@ -141,7 +165,15 @@
           urp-vm-debug = urpVmDebug;
           urp-ko-aarch64 = urpKoAarch64;
           urp-ko-riscv64 = urpKoRiscv64;
-        } // microvms.packages;
+        } // microvms.packages // redpandaUdsTest;
+
+        # `nix run .#test-redpanda-uds` (Linux only). Needs root at runtime.
+        apps = lib.optionalAttrs hasRedpanda {
+          test-redpanda-uds = {
+            type = "app";
+            program = "${redpandaUdsTest.test-redpanda-uds}/bin/test-redpanda-uds";
+          };
+        };
 
         # buildUrpKo: function to build against any kernel.
         #
