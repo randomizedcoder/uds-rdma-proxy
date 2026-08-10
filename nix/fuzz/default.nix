@@ -75,6 +75,32 @@ let
     '';
     meta.mainProgram = "netlink_fuzz";
   };
+  # Hostile-peer RDMA wire fuzzer (design 27 F2, S1/S2). A standalone
+  # librdmacm/libibverbs RC peer that connects to a urp acceptor and injects
+  # malformed frames into the RX path (urp_recv_done). Baked into the microVM
+  # rootfs and run from the peer VM against the acceptor under KASAN. Links
+  # rdma-core exactly like tools/urp-test-client.c.
+  wireFuzz = pkgs.stdenv.mkDerivation {
+    pname = "urp-wire-fuzz";
+    version = "0.1.0";
+    src = fuzzSrc;
+    nativeBuildInputs = [ pkgs.clang ];
+    buildInputs = [ pkgs.rdma-core ];
+    buildPhase = ''
+      runHook preBuild
+      clang -O1 -std=gnu11 -Wall -Wextra \
+        nix/fuzz/wire_fuzz.c -o wire_fuzz \
+        -lrdmacm -libverbs
+      runHook postBuild
+    '';
+    installPhase = ''
+      runHook preInstall
+      mkdir -p $out/bin
+      cp wire_fuzz $out/bin/
+      runHook postInstall
+    '';
+    meta.mainProgram = "wire_fuzz";
+  };
 in
 {
   # RX frame classifier -- the 27.8 disclosure surface.
@@ -86,4 +112,7 @@ in
 
   # Live-kernel netlink fuzzer binary (for the microVM rootfs).
   inherit netlinkFuzz;
+
+  # Hostile-peer RDMA wire fuzzer binary (for the microVM rootfs).
+  inherit wireFuzz;
 }

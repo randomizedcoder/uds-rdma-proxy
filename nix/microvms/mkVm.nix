@@ -245,6 +245,9 @@ in
         # Live-kernel netlink fuzzer (design 27 F2). Tiny standalone binary;
         # invoked by the pair harness's fuzz phase against the loaded module.
         (import ../fuzz { inherit pkgs lib; }).netlinkFuzz
+        # Hostile-peer RDMA wire fuzzer (design 27 F2, S1/S2). Run from the
+        # peer VM against the acceptor to fuzz the RX frame path under KASAN.
+        (import ../fuzz { inherit pkgs lib; }).wireFuzz
       ];
 
       # Expose the .ko via an env var on root's shell so test scripts
