@@ -242,6 +242,9 @@ in
         procps
         util-linux
         urpCli
+        # Live-kernel netlink fuzzer (design 27 F2). Tiny standalone binary;
+        # invoked by the pair harness's fuzz phase against the loaded module.
+        (import ../fuzz { inherit pkgs lib; }).netlinkFuzz
       ];
 
       # Expose the .ko via an env var on root's shell so test scripts
