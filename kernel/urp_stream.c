@@ -201,12 +201,12 @@ void urp_stream_destroy(struct urp_endpoint *ep, struct urp_stream *s)
 	rhashtable_remove_fast(&ep->streams, &s->ht_node, urp_stream_params);
 
 	/* Ordering is critical: shut the UDS FIRST so a pump blocked in
-	 * kernel_recvmsg() returns immediately, THEN stop the kthread.
+	 * kernel_recvmsg() returns immediately, THEN stop the kthread --
 	 * kthread_stop() before the shutdown would wait forever for a thread
-	 * parked in recvmsg. urp_stream_tx_fn never self-terminates (it parks
-	 * on kthread_should_stop after EOF), so kthread_stop is always the
-	 * sole terminator -- avoiding the task_struct refcount underflow that
-	 * a self-exit + later kthread_stop triggers.
+	 * blocked in recvmsg. The pump may also have self-exited already
+	 * (EOF/error paths); that is safe because urp_stream_pump_start()
+	 * pinned the task_struct, making urp_stream_pump_stop()'s
+	 * kthread_stop() a plain join with no use-after-free window.
 	 */
 	if (s->uds_sock)
 		kernel_sock_shutdown(s->uds_sock, SHUT_RDWR);

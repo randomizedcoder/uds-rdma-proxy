@@ -15,6 +15,7 @@
 
 #include "urp.h"
 #include <linux/sched.h>
+#include <linux/sched/task.h>
 #include <linux/ktime.h>
 #include <linux/timekeeping.h>
 
@@ -54,33 +55,19 @@ static int urp_tx_thread_fn(void *data)
 			urp_buf_free_send(ep, buf);
 			if (ret == 0) {
 				/*
-				 * Peer half-closed the write side. Stop reading,
-				 * but leave conn->active set and the uds_sock
-				 * intact so the RX path can still forward the
-				 * response back to the peer's read side. The
-				 * eventual full close gets caught when the RX
-				 * path's kernel_sendmsg returns -EPIPE, or when
-				 * urp_socket_conn_cleanup runs on drain/CM
-				 * disconnect.
-				 *
-				 * Don't `return` out of the kthread function
-				 * here: the task_struct reference that
-				 * urp_pump_stop() passes to kthread_stop() is
-				 * not pinned with get_task_struct(), so a
-				 * self-exited kthread leaves it dangling and
-				 * kthread_stop() hits a refcount underflow
-				 * (observed as refcount_warn_saturate + oops
-				 * on the drain path). Park until
-				 * kthread_should_stop() instead so
-				 * kthread_stop() is the sole terminator.
-				 * Follow-up: pin with get_task_struct() and
-				 * let the pump exit on its own.
+				 * Peer half-closed the write side. Stop reading
+				 * (the pump exits below), but leave conn->active
+				 * set and the uds_sock intact so the RX path can
+				 * still forward the response back to the peer's
+				 * read side. The eventual full close gets caught
+				 * when the RX path's kernel_sendmsg returns
+				 * -EPIPE, or when urp_socket_conn_cleanup runs
+				 * on drain/CM disconnect. Self-exit is safe:
+				 * urp_pump_start() pinned our task_struct, so
+				 * the later kthread_stop() join cannot see a
+				 * freed task.
 				 */
-				pr_debug("peer half-closed write side; pump parking (rx still routes)\n");
-				while (!kthread_should_stop())
-					schedule_timeout_interruptible(HZ);
-				pr_info("TX pump stopped\n");
-				return 0;
+				pr_debug("peer half-closed write side; pump exiting (rx still routes)\n");
 			} else if (ret != -ERESTARTSYS && ret != -EAGAIN) {
 				pr_err_ratelimited("kernel_recvmsg failed: %d\n", ret);
 				conn->active = false;
@@ -175,6 +162,13 @@ int urp_pump_start(struct urp_endpoint *ep)
 		pr_err("kthread_run (tx) failed: %d\n", ret);
 		return ret;
 	}
+	/*
+	 * Pin the task so the kthread_stop() in urp_pump_stop() can never
+	 * operate on a reaped task_struct, no matter when (or whether) the
+	 * pump self-exits. kthread_stop() on an already-exited-but-pinned
+	 * kthread is a safe join. Dropped in urp_pump_stop().
+	 */
+	get_task_struct(conn->tx_thread);
 
 	pr_info("pump started\n");
 	return 0;
@@ -188,6 +182,7 @@ void urp_pump_stop(struct urp_endpoint *ep)
 
 	if (conn->tx_thread) {
 		kthread_stop(conn->tx_thread);
+		put_task_struct(conn->tx_thread);
 		conn->tx_thread = NULL;
 	}
 
@@ -240,9 +235,10 @@ static int urp_stream_tx_fn(void *data)
 				pr_err_ratelimited("stream %u recvmsg failed: %d\n",
 						   stream->id, ret);
 			urp_stream_tx_fin(stream);
-			/* Mark reapable and stop reading, but do NOT return --
-			 * continue to the park loop below so kthread_stop()
-			 * (from urp_stream_destroy) remains the sole terminator.
+			/* Mark reapable and exit. Self-exit is safe: the
+			 * task_struct was pinned in urp_stream_pump_start(),
+			 * so urp_stream_destroy's kthread_stop() join cannot
+			 * see a freed task.
 			 */
 			WRITE_ONCE(stream->tx_done, true);
 			atomic_inc(&ep->pending_reap);
@@ -304,15 +300,6 @@ static int urp_stream_tx_fn(void *data)
 		atomic64_inc(&qps->tx_frames);
 	}
 
-	/* Park until kthread_stop(). We deliberately never return on our own:
-	 * that would let the task_struct be reaped before urp_stream_destroy's
-	 * kthread_stop() runs, underflowing its refcount. urp_stream_destroy
-	 * shuts the UDS before kthread_stop(), so the recvmsg above unblocks
-	 * and we land here promptly. tx_done was set on the EOF path.
-	 */
-	while (!kthread_should_stop())
-		schedule_timeout_interruptible(msecs_to_jiffies(100));
-
 	pr_debug("stream %u TX pump stopped\n", stream->id);
 	return 0;
 }
@@ -331,6 +318,8 @@ int urp_stream_pump_start(struct urp_stream *stream)
 		       stream->id, ret);
 		return ret;
 	}
+	/* Pin: see urp_pump_start(). Dropped in urp_stream_pump_stop(). */
+	get_task_struct(stream->tx_thread);
 	return 0;
 }
 
@@ -338,6 +327,7 @@ void urp_stream_pump_stop(struct urp_stream *stream)
 {
 	if (stream->tx_thread) {
 		kthread_stop(stream->tx_thread);
+		put_task_struct(stream->tx_thread);
 		stream->tx_thread = NULL;
 	}
 }

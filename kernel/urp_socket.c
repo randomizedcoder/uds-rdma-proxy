@@ -15,6 +15,7 @@
 
 #include "urp.h"
 #include <linux/file.h>
+#include <linux/sched/task.h>
 #include <net/sock.h>
 
 /*
@@ -218,6 +219,13 @@ static int urp_listen_uds(struct urp_endpoint *ep, const char *path)
 		ep->listen_sock = NULL;
 		return ret;
 	}
+	/*
+	 * Pin the task: the accept thread self-exits on fatal accept errors
+	 * (including the -ECONNABORTED our own teardown shutdown provokes),
+	 * and urp_socket_cleanup()'s kthread_stop() must never race a
+	 * reaped task_struct. Dropped in urp_socket_cleanup().
+	 */
+	get_task_struct(ep->accept_thread);
 
 	pr_info("listening on UDS %s\n", path);
 	return 0;
@@ -304,6 +312,7 @@ void urp_socket_cleanup(struct urp_endpoint *ep)
 
 	if (ep->accept_thread) {
 		kthread_stop(ep->accept_thread);
+		put_task_struct(ep->accept_thread);
 		ep->accept_thread = NULL;
 	}
 
