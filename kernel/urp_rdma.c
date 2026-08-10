@@ -464,6 +464,18 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 	}
 
 	/*
+	 * Never trust the frame's self-declared lengths over the number of
+	 * bytes the RDMA layer actually received (wc->byte_len). A frame
+	 * shorter than the fixed header means the header itself would be read
+	 * from stale pool memory -- drop it before decoding anything.
+	 */
+	if (wc->byte_len < URP_FRAME_HEADER_SIZE) {
+		pr_err_ratelimited("short frame: %u bytes (< header)\n",
+				   wc->byte_len);
+		goto repost;
+	}
+
+	/*
 	 * NOTE: eager reap-on-close is intentionally NOT done here. Reaping on
 	 * tx_done (client half-closed its write) races an in-flight response:
 	 * `echo X | socat - UNIX-CONNECT` half-closes after sending, so the
@@ -477,6 +489,19 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 	payload_len = urp_frame_decode_payload_len(buf->data);
 	if (payload_len > URP_MAX_PAYLOAD) {
 		pr_err_ratelimited("received oversized frame: %u\n", payload_len);
+		goto repost;
+	}
+	/*
+	 * The declared payload must fit within the bytes actually received.
+	 * Without this a peer sends a header-only frame declaring
+	 * payload_len == URP_MAX_PAYLOAD and we would forward ~4 KiB of stale
+	 * DMA-pool contents to the local UDS app -- a remote kernel-memory
+	 * disclosure. Bound it to the real received length.
+	 */
+	if (payload_len > wc->byte_len - URP_FRAME_HEADER_SIZE) {
+		pr_err_ratelimited("frame payload_len %u exceeds received %u\n",
+				   payload_len,
+				   wc->byte_len - URP_FRAME_HEADER_SIZE);
 		goto repost;
 	}
 
@@ -506,6 +531,21 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 	if (urp_frame_decode_type(buf->data) == URP_FRAME_TYPE_PROBE) {
 		u8 pflags = urp_frame_decode_flags(buf->data);
 		const void *payload = buf->data + URP_FRAME_HEADER_SIZE;
+
+		/*
+		 * PROBE handlers read fixed payload offsets (PING/PONG decode,
+		 * and urp_emit_pong_on memcpy's the PING payload back) without
+		 * consulting payload_len, so guard on the received length
+		 * directly. A short PROBE would otherwise decode / reflect
+		 * stale pool bytes. Both PING (32 B) and PONG (48 B) carry at
+		 * least URP_PING_PAYLOAD_SIZE bytes; anything shorter is bogus.
+		 */
+		if (wc->byte_len <
+		    URP_FRAME_HEADER_SIZE + URP_PING_PAYLOAD_SIZE) {
+			pr_err_ratelimited("short PROBE frame: %u bytes\n",
+					   wc->byte_len);
+			goto repost;
+		}
 
 		if (pflags & URP_PROBE_FLAG_PONG) {
 			int qp_idx = urp_qp_index_of(ep, wc->qp);
@@ -568,22 +608,27 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 		struct urp_stream *s = NULL;
 		bool need_backend = false;
 
-		rcu_read_lock();
+		/*
+		 * Dispatch runs in sleepable workqueue context (the recv CQ is
+		 * IB_POLL_WORKQUEUE) and legitimately sleeps: SYN creates a
+		 * stream (GFP_KERNEL alloc), FIN/RST take the per-stream mutex
+		 * and RST calls kthread_stop(). It must therefore NOT run under
+		 * rcu_read_lock. urp_stream_lookup brackets its own rhashtable
+		 * traversal, and the insert/remove paths take their own bucket
+		 * locks, so no outer RCU section is needed. Serialized recv
+		 * completions + drain-after-quiesce keep `s` alive across this
+		 * handler.
+		 */
 		(void)urp_stream_rx_dispatch(ep, stream_id, flags, &s);
 		if (s) {
 			uds = s->uds_sock;
 			need_backend = urp_stream_needs_backend(ep, s);
 		}
-		rcu_read_unlock();
 
 		/*
 		 * Acceptor: a freshly SYN'd stream has no backend UDS yet.
-		 * Do the (blocking) connect here, OUTSIDE rcu_read_lock. Safe
-		 * because the recv CQ is IB_POLL_WORKQUEUE (sleepable) and its
-		 * completions are serialized, so `s` cannot be freed between the
-		 * rcu_read_unlock and here (RST frees it, but rx_dispatch returns
-		 * s == NULL for RST, and drain only runs after the data path
-		 * quiesces).
+		 * The (blocking) connect is done here rather than inline in the
+		 * SYN handler so it happens once, in one place.
 		 */
 		if (need_backend) {
 			urp_stream_open_backend(s);
