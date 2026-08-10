@@ -413,6 +413,24 @@ static void test_reorder_buffer_full(struct kunit *test)
 	urp_reorder_free(rb);
 }
 
+/*
+ * Regression (C twin of the Rust reorder_ops fuzz find): delivering the
+ * frame at the top of the sequence space must saturate next_expected at
+ * U64_MAX rather than overflow. The Rust twin overflow-panics -> BUG();
+ * the C twin must not wrap to 0.
+ */
+static void test_reorder_seq_saturates(struct kunit *test)
+{
+	struct urp_reorder *rb = urp_reorder_alloc(U64_MAX, 16);
+	u8 b = 0xAB;
+
+	KUNIT_ASSERT_NOT_NULL(test, rb);
+	KUNIT_EXPECT_EQ(test, urp_reorder_insert(rb, U64_MAX, &b, 1), 0);
+	KUNIT_EXPECT_EQ(test, urp_reorder_next_expected(rb), U64_MAX);
+
+	urp_reorder_free(rb);
+}
+
 /* ---- QP round-robin selection tests (Phase 3a Step 9) ---- */
 
 static void test_qp_select_round_robin_determinism(struct kunit *test)
@@ -704,6 +722,7 @@ static struct kunit_case urp_test_cases[] = {
 	KUNIT_CASE(test_reorder_duplicate),
 	KUNIT_CASE(test_reorder_already_delivered),
 	KUNIT_CASE(test_reorder_buffer_full),
+	KUNIT_CASE(test_reorder_seq_saturates),
 	KUNIT_CASE(test_qp_select_round_robin_determinism),
 	KUNIT_CASE(test_qp_select_skips_unestablished),
 	KUNIT_CASE(test_qp_select_returns_null_when_none_ready),

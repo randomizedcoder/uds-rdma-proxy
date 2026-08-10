@@ -164,7 +164,13 @@ static void urp_reorder_drain_prefix(struct urp_reorder *rb)
 
 		rb_erase(first, &rb->pending);
 		rb->pending_count--;
-		rb->next_expected++;
+		/* Saturate at the top of the sequence space to match the Rust
+		 * twin (reorder.rs), where an unchecked increment overflow-
+		 * panics -> BUG(). Unreachable in practice (needs 2^64 in-order
+		 * deliveries); bounded for defense in depth.
+		 */
+		if (rb->next_expected != U64_MAX)
+			rb->next_expected++;
 		kfree(n);
 	}
 }
