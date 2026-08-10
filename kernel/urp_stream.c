@@ -177,17 +177,28 @@ int urp_stream_create(struct urp_endpoint *ep, u32 stream_id,
 	return 0;
 }
 
-/* RCU-safe lookup by stream_id. Returned pointer is only valid inside
- * the current rcu_read_lock() critical section unless the caller
- * arranges other lifetime management.
+/*
+ * Lookup by stream_id. Brackets the rhashtable traversal in its own
+ * short rcu_read_lock() so callers do NOT need to hold one -- the RX
+ * dispatch path (urp_stream_rx_dispatch) performs sleeping work
+ * (mutex_lock, GFP_KERNEL alloc, kthread_stop) that must not run inside
+ * an RCU read-side section. The returned pointer stays valid by the
+ * caller's serialization invariant (the recv CQ is IB_POLL_WORKQUEUE
+ * with serialized completions; endpoint drain runs only after the data
+ * path quiesces), not by an outer RCU grace period.
  */
 struct urp_stream *urp_stream_lookup(struct urp_endpoint *ep, u32 stream_id)
 {
+	struct urp_stream *s;
+
 	if (!ep->streams_inited)
 		return NULL;
 
-	return rhashtable_lookup_fast(&ep->streams, &stream_id,
-				      urp_stream_params);
+	rcu_read_lock();
+	s = rhashtable_lookup_fast(&ep->streams, &stream_id,
+				   urp_stream_params);
+	rcu_read_unlock();
+	return s;
 }
 
 /* Remove from table and schedule deferred free via RCU. The stream's
@@ -267,12 +278,10 @@ int urp_stream_rx_syn(struct urp_endpoint *ep, u32 stream_id,
 
 	/*
 	 * Acceptor-side backend UDS connect (Phase 3a Step 7d) is NOT done
-	 * here: urp_stream_connect_uds() blocks in kernel_connect(), and this
-	 * function runs under rcu_read_lock() on the RX completion path
-	 * (urp_recv_done). Sleeping under RCU is illegal. Instead we leave the
-	 * fresh stream in SYN_RECEIVED with uds_sock == NULL; the caller
-	 * (urp_recv_done) detects the missing backend and performs the connect
-	 * + pump start outside the RCU section. See urp_stream_needs_backend().
+	 * here: it is deferred to the caller (urp_recv_done) so the blocking
+	 * kernel_connect() happens once, in one place, after dispatch returns.
+	 * The fresh stream is left in SYN_RECEIVED with uds_sock == NULL;
+	 * urp_stream_needs_backend() signals the caller to open it.
 	 */
 	*out_stream = s;
 	return 0;
