@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * urp_credit.h -- per-QP credit-based flow control
+ * Per-QP credit-based flow control
  *
  * 1:1 C port of uds_rdma_protocol::credit::CreditState. Step 4 wires it
  * into the per-QP struct urp_qp so the TX path can gate ib_post_send on

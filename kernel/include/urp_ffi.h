@@ -17,9 +17,11 @@
 #ifdef CONFIG_URP_REORDER_RUST
 
 #include <linux/types.h>
+#include <linux/compiler_attributes.h>	/* __noreturn */
 
 /* Opaque handle type. The Rust side returns pointers to a heap-allocated
- * `UrpRustReorder`; C only ever passes the pointer around. */
+ * `UrpRustReorder`; C only ever passes the pointer around.
+ */
 struct urp_rust_reorder;
 
 /*
@@ -34,7 +36,7 @@ struct urp_rust_reorder;
  */
 void *urp_kalloc(size_t size, size_t align);
 void urp_kfree(void *ptr, size_t size, size_t align);
-void urp_panic_abort(void) __attribute__((noreturn));
+void __noreturn urp_panic_abort(void);
 
 /*
  * Symbols the Rust staticlib *exports* back to the kernel module. See
@@ -76,7 +78,8 @@ u64 urp_rust_reorder_next_expected(const struct urp_rust_reorder *rb);
 size_t urp_rust_reorder_gap_count(const struct urp_rust_reorder *rb);
 
 /* The number of frames already drained but not yet consumed via
- * urp_rust_reorder_drain_next(). */
+ * urp_rust_reorder_drain_next().
+ */
 size_t urp_rust_reorder_drain_pending(const struct urp_rust_reorder *rb);
 
 #endif /* CONFIG_URP_REORDER_RUST */

@@ -6,7 +6,7 @@
  * per-QP RQ is collapsed (max_recv_wr = 0 in qp_init_attr.cap) and
  * every recv buffer comes off the shared pool via ib_post_srq_recv.
  *
- * Rationale (design 05 §5.2):
+ * Rationale (design 05 section 5.2):
  *   - Memory efficiency -- one pool of N buffers instead of N*num_qps
  *     buffers (one set per QP) sitting unused on idle QPs.
  *   - Prevents per-QP RQ starvation when a single QP is hammered.
@@ -16,12 +16,9 @@
  * per-QP, but the buffers themselves are drawn from this shared pool.
  */
 
-#include "urp.h"
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
-/* Forward declaration -- the actual recv completion handler is in
- * urp_rdma.c (kept there because it shares the buffer pool helpers).
- */
-extern void urp_recv_done_for_srq(struct ib_cq *cq, struct ib_wc *wc);
+#include "urp.h"
 
 int urp_post_srq_recv(struct urp_endpoint *ep, struct urp_buffer *buf)
 {
@@ -56,13 +53,13 @@ int urp_srq_post_initial(struct urp_endpoint *ep)
 		ret = urp_post_srq_recv(ep, buf);
 		if (ret) {
 			urp_buf_free_recv(ep, buf);
-			pr_err("urp: ib_post_srq_recv failed: %d\n", ret);
+			pr_err("ib_post_srq_recv failed: %d\n", ret);
 			return ret;
 		}
 		posted++;
 	}
 
-	pr_info("urp: posted %u initial recv buffers to SRQ\n", posted);
+	pr_info("posted %u initial recv buffers to SRQ\n", posted);
 	return posted ? 0 : -ENOBUFS;
 }
 
@@ -91,7 +88,7 @@ int urp_srq_create(struct urp_endpoint *ep)
 	if (IS_ERR(ep->srq)) {
 		ret = PTR_ERR(ep->srq);
 		ep->srq = NULL;
-		pr_err("urp: ib_create_srq failed: %d\n", ret);
+		pr_err("ib_create_srq failed: %d\n", ret);
 		return ret;
 	}
 

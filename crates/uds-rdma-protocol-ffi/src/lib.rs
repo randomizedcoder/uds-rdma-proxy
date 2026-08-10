@@ -28,8 +28,8 @@
 
 extern crate alloc;
 
-mod kernel_runtime;
 pub mod ffi;
+mod kernel_runtime;
 
 // Re-export the FFI symbols so they live in the staticlib.
 #[allow(unused_imports)]

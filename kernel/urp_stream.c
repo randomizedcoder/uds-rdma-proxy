@@ -12,7 +12,7 @@
  * existing tests are unaffected. Step 7 introduces SYN/FIN/RST flag
  * handling on the wire and starts allocating streams per UDS accept().
  *
- * Stream-id allocation (design 09 §9.5):
+ * Stream-id allocation (design 09 section 9.5):
  *   - Initiator: odd IDs (1, 3, 5, ...)
  *   - Acceptor:  even IDs (2, 4, 6, ...)
  *   - stream_id = 0 reserved for the future control channel.
@@ -75,7 +75,8 @@ void urp_streams_reap(struct urp_endpoint *ep)
 	if (!ep->streams_inited)
 		return;
 	/* Fast path: nothing marked. Claim the pending count so we only
-	 * walk the table when a pump has actually signalled a close. */
+	 * walk the table when a pump has actually signalled a close.
+	 */
 	if (atomic_xchg(&ep->pending_reap, 0) == 0)
 		return;
 
@@ -87,7 +88,8 @@ void urp_streams_reap(struct urp_endpoint *ep)
 		if (!READ_ONCE(s->tx_done))
 			continue;
 		/* Drop the walk lock across the (sleeping) destroy, then
-		 * restart the walk -- rhashtable_walk_next tolerates this. */
+		 * restart the walk -- rhashtable_walk_next tolerates this.
+		 */
 		rhashtable_walk_stop(&iter);
 		urp_stream_destroy(ep, s);
 		rhashtable_walk_start(&iter);
@@ -152,8 +154,9 @@ int urp_stream_create(struct urp_endpoint *ep, u32 stream_id,
 	urp_credit_init(&s->credit, URP_NUM_BUFS / 2);
 
 	/* Reorder buffer is per-stream because each stream has its own
-	 * sequence space (design 09 §9.6). Capped at 256 -- well above
-	 * any reasonable ECMP path-skew burst. */
+	 * sequence space (design 09 section 9.6). Capped at 256 -- well above
+	 * any reasonable ECMP path-skew burst.
+	 */
 	s->reorder = urp_reorder_alloc(0, 256);
 	if (!s->reorder) {
 		mutex_destroy(&s->lock);
@@ -176,7 +179,8 @@ int urp_stream_create(struct urp_endpoint *ep, u32 stream_id,
 
 /* RCU-safe lookup by stream_id. Returned pointer is only valid inside
  * the current rcu_read_lock() critical section unless the caller
- * arranges other lifetime management. */
+ * arranges other lifetime management.
+ */
 struct urp_stream *urp_stream_lookup(struct urp_endpoint *ep, u32 stream_id)
 {
 	if (!ep->streams_inited)
@@ -187,7 +191,8 @@ struct urp_stream *urp_stream_lookup(struct urp_endpoint *ep, u32 stream_id)
 }
 
 /* Remove from table and schedule deferred free via RCU. The stream's
- * uds_sock + reorder buffer are freed in the RCU callback. */
+ * uds_sock + reorder buffer are freed in the RCU callback.
+ */
 void urp_stream_destroy(struct urp_endpoint *ep, struct urp_stream *s)
 {
 	if (!s)
@@ -201,7 +206,8 @@ void urp_stream_destroy(struct urp_endpoint *ep, struct urp_stream *s)
 	 * parked in recvmsg. urp_stream_tx_fn never self-terminates (it parks
 	 * on kthread_should_stop after EOF), so kthread_stop is always the
 	 * sole terminator -- avoiding the task_struct refcount underflow that
-	 * a self-exit + later kthread_stop triggers. */
+	 * a self-exit + later kthread_stop triggers.
+	 */
 	if (s->uds_sock)
 		kernel_sock_shutdown(s->uds_sock, SHUT_RDWR);
 
@@ -299,7 +305,7 @@ void urp_stream_open_backend(struct urp_stream *s)
 
 /*
  * Handle a FIN-flagged frame arriving from the peer. Implements the
- * half-close semantics in design 09 §9.4: peer is done sending; we
+ * half-close semantics in design 09 section 9.4: peer is done sending; we
  * shutdown(SHUT_WR) the UDS so the local app sees EOF on read, but
  * we keep reading from the UDS for any pending TX in this direction.
  *
@@ -340,9 +346,8 @@ int urp_stream_rx_rst(struct urp_stream *s)
 
 	mutex_lock(&s->lock);
 	s->state = URP_STREAM_STATE_CLOSED;
-	if (s->uds_sock) {
+	if (s->uds_sock)
 		kernel_sock_shutdown(s->uds_sock, SHUT_RDWR);
-	}
 	ep = s->ep;
 	mutex_unlock(&s->lock);
 
@@ -392,7 +397,7 @@ void urp_stream_tx_rst(struct urp_stream *s)
  * Frame-flag dispatcher used by the RX path (Step 7b will plumb the
  * call from urp_recv_done). Examines the DATA frame's flags byte and
  * fans out to syn/fin/rst handlers; pure-DATA frames (no flags)
- * fall through to ordinary in-order delivery via the reorder buffer.
+ * proceed to ordinary in-order delivery via the reorder buffer.
  *
  * For Step 7 this is exercised by KUnit only (Step 9). The wire-path
  * call site lands in a follow-up commit alongside the multi-stream
@@ -428,7 +433,8 @@ int urp_stream_rx_dispatch(struct urp_endpoint *ep, u32 stream_id, u8 flags,
 }
 
 /* Walk the stream rhashtable and tear down every entry. Used at
- * endpoint drain time, after the data path has stopped. */
+ * endpoint drain time, after the data path has stopped.
+ */
 void urp_streams_destroy_all(struct urp_endpoint *ep)
 {
 	struct rhashtable_iter iter;

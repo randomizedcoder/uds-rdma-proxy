@@ -8,6 +8,9 @@ _Last updated: 2026-08-09_
 + netns/provisioning design docs 24/25). Follow-up on `redpanda-produce-consume`
 (`74df057`, not yet merged): initiator **multi-stream** (Phase 3a Step 7d) +
 **full Kafka produce/consume over RDMA**, KASAN/KMEMLEAK/lockdep validated.
+On top of that (uncommitted): **static-analysis tooling** (`nix/analysis/`) +
+the first kernel-maintainer hygiene pass -- see the Static analysis section
+below and `docs/design/26-upstream-readiness.md`.
 
 ## Where we are
 
@@ -148,6 +151,30 @@ reap-on-`tx_done` dropped half-close responses and was reverted, so streams reap
 at drain (no per-endpoint leak, but long-lived endpoints accumulate until then);
 (2) make the acceptor's eager k0 `ep->conn` lazy (it opens one idle backend
 connection in the multi-stream case).
+
+## Static analysis / upstream readiness (2026-08-09)
+
+`nix/analysis/` (patterned on xdp2) adds hermetic, report-only analyzers:
+`nix build .#analysis-all -L` runs **sparse** (pinned upstream master;
+nixpkgs' is too old for 7.x headers), **smatch**, **checkpatch --strict**
+(from the target kernel's own source tree inside `.dev`), **W=1/W=2**,
+**coccicheck** (the kernel's coccinelle suite), **clippy**, and
+**rustfmt --check**, and prints a per-tool count table. Manual-run only --
+not wired into checks/CI.
+
+First pass results (kernel 7.1.6): sparse/smatch/W=1/coccicheck/clippy/
+rustfmt all **0**; checkpatch 79 -> **24**, every residual intentional and
+justified in `docs/design/26-upstream-readiness.md` §26.4. Three **real
+bugs** found and fixed: `NLA_POLICY_RANGE` s16-truncating
+`URP_BUFFER_SIZE_MAX` (65536 -> 0, validation broken), a 5.9 KiB stack
+frame in `urp_new_endpoint_doit` (whole `struct urp_endpoint` as stack
+scratch), and a QP-slot leak on the `urp_cm_accept_one` OOM path. Plus the
+mechanical hygiene sweep (pr_fmt, ratelimited printks, SPDX on
+Kbuild/Makefile, urp-y, `__noreturn`, `# Safety` docs on the FFI, cargo
+fmt, checkpatch style). Deeper maintainer items (kref lifetime, netns,
+lock scope, waitqueue pumps, kthread pinning) are catalogued as follow-ups
+in design doc 26. All regression gates re-verified green: urp-ko (7.1.6 +
+6.1/6.6/6.12), urp-cli (incl. the uapi mirror test), protocol-tests.
 
 ## Working-tree hygiene notes
 

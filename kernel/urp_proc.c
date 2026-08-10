@@ -8,6 +8,8 @@
  * holding any global state.
  */
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include "urp.h"
 
 static struct proc_dir_entry *urp_proc_dir;
@@ -55,7 +57,7 @@ int urp_proc_init(void)
 {
 	urp_proc_dir = proc_mkdir(URP_PROC_DIR, NULL);
 	if (!urp_proc_dir) {
-		pr_err("urp: failed to create /proc/%s\n", URP_PROC_DIR);
+		pr_err("failed to create /proc/%s\n", URP_PROC_DIR);
 		return -ENOMEM;
 	}
 
@@ -79,14 +81,14 @@ int urp_endpoint_proc_create(struct urp_endpoint *ep)
 
 	dir = proc_mkdir(ep->name, urp_proc_dir);
 	if (!dir) {
-		pr_err("urp: failed to create /proc/%s/%s\n",
+		pr_err("failed to create /proc/%s/%s\n",
 		       URP_PROC_DIR, ep->name);
 		return -ENOMEM;
 	}
 
 	stats = proc_create_data(URP_PROC_STATS, 0444, dir, &urp_stats_ops, ep);
 	if (!stats) {
-		pr_err("urp: failed to create /proc/%s/%s/%s\n",
+		pr_err("failed to create /proc/%s/%s/%s\n",
 		       URP_PROC_DIR, ep->name, URP_PROC_STATS);
 		proc_remove(dir);
 		return -ENOMEM;

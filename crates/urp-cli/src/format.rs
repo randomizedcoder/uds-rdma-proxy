@@ -5,9 +5,7 @@ use std::net::{Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::attr::{
-    payload_str, payload_u16, payload_u32, payload_u64, payload_u8, AttrIter,
-};
+use crate::attr::{payload_str, payload_u16, payload_u32, payload_u64, payload_u8, AttrIter};
 use crate::uapi::{
     UrpEndpointAttr, UrpEndpointState, UrpQpAttr, UrpQpState, UrpStatsAttr, UrpStreamAttr,
     UrpStreamState,
@@ -250,7 +248,10 @@ impl Endpoint {
                 st.reorder_insertions
             ));
             out.push_str(&format!("    reorder-drops:     {}\n", st.reorder_drops));
-            out.push_str(&format!("    buffer-alloc-fails:{}\n", st.buffer_alloc_fails));
+            out.push_str(&format!(
+                "    buffer-alloc-fails:{}\n",
+                st.buffer_alloc_fails
+            ));
             out.push_str(&format!("    auth-failures:     {}\n", st.auth_failures));
         }
         out
@@ -291,8 +292,12 @@ fn parse_qps(buf: &[u8]) -> Vec<Qp> {
                 x if x == UrpQpAttr::RttNs as u16 => qp.rtt_ns = payload_u64(val).unwrap_or(0),
                 x if x == UrpQpAttr::TxBytes as u16 => qp.tx_bytes = payload_u64(val).unwrap_or(0),
                 x if x == UrpQpAttr::RxBytes as u16 => qp.rx_bytes = payload_u64(val).unwrap_or(0),
-                x if x == UrpQpAttr::TxFrames as u16 => qp.tx_frames = payload_u64(val).unwrap_or(0),
-                x if x == UrpQpAttr::RxFrames as u16 => qp.rx_frames = payload_u64(val).unwrap_or(0),
+                x if x == UrpQpAttr::TxFrames as u16 => {
+                    qp.tx_frames = payload_u64(val).unwrap_or(0)
+                }
+                x if x == UrpQpAttr::RxFrames as u16 => {
+                    qp.rx_frames = payload_u64(val).unwrap_or(0)
+                }
                 _ => {}
             }
         }

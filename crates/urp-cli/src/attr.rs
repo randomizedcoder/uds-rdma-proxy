@@ -148,9 +148,8 @@ pub fn payload_u32(p: &[u8]) -> Option<u32> {
         .map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
 }
 pub fn payload_u64(p: &[u8]) -> Option<u64> {
-    p.get(..8).map(|b| {
-        u64::from_ne_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-    })
+    p.get(..8)
+        .map(|b| u64::from_ne_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
 }
 pub fn payload_str(p: &[u8]) -> Option<&str> {
     let end = p.iter().position(|&c| c == 0).unwrap_or(p.len());

@@ -25,6 +25,16 @@
 /* Policies                                                         */
 /* ---------------------------------------------------------------- */
 
+/*
+ * NLA_POLICY_RANGE packs its bounds into s16, so URP_BUFFER_SIZE_MAX
+ * (65536) silently truncated to 0 there (W=1 -Woverflow caught it) --
+ * ranges wider than s16 must use NLA_POLICY_FULL_RANGE.
+ */
+static const struct netlink_range_validation urp_buffer_size_range = {
+	.min = URP_BUFFER_SIZE_MIN,
+	.max = URP_BUFFER_SIZE_MAX,
+};
+
 /* Endpoint nested policy: validates URP_A_ENDPOINT contents */
 static const struct nla_policy urp_endpoint_policy[URP_ENDPOINT_A_MAX + 1] = {
 	[URP_ENDPOINT_A_NAME]		= { .type = NLA_NUL_STRING,
@@ -40,8 +50,8 @@ static const struct nla_policy urp_endpoint_policy[URP_ENDPOINT_A_MAX + 1] = {
 	[URP_ENDPOINT_A_NUM_QPS]	= NLA_POLICY_RANGE(NLA_U32, URP_NUM_QPS_MIN,
 							   URP_NUM_QPS_MAX),
 	[URP_ENDPOINT_A_BUFFER_COUNT]	= NLA_POLICY_MIN(NLA_U32, URP_BUFFER_COUNT_MIN),
-	[URP_ENDPOINT_A_BUFFER_SIZE]	= NLA_POLICY_RANGE(NLA_U32, URP_BUFFER_SIZE_MIN,
-							   URP_BUFFER_SIZE_MAX),
+	[URP_ENDPOINT_A_BUFFER_SIZE]	= NLA_POLICY_FULL_RANGE(NLA_U32,
+								&urp_buffer_size_range),
 	[URP_ENDPOINT_A_PASSWORD]	= { .type = NLA_NUL_STRING,
 					    .len  = URP_PASSWORD_MAX - 1 },
 	[URP_ENDPOINT_A_STATE]		= NLA_POLICY_RANGE(NLA_U8, 0, URP_STATE_MAX),
@@ -120,7 +130,8 @@ static int urp_fill_endpoint(struct sk_buff *skb, struct urp_endpoint *ep,
 
 		/* Per-QP nested blocks (Phase 3a Step 8). One entry per QP
 		 * in ep->qps[] -- the array is allocated by urp_qps_init at
-		 * activate time. */
+		 * activate time.
+		 */
 		qps_nest = nla_nest_start(skb, URP_ENDPOINT_A_QPS);
 		if (!qps_nest)
 			goto cancel;
@@ -160,7 +171,8 @@ static int urp_fill_endpoint(struct sk_buff *skb, struct urp_endpoint *ep,
 		/* Per-stream nested blocks (Phase 3a Step 8). Walks the
 		 * rhashtable under RCU; entries are added by Step 7b's
 		 * urp_stream_create call sites. With no active streams the
-		 * nest is emitted empty, which is intentional. */
+		 * nest is emitted empty, which is intentional.
+		 */
 		streams_nest = nla_nest_start(skb, URP_ENDPOINT_A_STREAMS);
 		if (!streams_nest)
 			goto cancel;
@@ -213,7 +225,8 @@ static int urp_fill_endpoint(struct sk_buff *skb, struct urp_endpoint *ep,
 
 		/* k0 single-connection compat: surface the legacy ep->conn
 		 * as a synthetic stream while Step 7b hasn't yet migrated
-		 * UDS accepts to urp_stream_create. */
+		 * UDS accepts to urp_stream_create.
+		 */
 		if (active_streams == 0 && ep->conn.active) {
 			struct nlattr *s_entry = nla_nest_start(skb, 1);
 
@@ -341,7 +354,7 @@ static inline void *urp_genlmsg_iput(struct sk_buff *skb,
 static int urp_new_endpoint_doit(struct sk_buff *skb, struct genl_info *info)
 {
 	struct nlattr *tb[URP_ENDPOINT_A_MAX + 1];
-	struct urp_endpoint cfg = {};
+	struct urp_endpoint *cfg;
 	struct urp_endpoint *ep;
 	int ret;
 
@@ -353,43 +366,56 @@ static int urp_new_endpoint_doit(struct sk_buff *skb, struct genl_info *info)
 		GENL_SET_ERR_MSG(info, "endpoint name required");
 		return -EINVAL;
 	}
-	nla_strscpy(cfg.name, tb[URP_ENDPOINT_A_NAME], URP_NAME_MAX);
+
+	/*
+	 * Config scratch. struct urp_endpoint embeds the buffer array, so
+	 * a stack instance blows the 2 KiB frame budget (W=1
+	 * -Wframe-larger-than flagged 5.9 KiB) -- heap-allocate instead.
+	 * urp_endpoint_create() copies what it needs; cfg is not retained.
+	 */
+	cfg = kzalloc(sizeof(*cfg), GFP_KERNEL);
+	if (!cfg)
+		return -ENOMEM;
+
+	nla_strscpy(cfg->name, tb[URP_ENDPOINT_A_NAME], URP_NAME_MAX);
 
 	if (tb[URP_ENDPOINT_A_LISTEN_PATH])
-		nla_strscpy(cfg.listen_path, tb[URP_ENDPOINT_A_LISTEN_PATH],
+		nla_strscpy(cfg->listen_path, tb[URP_ENDPOINT_A_LISTEN_PATH],
 			    URP_PATH_MAX_LEN);
 	if (tb[URP_ENDPOINT_A_CONNECT_PATH])
-		nla_strscpy(cfg.connect_path, tb[URP_ENDPOINT_A_CONNECT_PATH],
+		nla_strscpy(cfg->connect_path, tb[URP_ENDPOINT_A_CONNECT_PATH],
 			    URP_PATH_MAX_LEN);
 	if (tb[URP_ENDPOINT_A_RDMA_DEVICE])
-		nla_strscpy(cfg.rdma_device, tb[URP_ENDPOINT_A_RDMA_DEVICE],
+		nla_strscpy(cfg->rdma_device, tb[URP_ENDPOINT_A_RDMA_DEVICE],
 			    URP_DEVICE_MAX);
 
 	if (tb[URP_ENDPOINT_A_PEER_ADDR]) {
-		memcpy(&cfg.peer_addr, nla_data(tb[URP_ENDPOINT_A_PEER_ADDR]),
-		       sizeof(cfg.peer_addr));
-		cfg.has_peer_addr = true;
+		memcpy(&cfg->peer_addr, nla_data(tb[URP_ENDPOINT_A_PEER_ADDR]),
+		       sizeof(cfg->peer_addr));
+		cfg->has_peer_addr = true;
 	}
 	if (tb[URP_ENDPOINT_A_BIND_ADDR]) {
-		memcpy(&cfg.bind_addr, nla_data(tb[URP_ENDPOINT_A_BIND_ADDR]),
-		       sizeof(cfg.bind_addr));
-		cfg.has_bind_addr = true;
+		memcpy(&cfg->bind_addr, nla_data(tb[URP_ENDPOINT_A_BIND_ADDR]),
+		       sizeof(cfg->bind_addr));
+		cfg->has_bind_addr = true;
 	}
 
 	if (tb[URP_ENDPOINT_A_NUM_QPS])
-		cfg.num_qps = nla_get_u32(tb[URP_ENDPOINT_A_NUM_QPS]);
+		cfg->num_qps = nla_get_u32(tb[URP_ENDPOINT_A_NUM_QPS]);
 	if (tb[URP_ENDPOINT_A_BUFFER_COUNT])
-		cfg.buffer_count = nla_get_u32(tb[URP_ENDPOINT_A_BUFFER_COUNT]);
+		cfg->buffer_count = nla_get_u32(tb[URP_ENDPOINT_A_BUFFER_COUNT]);
 	if (tb[URP_ENDPOINT_A_BUFFER_SIZE])
-		cfg.buffer_size = nla_get_u32(tb[URP_ENDPOINT_A_BUFFER_SIZE]);
+		cfg->buffer_size = nla_get_u32(tb[URP_ENDPOINT_A_BUFFER_SIZE]);
 
 	if (tb[URP_ENDPOINT_A_PASSWORD]) {
-		nla_strscpy((char *)cfg.password,
+		nla_strscpy((char *)cfg->password,
 			    tb[URP_ENDPOINT_A_PASSWORD], URP_PASSWORD_MAX);
-		cfg.has_password = true;
+		cfg->has_password = true;
 	}
 
-	ret = urp_endpoint_create(&cfg, &ep);
+	ret = urp_endpoint_create(cfg, &ep);
+	/* cfg carries the raw PSK -- scrub it as it goes */
+	kfree_sensitive(cfg);
 	if (ret) {
 		if (ret == -EEXIST)
 			GENL_SET_ERR_MSG(info, "endpoint already exists");

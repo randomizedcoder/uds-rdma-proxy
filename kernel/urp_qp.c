@@ -37,7 +37,8 @@ int urp_qps_init(struct urp_endpoint *ep)
 		 */
 		urp_credit_init(&ep->qps[i].credit, URP_NUM_BUFS / 2);
 		/* Step 5: start in QUALIFYING; RDMA_CM_EVENT_ESTABLISHED
-		 * promotes to ACTIVE (probe-driven Qualifying lands later). */
+		 * promotes to ACTIVE (probe-driven Qualifying lands later).
+		 */
 		ep->qps[i].health = URP_QP_STATE_QUALIFYING;
 		/*
 		 * Phase 5 Step 3: ROUTE_RESOLVED schedules this to call
@@ -71,7 +72,7 @@ void urp_qps_destroy(struct urp_endpoint *ep)
  * filters non-connected entries by retrying up to num_qps times. With
  * num_qps == 1 this simplifies to returning ep->qps[0] when established.
  *
- * Hash-affinity and adaptive-EWMA selection (design 08 §8.5) depend on
+ * Hash-affinity and adaptive-EWMA selection (design 08 section 8.5) depend on
  * probe RTT data and ship in Phase 3b.
  */
 struct urp_qp *urp_qp_select_round_robin(struct urp_endpoint *ep)
@@ -90,7 +91,8 @@ struct urp_qp *urp_qp_select_round_robin(struct urp_endpoint *ep)
 		/* Step 5: skip QPs that probes have demoted out of the
 		 * working set (DRAINING / REMOVED). QUALIFYING and ACTIVE
 		 * both carry data -- QUALIFYING is the just-established
-		 * pre-promotion state, ACTIVE is the steady-state. */
+		 * pre-promotion state, ACTIVE is the steady-state.
+		 */
 		if (qps->health == URP_QP_STATE_DRAINING ||
 		    qps->health == URP_QP_STATE_REMOVED)
 			continue;

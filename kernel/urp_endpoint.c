@@ -186,7 +186,7 @@ int urp_endpoint_create(struct urp_endpoint *cfg, struct urp_endpoint **out)
  */
 int urp_endpoint_activate(struct urp_endpoint *ep)
 {
-	char ip_buf[16];
+	char ip_buf[INET_ADDRSTRLEN];
 	int peer_port = 0;
 	int bind_port = 0;
 	const char *peer_ip = "";

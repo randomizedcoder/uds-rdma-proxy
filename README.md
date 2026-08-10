@@ -32,6 +32,11 @@ for the full picture):
   cross-arch (x86_64 KVM / aarch64 TCG), a kernel-version matrix (6.1/6.6/6.12/
   7.1), and a **KASAN + KMEMLEAK + lockdep** sanitizer pass (clean under a
   12-concurrent-stream burst).
+- **Static analysis** — hermetic Nix targets for sparse, smatch,
+  checkpatch --strict, W=1, coccicheck, clippy, rustfmt
+  (`nix build .#analysis-all`); all clean except a small documented
+  checkpatch residual (see
+  [docs/design/26-upstream-readiness.md](docs/design/26-upstream-readiness.md)).
 
 ## Quick start (Nix)
 
