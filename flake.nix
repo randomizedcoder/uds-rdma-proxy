@@ -57,6 +57,10 @@
           inherit (nixChecks) src;
         };
 
+        # Userspace libFuzzer harnesses over the pure kernel C parsing
+        # surfaces (design 27 F1). Manual-run: nix run .#fuzz-classify.
+        fuzz = import ./nix/fuzz { inherit pkgs lib; };
+
         # CI: build against flake-pinned nixpkgs kernel
         urpKo = nixChecks.kernel-module-build;
 
@@ -186,6 +190,8 @@
             analysis-sparse analysis-smatch analysis-checkpatch
             analysis-w1 analysis-w2 analysis-coccicheck
             analysis-clippy analysis-rustfmt analysis-all;
+          # Userspace C fuzzers (manual): nix run .#fuzz-classify
+          inherit (fuzz) fuzz-classify;
         } // microvms.packages // redpandaUdsTest;
 
         # `nix run .#test-redpanda-uds` (Linux only). Needs root at runtime.

@@ -100,6 +100,15 @@ byte-total bounded; Rust and C agree bit-for-bit on observable behaviour.
 Goal: fuzz the **real C code** (not a port) in userspace, coverage-guided,
 under ASAN/UBSan — no VM, fast iteration, runs in CI.
 
+**Status:** the RX frame classifier harness is **implemented** —
+`nix run .#fuzz-classify` compiles the real `kernel/urp_frame.c`
+(`urp_classify_frame`, extracted with the codec into `urp_frame.h` per E1)
+against `nix/fuzz/urp_fuzz_shim.h` under `-fsanitize=fuzzer,address,undefined`.
+First run: 55M execs, full branch coverage, no ASAN/UBSan report, and the
+in-harness §27.8 invariant (never route an overrun frame) held throughout.
+The remaining targets below (codec truncations, reorder, credit, PSK) reuse
+the same shim + `nix/fuzz/` scaffolding.
+
 The pure, allocator-and-verbs-free C units compile standalone if we stub a
 handful of kernel symbols (`kmalloc`→`malloc`, `kfree`→`free`,
 `put/get_unaligned_le*`, `pr_*`→noop, an rbtree shim or bundle
