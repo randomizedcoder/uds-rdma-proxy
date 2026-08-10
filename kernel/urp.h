@@ -483,6 +483,37 @@ int  urp_emit_pong_on(struct urp_endpoint *ep, struct ib_qp *qp,
 void urp_probe_work_start(struct urp_endpoint *ep);
 void urp_probe_work_stop(struct urp_endpoint *ep);
 
+/*
+ * Pure RX frame classifier (design 28 E1). Extracts the classify/validate/
+ * route decision out of urp_recv_done so it can be table-tested in KUnit
+ * without an ib_wc / DMA buffer, and diffed against the Rust frame model.
+ * Given the received length and the 20 header bytes, it decodes the header
+ * fields into @out and returns the action urp_recv_done must take. All the
+ * length-vs-payload security guards (design 27 27.8 #1) live here.
+ */
+enum urp_rx_action {
+	URP_RX_DROP_SHORT,		/* byte_len < header: header itself stale */
+	URP_RX_DROP_OVERSIZE,		/* payload_len > URP_MAX_PAYLOAD */
+	URP_RX_DROP_PAYLOAD_OVERRUN,	/* payload_len > bytes received */
+	URP_RX_DROP_SHORT_PROBE,	/* PROBE shorter than a ping payload */
+	URP_RX_CREDIT,			/* CONTROL frame: apply peer's credit grant */
+	URP_RX_PROBE_PING,		/* PROBE ping: emit a PONG */
+	URP_RX_PROBE_PONG,		/* PROBE pong: RTT / EWMA update */
+	URP_RX_DELIVER_LEGACY,		/* DATA stream_id == 0: ep->conn */
+	URP_RX_DELIVER_STREAM,		/* DATA stream_id != 0: per-stream */
+};
+
+struct urp_rx_decoded {
+	u32	payload_len;
+	u32	stream_id;
+	u16	credits;
+	u8	type;
+	u8	flags;
+};
+
+enum urp_rx_action
+urp_classify_frame(u32 byte_len, const u8 *hdr, struct urp_rx_decoded *out);
+
 /* CQ completion callbacks (urp_rdma.c) -- used by pump when posting sends */
 void urp_send_done(struct ib_cq *cq, struct ib_wc *wc);
 /* Recv completion for SRQ-posted buffers -- urp_srq.c wires it as the

@@ -441,6 +441,57 @@ void urp_send_done(struct ib_cq *cq, struct ib_wc *wc)
 	urp_buf_free_send(ep, buf);
 }
 
+/*
+ * Pure RX frame classifier (design 28 E1). See urp.h for the contract.
+ * Table-tested by urp_test.c test_classify_frame; the length guards here
+ * are the design 27 27.8 #1 fix (never forward more than was received).
+ *
+ * Note: an unknown frame_type (3..255) is routed to the DATA path -- this
+ * preserves the historical behaviour; rejecting unknown types is a
+ * separate behaviour change, not part of this extraction.
+ */
+enum urp_rx_action
+urp_classify_frame(u32 byte_len, const u8 *hdr, struct urp_rx_decoded *out)
+{
+	memset(out, 0, sizeof(*out));
+
+	/* A frame shorter than the header would read the header itself from
+	 * stale pool memory -- reject before decoding anything.
+	 */
+	if (byte_len < URP_FRAME_HEADER_SIZE)
+		return URP_RX_DROP_SHORT;
+
+	out->payload_len = urp_frame_decode_payload_len(hdr);
+	out->stream_id = urp_frame_decode_stream_id(hdr);
+	out->type = urp_frame_decode_type(hdr);
+	out->flags = urp_frame_decode_flags(hdr);
+	out->credits = urp_frame_decode_credits(hdr);
+
+	if (out->payload_len > URP_MAX_PAYLOAD)
+		return URP_RX_DROP_OVERSIZE;
+	/* The declared payload must fit within the bytes actually received;
+	 * otherwise we'd forward stale DMA-pool memory to the local app.
+	 */
+	if (out->payload_len > byte_len - URP_FRAME_HEADER_SIZE)
+		return URP_RX_DROP_PAYLOAD_OVERRUN;
+
+	if (out->type == URP_FRAME_TYPE_CONTROL)
+		return URP_RX_CREDIT;
+
+	if (out->type == URP_FRAME_TYPE_PROBE) {
+		/* PROBE handlers read fixed payload offsets without consulting
+		 * payload_len, so require a full ping payload of received bytes.
+		 */
+		if (byte_len < URP_FRAME_HEADER_SIZE + URP_PING_PAYLOAD_SIZE)
+			return URP_RX_DROP_SHORT_PROBE;
+		return (out->flags & URP_PROBE_FLAG_PONG) ?
+			URP_RX_PROBE_PONG : URP_RX_PROBE_PING;
+	}
+
+	return out->stream_id == 0 ?
+		URP_RX_DELIVER_LEGACY : URP_RX_DELIVER_STREAM;
+}
+
 static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 {
 	struct urp_buffer *buf = container_of(wc->wr_cqe, struct urp_buffer, cqe);
@@ -449,9 +500,10 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 	struct urp_stream *rx_stream = NULL;
 	struct msghdr msg = {};
 	struct kvec iov;
+	struct urp_rx_decoded dec;
+	enum urp_rx_action action;
 	u32 payload_len;
 	u32 stream_id;
-	u8 flags;
 	int ret;
 
 	if (wc->status != IB_WC_SUCCESS) {
@@ -461,18 +513,6 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 		/* Return buffer to pool so it can be reposted. */
 		urp_buf_free_recv(ep, buf);
 		return;
-	}
-
-	/*
-	 * Never trust the frame's self-declared lengths over the number of
-	 * bytes the RDMA layer actually received (wc->byte_len). A frame
-	 * shorter than the fixed header means the header itself would be read
-	 * from stale pool memory -- drop it before decoding anything.
-	 */
-	if (wc->byte_len < URP_FRAME_HEADER_SIZE) {
-		pr_err_ratelimited("short frame: %u bytes (< header)\n",
-				   wc->byte_len);
-		goto repost;
 	}
 
 	/*
@@ -486,125 +526,84 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 	 * endpoint lifetime. See urp_streams_reap() (retained for that work).
 	 */
 
-	payload_len = urp_frame_decode_payload_len(buf->data);
-	if (payload_len > URP_MAX_PAYLOAD) {
+	/*
+	 * Classify + validate the frame (pure; design 28 E1). The action tells
+	 * us what to do; dec holds the decoded header fields. Every length
+	 * guard (design 27 27.8 #1) lives in urp_classify_frame.
+	 */
+	action = urp_classify_frame(wc->byte_len, buf->data, &dec);
+	payload_len = dec.payload_len;
+	stream_id = dec.stream_id;
+
+	switch (action) {
+	case URP_RX_DROP_SHORT:
+		pr_err_ratelimited("short frame: %u bytes (< header)\n",
+				   wc->byte_len);
+		goto repost;
+	case URP_RX_DROP_OVERSIZE:
 		pr_err_ratelimited("received oversized frame: %u\n", payload_len);
 		goto repost;
-	}
-	/*
-	 * The declared payload must fit within the bytes actually received.
-	 * Without this a peer sends a header-only frame declaring
-	 * payload_len == URP_MAX_PAYLOAD and we would forward ~4 KiB of stale
-	 * DMA-pool contents to the local UDS app -- a remote kernel-memory
-	 * disclosure. Bound it to the real received length.
-	 */
-	if (payload_len > wc->byte_len - URP_FRAME_HEADER_SIZE) {
+	case URP_RX_DROP_PAYLOAD_OVERRUN:
 		pr_err_ratelimited("frame payload_len %u exceeds received %u\n",
 				   payload_len,
 				   wc->byte_len - URP_FRAME_HEADER_SIZE);
 		goto repost;
-	}
-
-	/*
-	 * Step 4b: handle CONTROL/CREDIT frames -- peer is granting us
-	 * additional send credits on the QP this completion came in on.
-	 * Apply to the QP's credit state and we're done; no UDS delivery.
-	 */
-	if (urp_frame_decode_type(buf->data) == URP_FRAME_TYPE_CONTROL) {
-		int qp_idx = urp_qp_index_of(ep, wc->qp);
-		u16 grants = urp_frame_decode_credits(buf->data);
-		u8 cflags = urp_frame_decode_flags(buf->data);
-
-		if (qp_idx >= 0 && (cflags & URP_CTRL_FLAG_CREDIT))
-			urp_credit_grant(&ep->qps[qp_idx].credit, grants);
+	case URP_RX_DROP_SHORT_PROBE:
+		pr_err_ratelimited("short PROBE frame: %u bytes\n", wc->byte_len);
 		goto repost;
-	}
-
-	/*
-	 * Phase 3b PROBE handling.
-	 *   flags == 0                       -> PING (Step 3): emit PONG
-	 *   flags has URP_PROBE_FLAG_PONG    -> PONG (Step 4): compute
-	 *                                       RTT, update per-QP EWMA,
-	 *                                       reset consecutive_misses
-	 * In both cases the frame is not delivered to UDS.
-	 */
-	if (urp_frame_decode_type(buf->data) == URP_FRAME_TYPE_PROBE) {
-		u8 pflags = urp_frame_decode_flags(buf->data);
-		const void *payload = buf->data + URP_FRAME_HEADER_SIZE;
-
+	case URP_RX_CREDIT: {
 		/*
-		 * PROBE handlers read fixed payload offsets (PING/PONG decode,
-		 * and urp_emit_pong_on memcpy's the PING payload back) without
-		 * consulting payload_len, so guard on the received length
-		 * directly. A short PROBE would otherwise decode / reflect
-		 * stale pool bytes. Both PING (32 B) and PONG (48 B) carry at
-		 * least URP_PING_PAYLOAD_SIZE bytes; anything shorter is bogus.
+		 * CONTROL/CREDIT frame: peer is granting us send credits on the
+		 * QP this completion came in on. No UDS delivery.
 		 */
-		if (wc->byte_len <
-		    URP_FRAME_HEADER_SIZE + URP_PING_PAYLOAD_SIZE) {
-			pr_err_ratelimited("short PROBE frame: %u bytes\n",
-					   wc->byte_len);
-			goto repost;
-		}
+		int qp_idx = urp_qp_index_of(ep, wc->qp);
 
-		if (pflags & URP_PROBE_FLAG_PONG) {
-			int qp_idx = urp_qp_index_of(ep, wc->qp);
+		if (qp_idx >= 0 && (dec.flags & URP_CTRL_FLAG_CREDIT))
+			urp_credit_grant(&ep->qps[qp_idx].credit, dec.credits);
+		goto repost;
+	}
+	case URP_RX_PROBE_PONG: {
+		/* RTT sample -> per-QP EWMA (alpha = 0.2, integer math). */
+		int qp_idx = urp_qp_index_of(ep, wc->qp);
 
-			if (qp_idx >= 0) {
-				struct urp_qp *q = &ep->qps[qp_idx];
-				u64 t_send_mono =
-					urp_ping_decode_t_send_mono(payload);
-				u64 now = ktime_get_ns();
+		if (qp_idx >= 0) {
+			struct urp_qp *q = &ep->qps[qp_idx];
+			const void *pp = buf->data + URP_FRAME_HEADER_SIZE;
+			u64 t_send_mono = urp_ping_decode_t_send_mono(pp);
+			u64 now = ktime_get_ns();
 
-				if (now > t_send_mono) {
-					u64 rtt = now - t_send_mono;
-					/*
-					 * EWMA alpha = 0.2 in integer math:
-					 *   new = old * 4/5 + rtt * 1/5
-					 * First sample (rtt_ewma_ns == 0)
-					 * seeds directly so we don't pull the
-					 * baseline toward zero.
-					 */
-					if (q->rtt_ewma_ns == 0)
-						q->rtt_ewma_ns = rtt;
-					else
-						q->rtt_ewma_ns =
-							(q->rtt_ewma_ns * 4 +
-							 rtt) / 5;
-					/* Step 5: signal "PONG arrived for
-					 * the outstanding PING" by clearing
-					 * last_ping_ns; bump pong streak;
-					 * reset misses. A future Qualifying
-					 * promotion step will use
-					 * consecutive_pongs >= 3 to lift
-					 * the QP to ACTIVE.
-					 */
-					q->last_ping_ns = 0;
-					q->consecutive_misses = 0;
-					q->consecutive_pongs++;
-				}
+			if (now > t_send_mono) {
+				u64 rtt = now - t_send_mono;
+
+				/* First sample seeds directly so we don't pull
+				 * the baseline toward zero.
+				 */
+				if (q->rtt_ewma_ns == 0)
+					q->rtt_ewma_ns = rtt;
+				else
+					q->rtt_ewma_ns =
+						(q->rtt_ewma_ns * 4 + rtt) / 5;
+				/* PONG for the outstanding PING: clear
+				 * last_ping_ns, bump the pong streak, reset
+				 * misses (consecutive_pongs drives a future
+				 * Qualifying -> ACTIVE promotion).
+				 */
+				q->last_ping_ns = 0;
+				q->consecutive_misses = 0;
+				q->consecutive_pongs++;
 			}
-		} else {
-			urp_emit_pong_on(ep, wc->qp, payload);
 		}
 		goto repost;
 	}
-
-	/*
-	 * Phase 3a Step 7b: dispatch DATA frames by stream_id. stream_id
-	 * == 0 is the k0/legacy single-connection path -- frames go to
-	 * ep->conn. Non-zero stream_ids look up a per-stream UDS socket;
-	 * SYN-flagged frames may auto-create the stream entry via
-	 * urp_stream_rx_syn (Step 7c on the acceptor side then opens the
-	 * per-stream UDS + starts that stream's TX pump).
-	 */
-	stream_id = urp_frame_decode_stream_id(buf->data);
-	flags = urp_frame_decode_flags(buf->data);
-
-	if (stream_id == 0) {
+	case URP_RX_PROBE_PING:
+		urp_emit_pong_on(ep, wc->qp, buf->data + URP_FRAME_HEADER_SIZE);
+		goto repost;
+	case URP_RX_DELIVER_LEGACY:
+		/* stream_id == 0: k0/legacy single connection. */
 		if (ep->conn.active && ep->conn.uds_sock)
 			uds = ep->conn.uds_sock;
-	} else {
+		break;
+	case URP_RX_DELIVER_STREAM: {
 		struct urp_stream *s = NULL;
 		bool need_backend = false;
 
@@ -619,7 +618,7 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 		 * completions + drain-after-quiesce keep `s` alive across this
 		 * handler.
 		 */
-		(void)urp_stream_rx_dispatch(ep, stream_id, flags, &s);
+		(void)urp_stream_rx_dispatch(ep, stream_id, dec.flags, &s);
 		if (s) {
 			uds = s->uds_sock;
 			need_backend = urp_stream_needs_backend(ep, s);
@@ -635,6 +634,8 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 			uds = s->uds_sock;
 		}
 		rx_stream = s;
+		break;
+	}
 	}
 
 	if (!uds) {

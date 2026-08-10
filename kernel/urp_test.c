@@ -610,6 +610,71 @@ static void test_stream_next_state(struct kunit *test)
 #undef A_DEST
 }
 
+/*
+ * RX frame classifier (design 28 E1). Table-drives urp_classify_frame over
+ * the length guards + type/flag routing. The design 27 27.8 #1 info-leak
+ * (a header-only frame declaring a full payload) and the short-PROBE guard
+ * are explicit regression rows.
+ */
+static void test_classify_frame(struct kunit *test)
+{
+#define FT_D   URP_FRAME_TYPE_DATA
+#define FT_C   URP_FRAME_TYPE_CONTROL
+#define FT_P   URP_FRAME_TYPE_PROBE
+#define HDRSZ  URP_FRAME_HEADER_SIZE
+#define PINGSZ URP_PING_PAYLOAD_SIZE
+#define PONGSZ URP_PONG_PAYLOAD_SIZE
+	static const struct {
+		u32 stream_id;
+		u8  type;
+		u8  flags;
+		u16 credits;
+		u32 payload_len;
+		u32 byte_len;
+		enum urp_rx_action want;
+	} cases[] = {
+		/* Normal delivery */
+		{ 0, FT_D, 0, 0, 10, 30,    URP_RX_DELIVER_LEGACY },
+		{ 5, FT_D, 0, 0, 10, 30,    URP_RX_DELIVER_STREAM },
+		{ 5, FT_D, 0, 0,  0, HDRSZ, URP_RX_DELIVER_STREAM },  /* zero payload */
+		{ 5, FT_D, 0, 0, 10, 30,    URP_RX_DELIVER_STREAM },  /* fits exactly */
+		/* Short frame: header itself would be stale */
+		{ 0, FT_D, 0, 0, 0, 10,        URP_RX_DROP_SHORT },
+		{ 0, FT_D, 0, 0, 0, HDRSZ - 1, URP_RX_DROP_SHORT },
+		/* Oversize payload_len */
+		{ 0, FT_D, 0, 0, URP_MAX_PAYLOAD + 1, URP_BUF_SIZE, URP_RX_DROP_OVERSIZE },
+		/* 27.8 #1: header-only frame declaring a full payload */
+		{ 0, FT_D, 0, 0, URP_MAX_PAYLOAD, HDRSZ, URP_RX_DROP_PAYLOAD_OVERRUN },
+		{ 5, FT_D, 0, 0, 11, 30, URP_RX_DROP_PAYLOAD_OVERRUN },  /* overrun by 1 */
+		/* CONTROL -> credit */
+		{ 0, FT_C, URP_CTRL_FLAG_CREDIT, 64, 0, HDRSZ, URP_RX_CREDIT },
+		/* PROBE ping / pong */
+		{ 0, FT_P, 0, 0, PINGSZ, HDRSZ + PINGSZ, URP_RX_PROBE_PING },
+		{ 0, FT_P, URP_PROBE_FLAG_PONG, 0, PONGSZ, HDRSZ + PONGSZ, URP_RX_PROBE_PONG },
+		/* PROBE too short to read the fixed payload offsets */
+		{ 0, FT_P, 0, 0, 0, HDRSZ + PINGSZ - 1, URP_RX_DROP_SHORT_PROBE },
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		u8 hdr[URP_FRAME_HEADER_SIZE];
+		struct urp_rx_decoded dec;
+		enum urp_rx_action got;
+
+		urp_frame_encode(hdr, cases[i].stream_id, 0, cases[i].type,
+				 cases[i].flags, cases[i].credits,
+				 cases[i].payload_len);
+		got = urp_classify_frame(cases[i].byte_len, hdr, &dec);
+		KUNIT_EXPECT_EQ_MSG(test, got, cases[i].want, "case %d", i);
+	}
+#undef FT_D
+#undef FT_C
+#undef FT_P
+#undef HDRSZ
+#undef PINGSZ
+#undef PONGSZ
+}
+
 /* ---- Test suite registration ---- */
 
 static struct kunit_case urp_test_cases[] = {
@@ -648,6 +713,8 @@ static struct kunit_case urp_test_cases[] = {
 	KUNIT_CASE(test_probe_payload_sizes),
 	/* design 28 E2: stream state machine */
 	KUNIT_CASE(test_stream_next_state),
+	/* design 28 E1: RX frame classifier */
+	KUNIT_CASE(test_classify_frame),
 	{}
 };
 
