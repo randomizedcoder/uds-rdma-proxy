@@ -29,6 +29,11 @@ path = "fuzz_targets/reorder_buffer.rs"
 doc = false
 
 [[bin]]
+name = "reorder_ops"
+path = "fuzz_targets/reorder_ops.rs"
+doc = false
+
+[[bin]]
 name = "credit_state_machine"
 path = "fuzz_targets/credit_state_machine.rs"
 doc = false

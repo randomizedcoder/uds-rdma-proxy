@@ -68,11 +68,16 @@ impl ReorderBuffer {
 
         self.pending.insert(seq, data);
 
-        // Drain consecutive frames starting from next_expected
+        // Drain consecutive frames starting from next_expected.
+        // saturating_add so the top of the u64 sequence space cannot
+        // overflow-panic (found by fuzz/reorder_ops): a peer would need
+        // 2^64 in-order deliveries to reach it, but a panic here aborts
+        // the kernel via the FFI backend, so bound it. The C twin
+        // (kernel/urp_reorder.c) matches.
         let mut delivered = Vec::new();
         while let Some(payload) = self.pending.remove(&self.next_expected) {
             delivered.push((self.next_expected, payload));
-            self.next_expected += 1;
+            self.next_expected = self.next_expected.saturating_add(1);
         }
 
         Ok(DrainResult {
@@ -222,5 +227,17 @@ mod tests {
         assert!(r.delivered.is_empty());
         assert_eq!(rb.pending_count(), 1);
         assert_eq!(rb.next_expected(), 1);
+    }
+
+    // Regression: fuzz/reorder_ops found `next_expected += 1` overflow-
+    // panicking at the top of the u64 sequence space. Delivering the frame
+    // at u64::MAX must saturate, not panic.
+    #[test]
+    fn insert_at_u64_max_saturates() {
+        let mut rb = ReorderBuffer::new(u64::MAX, 16);
+        let r = rb.insert(u64::MAX, vec![0xAB]).unwrap();
+        assert_eq!(r.delivered.len(), 1);
+        assert_eq!(r.delivered[0].0, u64::MAX);
+        assert_eq!(rb.next_expected(), u64::MAX); // saturated, no overflow
     }
 }
