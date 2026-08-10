@@ -234,6 +234,64 @@ void urp_stream_destroy(struct urp_endpoint *ep, struct urp_stream *s)
 }
 
 /*
+ * Pure stream state-machine core (design 28 E2). No locks, no sockets,
+ * no allocation -- just (state, event) -> (next, actions, accepted).
+ * The handlers below own the locking + side effects; this owns the
+ * decision. Mirrored 1:1 by crates/uds-rdma-protocol/src/stream.rs
+ * (keep in lock-step; the KUnit table in urp_test.c and the Rust table
+ * test both enumerate the full matrix).
+ *
+ * Note: the SYN that *creates* an inbound stream is a distinct event
+ * (create -> SYN_RECEIVED), handled in urp_stream_rx_syn; this function
+ * models RX_SYN on an already-known stream (idempotent handshake
+ * advance to ESTABLISHED, or reject on a closing/closed stream).
+ */
+struct urp_stream_transition
+urp_stream_next_state(enum urp_stream_state cur, enum urp_stream_event ev)
+{
+	struct urp_stream_transition t = {
+		.next = cur, .actions = 0, .accepted = true,
+	};
+
+	switch (ev) {
+	case URP_STREAM_EV_RX_SYN:
+		if (cur == URP_STREAM_STATE_SYN_SENT ||
+		    cur == URP_STREAM_STATE_SYN_RECEIVED ||
+		    cur == URP_STREAM_STATE_ESTABLISHED)
+			t.next = URP_STREAM_STATE_ESTABLISHED;
+		else
+			t.accepted = false;	/* -EEXIST: SYN on closing/closed */
+		break;
+	case URP_STREAM_EV_RX_FIN:
+		/* Peer half-close: always SHUT_WR the local UDS; advance the
+		 * two states with a defined FIN transition.
+		 */
+		t.actions = URP_STREAM_ACT_SHUTDOWN_WR;
+		if (cur == URP_STREAM_STATE_ESTABLISHED)
+			t.next = URP_STREAM_STATE_CLOSE_WAIT;
+		else if (cur == URP_STREAM_STATE_FIN_WAIT)
+			t.next = URP_STREAM_STATE_CLOSED;
+		break;
+	case URP_STREAM_EV_RX_RST:
+		t.next = URP_STREAM_STATE_CLOSED;
+		t.actions = URP_STREAM_ACT_SHUTDOWN_RDWR |
+			    URP_STREAM_ACT_DESTROY;
+		break;
+	case URP_STREAM_EV_TX_FIN:
+		if (cur == URP_STREAM_STATE_ESTABLISHED)
+			t.next = URP_STREAM_STATE_FIN_WAIT;
+		else if (cur == URP_STREAM_STATE_CLOSE_WAIT)
+			t.next = URP_STREAM_STATE_CLOSED;
+		break;
+	case URP_STREAM_EV_TX_RST:
+		t.next = URP_STREAM_STATE_CLOSED;
+		t.actions = URP_STREAM_ACT_SHUTDOWN_RDWR;
+		break;
+	}
+	return t;
+}
+
+/*
  * Handle a SYN-flagged frame arriving from the peer. Creates a stream
  * for the given peer-assigned id if absent, transitions to
  * SYN_RECEIVED, and returns the stream (locked-free; caller doesn't
@@ -255,17 +313,18 @@ int urp_stream_rx_syn(struct urp_endpoint *ep, u32 stream_id,
 
 	s = urp_stream_lookup(ep, stream_id);
 	if (s) {
+		struct urp_stream_transition t;
+
 		mutex_lock(&s->lock);
-		if (s->state == URP_STREAM_STATE_SYN_SENT ||
-		    s->state == URP_STREAM_STATE_SYN_RECEIVED ||
-		    s->state == URP_STREAM_STATE_ESTABLISHED) {
-			s->state = URP_STREAM_STATE_ESTABLISHED;
+		t = urp_stream_next_state(s->state, URP_STREAM_EV_RX_SYN);
+		if (!t.accepted) {
 			mutex_unlock(&s->lock);
-			*out_stream = s;
-			return 0;
+			return -EEXIST;
 		}
+		s->state = t.next;
 		mutex_unlock(&s->lock);
-		return -EEXIST;
+		*out_stream = s;
+		return 0;
 	}
 
 	ret = urp_stream_create(ep, stream_id, &s);
@@ -323,19 +382,16 @@ void urp_stream_open_backend(struct urp_stream *s)
  */
 int urp_stream_rx_fin(struct urp_stream *s)
 {
+	struct urp_stream_transition t;
+
 	if (!s)
 		return -EINVAL;
 
 	mutex_lock(&s->lock);
-
-	if (s->uds_sock)
+	t = urp_stream_next_state(s->state, URP_STREAM_EV_RX_FIN);
+	if ((t.actions & URP_STREAM_ACT_SHUTDOWN_WR) && s->uds_sock)
 		kernel_sock_shutdown(s->uds_sock, SHUT_WR);
-
-	if (s->state == URP_STREAM_STATE_ESTABLISHED)
-		s->state = URP_STREAM_STATE_CLOSE_WAIT;
-	else if (s->state == URP_STREAM_STATE_FIN_WAIT)
-		s->state = URP_STREAM_STATE_CLOSED;
-
+	s->state = t.next;
 	mutex_unlock(&s->lock);
 	return 0;
 }
@@ -348,19 +404,22 @@ int urp_stream_rx_fin(struct urp_stream *s)
  */
 int urp_stream_rx_rst(struct urp_stream *s)
 {
+	struct urp_stream_transition t;
 	struct urp_endpoint *ep;
 
 	if (!s)
 		return -EINVAL;
 
 	mutex_lock(&s->lock);
-	s->state = URP_STREAM_STATE_CLOSED;
-	if (s->uds_sock)
+	t = urp_stream_next_state(s->state, URP_STREAM_EV_RX_RST);
+	s->state = t.next;
+	if ((t.actions & URP_STREAM_ACT_SHUTDOWN_RDWR) && s->uds_sock)
 		kernel_sock_shutdown(s->uds_sock, SHUT_RDWR);
 	ep = s->ep;
 	mutex_unlock(&s->lock);
 
-	urp_stream_destroy(ep, s);
+	if (t.actions & URP_STREAM_ACT_DESTROY)
+		urp_stream_destroy(ep, s);
 	return 0;
 }
 
@@ -373,14 +432,14 @@ int urp_stream_rx_rst(struct urp_stream *s)
  */
 void urp_stream_tx_fin(struct urp_stream *s)
 {
+	struct urp_stream_transition t;
+
 	if (!s)
 		return;
 
 	mutex_lock(&s->lock);
-	if (s->state == URP_STREAM_STATE_ESTABLISHED)
-		s->state = URP_STREAM_STATE_FIN_WAIT;
-	else if (s->state == URP_STREAM_STATE_CLOSE_WAIT)
-		s->state = URP_STREAM_STATE_CLOSED;
+	t = urp_stream_next_state(s->state, URP_STREAM_EV_TX_FIN);
+	s->state = t.next;
 	mutex_unlock(&s->lock);
 }
 
@@ -392,12 +451,15 @@ void urp_stream_tx_fin(struct urp_stream *s)
  */
 void urp_stream_tx_rst(struct urp_stream *s)
 {
+	struct urp_stream_transition t;
+
 	if (!s)
 		return;
 
 	mutex_lock(&s->lock);
-	s->state = URP_STREAM_STATE_CLOSED;
-	if (s->uds_sock)
+	t = urp_stream_next_state(s->state, URP_STREAM_EV_TX_RST);
+	s->state = t.next;
+	if ((t.actions & URP_STREAM_ACT_SHUTDOWN_RDWR) && s->uds_sock)
 		kernel_sock_shutdown(s->uds_sock, SHUT_RDWR);
 	mutex_unlock(&s->lock);
 }

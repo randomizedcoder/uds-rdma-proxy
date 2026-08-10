@@ -13,6 +13,7 @@ pub mod mtu;
 pub mod probe;
 pub mod qp;
 pub mod reorder;
+pub mod stream;
 
 pub use constants::*;
 pub use credit::CreditState;
@@ -21,3 +22,4 @@ pub use frame::FrameHeader;
 pub use mtu::IbPmtu;
 pub use probe::{PingPayload, PongPayload};
 pub use reorder::{DrainResult, ReorderBuffer};
+pub use stream::{StreamEvent, StreamState, Transition};
