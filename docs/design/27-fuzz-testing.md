@@ -145,13 +145,38 @@ paths F0/F1 can't.
    drives malformed nesting, truncated/oversized/duplicate attrs, and
    concurrent NEW/SET/DEL/GET on one name (the DEL-after-RCU-drop race, the
    SET-`num_qps`-OOB path). Oracle: any KASAN/KMEMLEAK/lockdep report or leak.
-2. **Hostile-peer wire fuzzer** (S1/S2): a userspace RDMA client on the peer
-   rxe device that speaks raw urp frames into a live acceptor endpoint in the
-   VM. Mutates every header field, flag combination (incl. SYN|RST, SYN|FIN),
-   payload_len vs actual bytes, unknown stream_ids (stream-exhaustion),
-   PROBE payloads shorter than 32 B, and CM `private_data` of every length.
-   Structured generator seeded from `arbitrary`; runs against the KASAN VM.
-   This is the track that would have caught both §27.8 bugs.
+2. **Hostile-peer wire fuzzer** (S1/S2) — **IMPLEMENTED** (`nix/fuzz/wire_fuzz.c`):
+   a standalone librdmacm/libibverbs RC peer that completes the CM handshake
+   into a live acceptor endpoint and injects malformed frames into the RX path
+   (`urp_recv_done`). It mutates every header field, flag combination (incl.
+   `SYN|RST` and `SYN|FIN` in one frame), the `payload_len` header field
+   *independently* of the actual wire byte_len (so the classifier's
+   overrun/oversize guards fire), runt frames < 20 B, unknown frame types
+   0x03..0xFF (the DATA fall-through), and short PROBE frames. Its highest-value
+   mode is **scripted stream sequences** on a small stream_id space (SYN→RST,
+   SYN+RST-in-one-frame, RST-without-SYN, double-RST, SYN→data→RST, id reuse):
+   a SYN on a fresh id makes the acceptor open a backend UDS + spawn a pump
+   kthread, and the following RST drives `urp_stream_destroy` → `kthread_stop`
+   → `sock_release` → `call_rcu` — the RST-under-RCU / kthread-lifecycle path
+   the cooperative pair test structurally cannot reach. Deterministic (xorshift
+   seeded from argv) and self-healing (reconnects if the RC QP errors).
+
+   Wired as **Phase 10d** of the microVM pair test (`nix/microvms/lib.nix`):
+   it stands up a *dedicated* `fuzz_acceptor` (port 4792, own socat backend) —
+   the live `pair_acceptor`'s QP slots are already full with the real initiator,
+   so a second peer is `rdma_reject`ed (`urp_rdma.c`: `qp_index >= num_qps`) —
+   runs `wire_fuzz` from the peer VM against it, then tears the endpoint down
+   (also exercising teardown right after hostile traffic). Oracle: the existing
+   Phase 11b KASAN/KMEMLEAK/lockdep dmesg scan. The S2 PSK pre-auth surface is
+   reachable by pointing it at a password-protected endpoint (the connect-time
+   `private_data` hook is in place). Throughput is acceptor-bound (RNR backoff +
+   a real stream/kthread/socat-fork per SYN), so raw frame counts are modest by
+   design; coverage comes from state diversity, not volume. This is the track
+   that would have caught both §27.8 bugs.
+
+   Still open (the coverage-guided upgrade): add **KCOV** to the sanitizer
+   kernel and drive `wire_fuzz`'s generator from `arbitrary` under coverage
+   feedback (and/or point real syzkaller at S3) rather than blind mutation.
 
 ## 27.7 Track F3 — lifecycle/churn + automation
 

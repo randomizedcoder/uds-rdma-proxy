@@ -522,6 +522,49 @@ in rec {
       echo ""
 
       # -----------------------------------------------------------------
+      # Phase 10d — hostile-peer wire fuzz (design 27 F2, S1/S2). Stand up a
+      # DEDICATED acceptor endpoint on vm1 (fuzz_acceptor, port 4792, its own
+      # socat backend) — the live pair_acceptor's QP slots are already full
+      # with the real initiator, so the acceptor would rdma_reject a second
+      # peer (urp_rdma.c: qp_index >= num_qps). From vm2, wire_fuzz connects
+      # to fuzz_acceptor and injects malformed frames into the acceptor's RX
+      # path: bad lengths, unknown types, and scripted SYN/FIN/RST sequences
+      # that spin up + tear down streams (kthread + backend UDS) so the
+      # "RST-under-RCU" lifecycle runs under KASAN. The friendly pair test
+      # never sends hostile frames, so this is the only phase that reaches
+      # urp_recv_done's error/destroy branches. The Phase 11b sanitizer scan
+      # is the oracle. fuzz_acceptor is created + hammered + torn down here,
+      # so it also exercises endpoint teardown right after hostile traffic.
+      # -----------------------------------------------------------------
+      echo "--- Phase 10d: hostile wire fuzz (vm2 -> vm1 fuzz_acceptor) ---"
+      WIREFUZZ_SECS=${if sanitizer then "25" else "8"}
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+        "rm -f /tmp/urp-fuzz-echo.sock; nohup socat UNIX-LISTEN:/tmp/urp-fuzz-echo.sock,fork EXEC:cat </dev/null >/dev/null 2>&1 & sleep 0.3; echo FUZZ_SOCAT_OK" 5 \
+        | grep -q FUZZ_SOCAT_OK \
+        || info "vm1 fuzz socat backend may not have started"
+      if vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+           "urp add fuzz_acceptor --connect-path /tmp/urp-fuzz-echo.sock --bind $VM1_IP:4792" "$T_URP" \
+           | grep -q "ok:"; then
+        # rxe listener needs a beat to be routable before the peer resolves it.
+        sleep "$POLL"
+        vm_run "$VM2_VIRTIO" "$VM2_PROC" \
+          "wire_fuzz $VM1_IP 4792 $WIREFUZZ_SECS 1 2>&1 | tail -4" $((WIREFUZZ_SECS + 25)) \
+          > "$RUNDIR/diag/vm2.wire-fuzz.txt" 2>&1 || true
+        if grep -q WIRE_FUZZ_DONE "$RUNDIR/diag/vm2.wire-fuzz.txt" 2>/dev/null; then
+          info "wire fuzz completed ($(grep -o 'frames=[0-9]* reconnects=[0-9]*' "$RUNDIR/diag/vm2.wire-fuzz.txt" | tail -1))"
+        else
+          info "wire fuzz did not report DONE (check diag/vm2.wire-fuzz.txt)"
+        fi
+        # Tear down the fuzz acceptor right after hostile traffic.
+        vm_run "$VM1_VIRTIO" "$VM1_PROC" "urp drain fuzz_acceptor 2>&1; urp remove fuzz_acceptor 2>&1; echo FUZZ_EP_GONE" 15 \
+          > "$RUNDIR/diag/vm1.fuzz-teardown.txt" 2>&1 || true
+      else
+        info "fuzz_acceptor add failed; skipping wire fuzz (check diag)"
+      fi
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" "pkill -f urp-fuzz-echo.sock 2>/dev/null; rm -f /tmp/urp-fuzz-echo.sock; echo FZC" 5 >/dev/null 2>&1 || true
+      echo ""
+
+      # -----------------------------------------------------------------
       # Phase 11 — teardown (drain, remove, rmmod), each step timed
       # so the slow command pops out of the verdict table.
       # -----------------------------------------------------------------
