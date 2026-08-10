@@ -47,6 +47,16 @@
           inherit (packages) rustToolchain;
         };
 
+        # Static analysis (sparse/smatch/checkpatch/W=1/coccicheck for the
+        # kernel module, clippy/rustfmt for the Rust workspace). Report
+        # derivations, manual-run only -- deliberately NOT in checks/CI.
+        # See nix/analysis/default.nix. Usage: nix build .#analysis-all -L
+        analysis = import ./nix/analysis {
+          inherit pkgs lib;
+          inherit (packages) rustToolchain;
+          inherit (nixChecks) src;
+        };
+
         # CI: build against flake-pinned nixpkgs kernel
         urpKo = nixChecks.kernel-module-build;
 
@@ -171,6 +181,11 @@
           urp-vm-debug = urpVmDebug;
           urp-ko-aarch64 = urpKoAarch64;
           urp-ko-riscv64 = urpKoRiscv64;
+          # Static-analysis reports (manual): nix build .#analysis-all -L
+          inherit (analysis)
+            analysis-sparse analysis-smatch analysis-checkpatch
+            analysis-w1 analysis-w2 analysis-coccicheck
+            analysis-clippy analysis-rustfmt analysis-all;
         } // microvms.packages // redpandaUdsTest;
 
         # `nix run .#test-redpanda-uds` (Linux only). Needs root at runtime.

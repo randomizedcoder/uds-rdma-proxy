@@ -17,5 +17,6 @@ pkgs.mkShell {
     echo "  load-kmod        - insmod urp.ko"
     echo "  unload-kmod      - rmmod urp"
     echo "  nix run .#urp-vm - test VM (start/ssh/stop/console/status)"
+    echo "  nix build .#analysis-all -L - static analysis (sparse/smatch/checkpatch/W=1/cocci/clippy)"
   '';
 }
