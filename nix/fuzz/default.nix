@@ -52,6 +52,29 @@ let
       '';
       meta.mainProgram = name;
     };
+  # Live-kernel netlink fuzzer (design 27 F2, S3). A plain standalone
+  # binary -- not libFuzzer -- meant to run INSIDE a sanitizer VM against
+  # the loaded urp module, hammering the genl control plane. Built here so
+  # it can be baked into the microVM rootfs (see nix/microvms/mkVm.nix).
+  netlinkFuzz = pkgs.stdenv.mkDerivation {
+    pname = "urp-netlink-fuzz";
+    version = "0.1.0";
+    src = fuzzSrc;
+    nativeBuildInputs = [ pkgs.clang ];
+    buildPhase = ''
+      runHook preBuild
+      clang -O1 -std=gnu11 -Wall -Wextra \
+        nix/fuzz/netlink_fuzz.c -o netlink_fuzz
+      runHook postBuild
+    '';
+    installPhase = ''
+      runHook preInstall
+      mkdir -p $out/bin
+      cp netlink_fuzz $out/bin/
+      runHook postInstall
+    '';
+    meta.mainProgram = "netlink_fuzz";
+  };
 in
 {
   # RX frame classifier -- the 27.8 disclosure surface.
@@ -60,4 +83,7 @@ in
     harness = "classify_fuzz.c";
     units = [ "kernel/urp_frame.c" ];
   };
+
+  # Live-kernel netlink fuzzer binary (for the microVM rootfs).
+  inherit netlinkFuzz;
 }

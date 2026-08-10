@@ -503,6 +503,25 @@ in rec {
       echo ""
 
       # -----------------------------------------------------------------
+      # Phase 10c — live-kernel netlink fuzz (design 27 F2, S3). Hammer the
+      # genl control plane on vm1 while the module is loaded; the Phase 11b
+      # sanitizer scan then catches any KASAN / BUG the parser trips. The
+      # fuzzer sends random endpoint NAMES, so it does not disturb the real
+      # pair_acceptor / pair_initiator endpoints that teardown removes.
+      # -----------------------------------------------------------------
+      echo "--- Phase 10c: netlink fuzz (vm1, live module) ---"
+      NLFUZZ_SECS=${if sanitizer then "25" else "8"}
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+        "netlink_fuzz $NLFUZZ_SECS 1 2>&1 | tail -3" $((NLFUZZ_SECS + 25)) \
+        > "$RUNDIR/diag/vm1.netlink-fuzz.txt" 2>&1 || true
+      if grep -q NETLINK_FUZZ_DONE "$RUNDIR/diag/vm1.netlink-fuzz.txt" 2>/dev/null; then
+        info "netlink fuzz completed ($(grep -o 'iters=[0-9]*' "$RUNDIR/diag/vm1.netlink-fuzz.txt" | tail -1))"
+      else
+        info "netlink fuzz did not report DONE (check diag/vm1.netlink-fuzz.txt)"
+      fi
+      echo ""
+
+      # -----------------------------------------------------------------
       # Phase 11 — teardown (drain, remove, rmmod), each step timed
       # so the slow command pops out of the verdict table.
       # -----------------------------------------------------------------
