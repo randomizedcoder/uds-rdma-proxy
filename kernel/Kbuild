@@ -2,7 +2,7 @@
 obj-m := urp.o
 urp-y := urp_main.o urp_socket.o urp_rdma.o urp_pump.o urp_proc.o \
 	    urp_endpoint.o urp_netlink.o urp_qp.o urp_srq.o urp_credit.o \
-	    urp_stream.o
+	    urp_stream.o urp_frame.o
 
 # Phase 3a Step 5b: reorder backend selection. Default is the C
 # rbtree implementation; CONFIG_URP_REORDER_RUST=y swaps in the Rust
