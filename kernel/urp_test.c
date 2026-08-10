@@ -533,6 +533,83 @@ static void test_probe_payload_sizes(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, URP_PONG_PAYLOAD_SIZE, 48);
 }
 
+/*
+ * Stream state machine (design 28 E2). Table-drives the full
+ * (state, event) -> (next, actions, accepted) matrix over the pure
+ * urp_stream_next_state(). This is the C half of the differential with
+ * crates/uds-rdma-protocol/src/stream.rs -- the two tables must match
+ * row-for-row. Enumerates all 6 states x 5 events = 30 transitions.
+ */
+static void test_stream_next_state(struct kunit *test)
+{
+#define S(x)   URP_STREAM_STATE_##x
+#define EV(x)  URP_STREAM_EV_##x
+#define A_WR   URP_STREAM_ACT_SHUTDOWN_WR
+#define A_RDWR URP_STREAM_ACT_SHUTDOWN_RDWR
+#define A_DEST URP_STREAM_ACT_DESTROY
+	static const struct {
+		enum urp_stream_state cur;
+		enum urp_stream_event ev;
+		enum urp_stream_state next;
+		u32 actions;
+		bool accepted;
+	} cases[] = {
+		/* RX_SYN: idempotent handshake advance, else reject */
+		{ S(SYN_SENT),     EV(RX_SYN), S(ESTABLISHED), 0, true  },
+		{ S(SYN_RECEIVED), EV(RX_SYN), S(ESTABLISHED), 0, true  },
+		{ S(ESTABLISHED),  EV(RX_SYN), S(ESTABLISHED), 0, true  },
+		{ S(FIN_WAIT),     EV(RX_SYN), S(FIN_WAIT),    0, false },
+		{ S(CLOSE_WAIT),   EV(RX_SYN), S(CLOSE_WAIT),  0, false },
+		{ S(CLOSED),       EV(RX_SYN), S(CLOSED),      0, false },
+		/* RX_FIN: always SHUT_WR; advance EST/FIN_WAIT */
+		{ S(SYN_SENT),     EV(RX_FIN), S(SYN_SENT),     A_WR, true },
+		{ S(SYN_RECEIVED), EV(RX_FIN), S(SYN_RECEIVED), A_WR, true },
+		{ S(ESTABLISHED),  EV(RX_FIN), S(CLOSE_WAIT),   A_WR, true },
+		{ S(FIN_WAIT),     EV(RX_FIN), S(CLOSED),       A_WR, true },
+		{ S(CLOSE_WAIT),   EV(RX_FIN), S(CLOSE_WAIT),   A_WR, true },
+		{ S(CLOSED),       EV(RX_FIN), S(CLOSED),       A_WR, true },
+		/* RX_RST: any -> CLOSED, shutdown RDWR + destroy */
+		{ S(SYN_SENT),     EV(RX_RST), S(CLOSED), A_RDWR | A_DEST, true },
+		{ S(SYN_RECEIVED), EV(RX_RST), S(CLOSED), A_RDWR | A_DEST, true },
+		{ S(ESTABLISHED),  EV(RX_RST), S(CLOSED), A_RDWR | A_DEST, true },
+		{ S(FIN_WAIT),     EV(RX_RST), S(CLOSED), A_RDWR | A_DEST, true },
+		{ S(CLOSE_WAIT),   EV(RX_RST), S(CLOSED), A_RDWR | A_DEST, true },
+		{ S(CLOSED),       EV(RX_RST), S(CLOSED), A_RDWR | A_DEST, true },
+		/* TX_FIN: advance EST->FIN_WAIT, CLOSE_WAIT->CLOSED */
+		{ S(SYN_SENT),     EV(TX_FIN), S(SYN_SENT),     0, true },
+		{ S(SYN_RECEIVED), EV(TX_FIN), S(SYN_RECEIVED), 0, true },
+		{ S(ESTABLISHED),  EV(TX_FIN), S(FIN_WAIT),     0, true },
+		{ S(FIN_WAIT),     EV(TX_FIN), S(FIN_WAIT),     0, true },
+		{ S(CLOSE_WAIT),   EV(TX_FIN), S(CLOSED),       0, true },
+		{ S(CLOSED),       EV(TX_FIN), S(CLOSED),       0, true },
+		/* TX_RST: any -> CLOSED, shutdown RDWR (no destroy) */
+		{ S(SYN_SENT),     EV(TX_RST), S(CLOSED), A_RDWR, true },
+		{ S(SYN_RECEIVED), EV(TX_RST), S(CLOSED), A_RDWR, true },
+		{ S(ESTABLISHED),  EV(TX_RST), S(CLOSED), A_RDWR, true },
+		{ S(FIN_WAIT),     EV(TX_RST), S(CLOSED), A_RDWR, true },
+		{ S(CLOSE_WAIT),   EV(TX_RST), S(CLOSED), A_RDWR, true },
+		{ S(CLOSED),       EV(TX_RST), S(CLOSED), A_RDWR, true },
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		struct urp_stream_transition t =
+			urp_stream_next_state(cases[i].cur, cases[i].ev);
+
+		KUNIT_EXPECT_EQ_MSG(test, t.next, cases[i].next,
+				    "case %d: next", i);
+		KUNIT_EXPECT_EQ_MSG(test, t.actions, cases[i].actions,
+				    "case %d: actions", i);
+		KUNIT_EXPECT_EQ_MSG(test, (int)t.accepted, (int)cases[i].accepted,
+				    "case %d: accepted", i);
+	}
+#undef S
+#undef EV
+#undef A_WR
+#undef A_RDWR
+#undef A_DEST
+}
+
 /* ---- Test suite registration ---- */
 
 static struct kunit_case urp_test_cases[] = {
@@ -569,6 +646,8 @@ static struct kunit_case urp_test_cases[] = {
 	KUNIT_CASE(test_probe_ping_roundtrip),
 	KUNIT_CASE(test_probe_pong_echoes_ping),
 	KUNIT_CASE(test_probe_payload_sizes),
+	/* design 28 E2: stream state machine */
+	KUNIT_CASE(test_stream_next_state),
 	{}
 };
 
