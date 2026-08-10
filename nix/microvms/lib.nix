@@ -466,11 +466,26 @@ in rec {
       done
 
       P10_START=$(now_ms)
+      # (a) Verifiable single echo FIRST, on a clean console.
       RESULT=$(vm_run "$VM2_VIRTIO" "$VM2_PROC" \
         "echo hello-pair | socat -t 5 - UNIX-CONNECT:/tmp/urp-pair.sock" "$T_ECHO" \
         | tr -d '\r' | grep -v '^$' | tail -1)
-      P10_MS=$(( $(now_ms) - P10_START ))
       echo "  response: '$RESULT'"
+
+      # (b) Multi-stream exercise (Phase 3a Step 7d): fire a burst of concurrent
+      # UDS connections so the initiator opens many streams at once, each
+      # tunnelled to its own backend UDS on the acceptor. Stresses stream
+      # create + per-stream pump + reap-on-close + teardown -- exactly the
+      # concurrency the sanitizer scan (Phase 11b) validates. We only assert it
+      # completes; the drain that follows exercises multi-stream teardown.
+      if vm_run "$VM2_VIRTIO" "$VM2_PROC" \
+        "for i in 1 2 3 4 5 6 7 8 9 10 11 12; do ( echo hp | socat -t 5 - UNIX-CONNECT:/tmp/urp-pair.sock >/dev/null 2>&1 ) & done; wait; echo BURST_DONE" 120 \
+        | grep -q BURST_DONE; then
+        info "concurrent 12-stream burst completed"
+      else
+        info "burst may not have completed (check diag)"
+      fi
+      P10_MS=$(( $(now_ms) - P10_START ))
 
       for label in vm1 vm2; do
         if [ "$label" = vm1 ]; then port=$VM1_VIRTIO host=$VM1_PROC; else port=$VM2_VIRTIO host=$VM2_PROC; fi

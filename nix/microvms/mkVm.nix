@@ -40,6 +40,10 @@ let
   baseKernelPackages = pkgs.${constants.kernelPackage};
 
   sanitizerKernel = baseKernelPackages.kernel.override {
+    # Tolerate "unused option" config errors (DRM_NOVA, RUST, NOVA_CORE, ...)
+    # that the base nixpkgs 7.1.6 config trips when structuredExtraConfig forces
+    # a config regen. These are unrelated to the KASAN/KMEMLEAK options we add.
+    ignoreConfigErrors = true;
     kernelPatches = baseKernelPackages.kernel.kernelPatches ++ [{
       name = "urp-kasan-kmemleak";
       patch = null;

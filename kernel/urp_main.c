@@ -16,6 +16,8 @@
  * -ENODEV rather than touching half-freed state.
  */
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include "urp.h"
 
 static int __init urp_init(void)
@@ -24,7 +26,7 @@ static int __init urp_init(void)
 
 	ret = urp_endpoint_table_init();
 	if (ret) {
-		pr_err("urp: endpoint table init failed: %d\n", ret);
+		pr_err("endpoint table init failed: %d\n", ret);
 		return ret;
 	}
 
@@ -34,11 +36,11 @@ static int __init urp_init(void)
 
 	ret = urp_genl_register();
 	if (ret) {
-		pr_err("urp: genl_register_family failed: %d\n", ret);
+		pr_err("genl_register_family failed: %d\n", ret);
 		goto err_proc;
 	}
 
-	pr_info("urp: module loaded (idle; configure via `urp add`)\n");
+	pr_info("module loaded (idle; configure via `urp add`)\n");
 	return 0;
 
 err_proc:
@@ -60,13 +62,13 @@ static void __exit urp_exit(void)
 	urp_endpoint_drain_all();
 	urp_proc_cleanup();
 	urp_endpoint_table_destroy();
-	pr_info("urp: module unloaded\n");
+	pr_info("module unloaded\n");
 }
 
 module_init(urp_init);
 module_exit(urp_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("UDS-RDMA Proxy Contributors");
+MODULE_AUTHOR("Dave Seddon <dave.seddon.ca@gmail.com>");
 MODULE_DESCRIPTION("UDS-RDMA Proxy kernel module");
 MODULE_VERSION("0.0.2");

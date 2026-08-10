@@ -96,6 +96,6 @@ mod cli_tests {
 
     #[test]
     fn clap_renders() {
-        let _ = Cli::command().debug_assert();
+        Cli::command().debug_assert();
     }
 }

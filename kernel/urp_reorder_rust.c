@@ -10,9 +10,9 @@
  * defined by the C rbtree backend, so the rest of the data path
  * doesn't change between the two builds.
  *
- * urp_reorder.h is intentionally backend-agnostic; the build picks
- * either urp_reorder.c (default) or urp_reorder_rust.c (opt-in) via
- * Kbuild's $(CONFIG_URP_REORDER_RUST). The urp_reorder struct
+ * The reorder interface is intentionally backend-agnostic; the build picks
+ * either the C rbtree backend (default) or this Rust shim (opt-in) via
+ * $(CONFIG_URP_REORDER_RUST). The urp_reorder struct
  * pointer is opaque to callers, so we can flip the underlying
  * representation without source changes elsewhere.
  *
@@ -22,6 +22,8 @@
  * are defined here so they live in the same translation unit as the
  * urp_reorder.h facade.
  */
+
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/errno.h>
 #include <linux/printk.h>
@@ -101,7 +103,8 @@ void *urp_kalloc(size_t size, size_t align)
 void urp_kfree(void *ptr, size_t size, size_t align)
 {
 	/* size + align are informational for the Rust side; the kernel
-	 * slab allocator tracks the real allocation itself. */
+	 * slab allocator tracks the real allocation itself.
+	 */
 	(void)size;
 	(void)align;
 	kfree(ptr);
@@ -109,6 +112,15 @@ void urp_kfree(void *ptr, size_t size, size_t align)
 
 void urp_panic_abort(void)
 {
-	pr_err("urp: Rust panic_abort callback invoked\n");
+	/*
+	 * Rust's #[panic_handler] is declared -> ! (never returns), so this
+	 * sink must not return either -- returning would be immediate UB in
+	 * the caller. WARN first so the backtrace is reported through the
+	 * normal warn machinery, then BUG() to satisfy the noreturn
+	 * contract. The Rust reorder backend is panic-free by construction
+	 * (no unwrap/panic! in urp-protocol-ffi); this path is unreachable
+	 * unless that invariant is broken.
+	 */
+	WARN(1, "urp: Rust panic_abort callback invoked\n");
 	BUG();
 }

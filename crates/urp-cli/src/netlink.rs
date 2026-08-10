@@ -12,8 +12,8 @@ use crate::attr::{payload_str, payload_u16, AttrBuf, AttrIter};
 use crate::error::UrpError;
 use crate::uapi::{
     CTRL_ATTR_FAMILY_ID, CTRL_ATTR_FAMILY_NAME, CTRL_ATTR_MCAST_GROUPS, CTRL_ATTR_MCAST_GRP_ID,
-    CTRL_ATTR_MCAST_GRP_NAME, CTRL_CMD_GETFAMILY, GENL_ID_CTRL, NLMSG_DONE, NLMSG_ERROR,
-    NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST, URP_GENL_MCGRP_EVENTS, URP_GENL_NAME, URP_GENL_VERSION,
+    CTRL_ATTR_MCAST_GRP_NAME, CTRL_CMD_GETFAMILY, GENL_ID_CTRL, NLMSG_DONE, NLMSG_ERROR, NLM_F_ACK,
+    NLM_F_DUMP, NLM_F_REQUEST, URP_GENL_MCGRP_EVENTS, URP_GENL_NAME, URP_GENL_VERSION,
 };
 
 const NETLINK_GENERIC: c_int = 16;
@@ -126,10 +126,9 @@ impl UrpSocket {
         let reply = self
             .send_request_raw(GENL_ID_CTRL, CTRL_CMD_GETFAMILY, 1, &payload.into_bytes())
             .map_err(|e| match e {
-                UrpError::Io(io_err) => UrpError::from_errno(
-                    io_err.raw_os_error().unwrap_or(libc::EIO),
-                    "resolve",
-                ),
+                UrpError::Io(io_err) => {
+                    UrpError::from_errno(io_err.raw_os_error().unwrap_or(libc::EIO), "resolve")
+                }
                 other => other,
             })?;
 

@@ -8,6 +8,11 @@ let
       let
         baseName = builtins.baseNameOf path;
       in
+      # Exclude kbuild artifacts that a local `make -C kernel` leaves in
+      # the working tree (urp.mod.c would otherwise match the *.c rule
+      # below and pollute static-analysis runs).
+      !(pkgs.lib.hasSuffix ".mod.c" baseName) &&
+      (
       # Include Cargo workspace and every member crate. cargo refuses to
       # operate on a workspace whose members are missing -- even if we
       # only invoke it on one crate -- so all member directories must be
@@ -33,7 +38,8 @@ let
       (baseName == "Kbuild") ||
       (baseName == "Makefile" && pkgs.lib.hasInfix "/kernel" (toString path)) ||
       (pkgs.lib.hasSuffix ".c" baseName) ||
-      (pkgs.lib.hasSuffix ".h" baseName);
+      (pkgs.lib.hasSuffix ".h" baseName)
+      );
   };
 
   # Build urp.ko against a given kernel package. The optional
@@ -104,7 +110,9 @@ let
   };
 in
 {
-  inherit buildUrpKo buildUrpKoWith;
+  # src is consumed by nix/analysis/ (static-analysis targets) so the
+  # analyzers see exactly the sources the module build sees.
+  inherit src buildUrpKo buildUrpKoWith;
 
   # cargo test -- runs all protocol crate tests. Uses rustPlatform.buildRustPackage
   # so cargo dependencies are vendored from Cargo.lock rather than fetched from

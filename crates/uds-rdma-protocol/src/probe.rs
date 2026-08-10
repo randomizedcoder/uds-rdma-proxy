@@ -233,10 +233,7 @@ mod tests {
     fn ping_buffer_too_short() {
         assert_eq!(
             PingPayload::decode(&[0u8; 31]),
-            Err(ProtocolError::BufferTooShort {
-                need: 32,
-                have: 31
-            })
+            Err(ProtocolError::BufferTooShort { need: 32, have: 31 })
         );
     }
 
@@ -244,10 +241,7 @@ mod tests {
     fn pong_buffer_too_short() {
         assert_eq!(
             PongPayload::decode(&[0u8; 47]),
-            Err(ProtocolError::BufferTooShort {
-                need: 48,
-                have: 47
-            })
+            Err(ProtocolError::BufferTooShort { need: 48, have: 47 })
         );
     }
 }

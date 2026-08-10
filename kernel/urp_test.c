@@ -133,8 +133,9 @@ static void test_buf_list_init(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, list_empty(&free_list));
 
 	/* Verify FIFO order */
-	i = 0;
 	struct urp_buffer *buf;
+
+	i = 0;
 	list_for_each_entry(buf, &free_list, list) {
 		KUNIT_EXPECT_EQ(test, buf->index, (u32)i);
 		i++;
@@ -196,7 +197,8 @@ static void test_buf_list_exhaustion(struct kunit *test)
 }
 
 /* ---- Credit-state tests (Phase 3a Step 9; mirrors the 8 Rust
- *      uds_rdma_protocol::credit unit tests) ---- */
+ *      uds_rdma_protocol::credit unit tests) ----
+ */
 
 static void test_credit_initial_state(struct kunit *test)
 {
@@ -299,7 +301,8 @@ static void test_credit_initial_zero(struct kunit *test)
 }
 
 /* ---- Reorder buffer tests (Phase 3a Step 9; mirrors the 8 Rust
- *      uds_rdma_protocol::reorder unit tests against the C backend) ---- */
+ *      uds_rdma_protocol::reorder unit tests against the C backend) ----
+ */
 
 static void test_reorder_in_order(struct kunit *test)
 {
@@ -469,7 +472,8 @@ static void test_qp_select_returns_null_when_none_ready(struct kunit *test)
 
 	ep.num_qps = 2;
 	ep.qps = qps;
-	qps[0].ep = qps[1].ep = &ep;
+	qps[0].ep = &ep;
+	qps[1].ep = &ep;
 	atomic_set(&ep.rr_counter, 0);
 
 	picked = urp_qp_select_round_robin(&ep);
@@ -523,7 +527,8 @@ static void test_probe_pong_echoes_ping(struct kunit *test)
 static void test_probe_payload_sizes(struct kunit *test)
 {
 	/* Wire-format size constants must match the Rust reference impl
-	 * (uds_rdma_protocol::constants::{PING,PONG}_PAYLOAD_SIZE). */
+	 * (uds_rdma_protocol::constants::{PING,PONG}_PAYLOAD_SIZE).
+	 */
 	KUNIT_EXPECT_EQ(test, URP_PING_PAYLOAD_SIZE, 32);
 	KUNIT_EXPECT_EQ(test, URP_PONG_PAYLOAD_SIZE, 48);
 }

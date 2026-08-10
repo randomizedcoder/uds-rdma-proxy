@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * UDS-RDMA Proxy (urp) — UDS socket endpoint
+ * UDS-RDMA Proxy (urp) -- UDS socket endpoint
  *
  * Phase k0: Virtual UDS endpoint (design doc approach D).
  *
@@ -11,6 +11,8 @@
  *   Data arriving from RDMA is forwarded to this connection.
  */
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include "urp.h"
 #include <linux/file.h>
 #include <net/sock.h>
@@ -18,9 +20,15 @@
 /*
  * Accept loop kthread (initiator mode).
  *
- * Waits for a client to connect to the listening UDS socket,
- * then starts the TX/RX pump for that connection. k0 handles
- * only one connection at a time — subsequent accepts are rejected.
+ * Waits for clients to connect to the listening UDS socket. Phase 3a
+ * Step 7d: each accepted connection becomes its own stream (multiplexed
+ * over the shared QP set) rather than the single k0 ep->conn. This is
+ * what lets a real client -- e.g. franz-go, which opens a separate
+ * connection per broker beyond the metadata bootstrap -- work end to end.
+ *
+ * urp_stream_create allocates the next odd stream_id; the per-stream TX
+ * pump (urp_stream_tx_fn) emits a SYN-flagged first frame, which makes
+ * the acceptor open a matching backend UDS for this stream.
  */
 static int urp_accept_thread_fn(void *data)
 {
@@ -29,46 +37,51 @@ static int urp_accept_thread_fn(void *data)
 	int ret;
 
 	while (!kthread_should_stop()) {
+		struct urp_stream *s = NULL;
+
 		ret = kernel_accept(ep->listen_sock, &new_sock, 0);
 		if (ret < 0) {
 			if (ret == -EAGAIN || ret == -ERESTARTSYS)
 				continue;
-			pr_err("urp: accept failed: %d\n", ret);
+			pr_err_ratelimited("accept failed: %d\n", ret);
 			break;
 		}
 
-		if (ep->conn.active) {
-			pr_warn("urp: k0 only supports one connection, rejecting\n");
+		pr_debug("UDS connection accepted\n");
+
+		/* Wait for RDMA to be ready before opening a stream. */
+		if (!ep->connected) {
+			pr_info("waiting for RDMA connection...\n");
+			wait_for_completion_interruptible(&ep->cm_done);
+			if (!ep->connected) {
+				pr_err("RDMA connection failed\n");
+				sock_release(new_sock);
+				new_sock = NULL;
+				continue;
+			}
+		}
+
+		ret = urp_stream_create(ep, 0, &s);
+		if (ret) {
+			pr_err("stream create failed: %d\n", ret);
 			sock_release(new_sock);
 			new_sock = NULL;
 			continue;
 		}
 
-		pr_info("urp: UDS connection accepted\n");
-		ep->conn.uds_sock = new_sock;
-		ep->conn.seq = 0;
-		ep->conn.active = true;
+		/* Ownership of new_sock transfers to the stream; it is
+		 * released by urp_stream_destroy (drain / RST).
+		 */
+		s->uds_sock = new_sock;
+		new_sock = NULL;
 		atomic64_inc(&ep->stats.connections);
 
-		/* Wait for RDMA to be ready before starting pump */
-		if (!ep->connected) {
-			pr_info("urp: waiting for RDMA connection...\n");
-			wait_for_completion_interruptible(&ep->cm_done);
-			if (!ep->connected) {
-				pr_err("urp: RDMA connection failed\n");
-				ep->conn.active = false;
-				sock_release(new_sock);
-				ep->conn.uds_sock = NULL;
-				continue;
-			}
-		}
-
-		ret = urp_pump_start(ep);
+		ret = urp_stream_pump_start(s);
 		if (ret) {
-			pr_err("urp: pump start failed: %d\n", ret);
-			ep->conn.active = false;
-			sock_release(new_sock);
-			ep->conn.uds_sock = NULL;
+			pr_err("stream %u pump start failed: %d\n",
+			       s->id, ret);
+			urp_stream_destroy(ep, s);
+			continue;
 		}
 	}
 
@@ -91,7 +104,7 @@ int urp_stream_connect_uds(struct urp_stream *stream, const char *path)
 
 	ret = sock_create_kern(&init_net, AF_UNIX, SOCK_STREAM, 0, &sock);
 	if (ret) {
-		pr_err("urp: stream %u sock_create_kern failed: %d\n",
+		pr_err("stream %u sock_create_kern failed: %d\n",
 		       stream->id, ret);
 		return ret;
 	}
@@ -105,14 +118,14 @@ int urp_stream_connect_uds(struct urp_stream *stream, const char *path)
 				     strlen(path) + 1,
 			     0);
 	if (ret) {
-		pr_err("urp: stream %u connect to %s failed: %d\n",
+		pr_err("stream %u connect to %s failed: %d\n",
 		       stream->id, path, ret);
 		sock_release(sock);
 		return ret;
 	}
 
 	stream->uds_sock = sock;
-	pr_info("urp: stream %u connected to UDS %s\n", stream->id, path);
+	pr_debug("stream %u connected to UDS %s\n", stream->id, path);
 	return 0;
 }
 
@@ -133,7 +146,7 @@ int urp_connect_uds(struct urp_endpoint *ep, const char *path)
 
 	ret = sock_create_kern(&init_net, AF_UNIX, SOCK_STREAM, 0, &sock);
 	if (ret) {
-		pr_err("urp: sock_create_kern failed: %d\n", ret);
+		pr_err("sock_create_kern failed: %d\n", ret);
 		return ret;
 	}
 
@@ -146,7 +159,7 @@ int urp_connect_uds(struct urp_endpoint *ep, const char *path)
 			     offsetof(struct sockaddr_un, sun_path) + strlen(path) + 1,
 			     0);
 	if (ret) {
-		pr_err("urp: connect to %s failed: %d\n", path, ret);
+		pr_err("connect to %s failed: %d\n", path, ret);
 		sock_release(sock);
 		return ret;
 	}
@@ -156,7 +169,7 @@ int urp_connect_uds(struct urp_endpoint *ep, const char *path)
 	ep->conn.active = true;
 	atomic64_inc(&ep->stats.connections);
 
-	pr_info("urp: connected to UDS %s\n", path);
+	pr_info("connected to UDS %s\n", path);
 	return 0;
 }
 
@@ -171,7 +184,7 @@ static int urp_listen_uds(struct urp_endpoint *ep, const char *path)
 
 	ret = sock_create_kern(&init_net, AF_UNIX, SOCK_STREAM, 0, &sock);
 	if (ret) {
-		pr_err("urp: sock_create_kern failed: %d\n", ret);
+		pr_err("sock_create_kern failed: %d\n", ret);
 		return ret;
 	}
 
@@ -182,14 +195,14 @@ static int urp_listen_uds(struct urp_endpoint *ep, const char *path)
 	ret = kernel_bind(sock, (urp_sockaddr_t *)&addr,
 			  offsetof(struct sockaddr_un, sun_path) + strlen(path) + 1);
 	if (ret) {
-		pr_err("urp: bind to %s failed: %d\n", path, ret);
+		pr_err("bind to %s failed: %d\n", path, ret);
 		sock_release(sock);
 		return ret;
 	}
 
 	ret = kernel_listen(sock, 1);
 	if (ret) {
-		pr_err("urp: listen failed: %d\n", ret);
+		pr_err("listen failed: %d\n", ret);
 		sock_release(sock);
 		return ret;
 	}
@@ -200,20 +213,20 @@ static int urp_listen_uds(struct urp_endpoint *ep, const char *path)
 	if (IS_ERR(ep->accept_thread)) {
 		ret = PTR_ERR(ep->accept_thread);
 		ep->accept_thread = NULL;
-		pr_err("urp: kthread_run failed: %d\n", ret);
+		pr_err("kthread_run failed: %d\n", ret);
 		sock_release(sock);
 		ep->listen_sock = NULL;
 		return ret;
 	}
 
-	pr_info("urp: listening on UDS %s\n", path);
+	pr_info("listening on UDS %s\n", path);
 	return 0;
 }
 
 int urp_socket_init(struct urp_endpoint *ep, const char *path)
 {
 	if (strlen(path) >= URP_PATH_MAX_LEN) {
-		pr_err("urp: path too long: %s\n", path);
+		pr_err("path too long: %s\n", path);
 		return -ENAMETOOLONG;
 	}
 
@@ -226,7 +239,7 @@ int urp_socket_init(struct urp_endpoint *ep, const char *path)
 	 * the RDMA CM ESTABLISHED handler (urp_rdma.c) to avoid racing with
 	 * recv completions.
 	 */
-	pr_info("urp: acceptor waiting for RDMA connection (connect_path=%s)\n", path);
+	pr_info("acceptor waiting for RDMA connection (connect_path=%s)\n", path);
 	return 0;
 }
 

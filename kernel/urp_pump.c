@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * UDS-RDMA Proxy (urp) — TX/RX data pump
+ * UDS-RDMA Proxy (urp) -- TX/RX data pump
  *
  * Phase k0: Simple bidirectional pump.
  *
@@ -10,6 +10,8 @@
  *
  * No reorder buffer, no credits, no multiplexing.
  */
+
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include "urp.h"
 #include <linux/sched.h>
@@ -61,21 +63,26 @@ static int urp_tx_thread_fn(void *data)
 				 * urp_socket_conn_cleanup runs on drain/CM
 				 * disconnect.
 				 *
-				 * Don't `break` out of the kthread function
-				 * here: Linux 7.0.x kthread_stop() WARNs +
-				 * NULL-derefs when called on a kthread that has
-				 * already exited via `return 0` (see
-				 * https://...). Instead, park the kthread on a
-				 * waitqueue tied to kthread_should_stop() so
-				 * the eventual urp_pump_stop() reap is normal.
+				 * Don't `return` out of the kthread function
+				 * here: the task_struct reference that
+				 * urp_pump_stop() passes to kthread_stop() is
+				 * not pinned with get_task_struct(), so a
+				 * self-exited kthread leaves it dangling and
+				 * kthread_stop() hits a refcount underflow
+				 * (observed as refcount_warn_saturate + oops
+				 * on the drain path). Park until
+				 * kthread_should_stop() instead so
+				 * kthread_stop() is the sole terminator.
+				 * Follow-up: pin with get_task_struct() and
+				 * let the pump exit on its own.
 				 */
-				pr_info("urp: peer half-closed write side; pump parking (rx still routes)\n");
+				pr_debug("peer half-closed write side; pump parking (rx still routes)\n");
 				while (!kthread_should_stop())
 					schedule_timeout_interruptible(HZ);
-				pr_info("urp: TX pump stopped\n");
+				pr_info("TX pump stopped\n");
 				return 0;
 			} else if (ret != -ERESTARTSYS && ret != -EAGAIN) {
-				pr_err("urp: kernel_recvmsg failed: %d\n", ret);
+				pr_err_ratelimited("kernel_recvmsg failed: %d\n", ret);
 				conn->active = false;
 			}
 			break;
@@ -138,7 +145,7 @@ static int urp_tx_thread_fn(void *data)
 
 			ret = ib_post_send(qps->qp, &wr, &bad_wr);
 			if (ret) {
-				pr_err("urp: ib_post_send failed: %d\n", ret);
+				pr_err_ratelimited("ib_post_send failed: %d\n", ret);
 				urp_buf_free_send(ep, buf);
 				conn->active = false;
 				break;
@@ -152,7 +159,7 @@ static int urp_tx_thread_fn(void *data)
 		atomic64_inc(&qps->tx_frames);
 	}
 
-	pr_info("urp: TX pump stopped\n");
+	pr_info("TX pump stopped\n");
 	return 0;
 }
 
@@ -165,11 +172,11 @@ int urp_pump_start(struct urp_endpoint *ep)
 		int ret = PTR_ERR(conn->tx_thread);
 
 		conn->tx_thread = NULL;
-		pr_err("urp: kthread_run (tx) failed: %d\n", ret);
+		pr_err("kthread_run (tx) failed: %d\n", ret);
 		return ret;
 	}
 
-	pr_info("urp: pump started\n");
+	pr_info("pump started\n");
 	return 0;
 }
 
@@ -184,7 +191,7 @@ void urp_pump_stop(struct urp_endpoint *ep)
 		conn->tx_thread = NULL;
 	}
 
-	pr_info("urp: pump stopped\n");
+	pr_info("pump stopped\n");
 }
 
 /*
@@ -227,14 +234,18 @@ static int urp_stream_tx_fn(void *data)
 		if (ret <= 0) {
 			urp_buf_free_send(ep, buf);
 			if (ret == 0)
-				pr_info("urp: stream %u UDS closed by peer\n",
-					stream->id);
+				pr_debug("stream %u UDS closed by peer\n",
+					 stream->id);
 			else if (ret != -ERESTARTSYS && ret != -EAGAIN)
-				pr_err("urp: stream %u recvmsg failed: %d\n",
-				       stream->id, ret);
-			/* The stream goes to FIN_WAIT; full teardown happens
-			 * in the drain path. */
+				pr_err_ratelimited("stream %u recvmsg failed: %d\n",
+						   stream->id, ret);
 			urp_stream_tx_fin(stream);
+			/* Mark reapable and stop reading, but do NOT return --
+			 * continue to the park loop below so kthread_stop()
+			 * (from urp_stream_destroy) remains the sole terminator.
+			 */
+			WRITE_ONCE(stream->tx_done, true);
+			atomic_inc(&ep->pending_reap);
 			break;
 		}
 
@@ -260,7 +271,8 @@ static int urp_stream_tx_fn(void *data)
 		}
 
 		/* Step 4b: per-stream credit consume (best-effort, same
-		 * rules as the legacy ep->conn pump above). */
+		 * rules as the legacy ep->conn pump above).
+		 */
 		if (urp_credit_consume(&stream->credit) == -EAGAIN)
 			atomic64_inc(&ep->stats.credit_stalls);
 
@@ -278,8 +290,8 @@ static int urp_stream_tx_fn(void *data)
 
 			ret = ib_post_send(qps->qp, &wr, &bad_wr);
 			if (ret) {
-				pr_err("urp: stream %u ib_post_send failed: %d\n",
-				       stream->id, ret);
+				pr_err_ratelimited("stream %u ib_post_send failed: %d\n",
+						   stream->id, ret);
 				urp_buf_free_send(ep, buf);
 				break;
 			}
@@ -287,11 +299,21 @@ static int urp_stream_tx_fn(void *data)
 
 		atomic64_add(len, &ep->stats.tx_bytes);
 		atomic64_inc(&ep->stats.tx_frames);
+		atomic64_add(len, &stream->tx_bytes);
 		atomic64_add(len, &qps->tx_bytes);
 		atomic64_inc(&qps->tx_frames);
 	}
 
-	pr_info("urp: stream %u TX pump stopped\n", stream->id);
+	/* Park until kthread_stop(). We deliberately never return on our own:
+	 * that would let the task_struct be reaped before urp_stream_destroy's
+	 * kthread_stop() runs, underflowing its refcount. urp_stream_destroy
+	 * shuts the UDS before kthread_stop(), so the recvmsg above unblocks
+	 * and we land here promptly. tx_done was set on the EOF path.
+	 */
+	while (!kthread_should_stop())
+		schedule_timeout_interruptible(msecs_to_jiffies(100));
+
+	pr_debug("stream %u TX pump stopped\n", stream->id);
 	return 0;
 }
 
@@ -305,7 +327,7 @@ int urp_stream_pump_start(struct urp_stream *stream)
 		int ret = PTR_ERR(stream->tx_thread);
 
 		stream->tx_thread = NULL;
-		pr_err("urp: stream %u kthread_run failed: %d\n",
+		pr_err("stream %u kthread_run failed: %d\n",
 		       stream->id, ret);
 		return ret;
 	}
@@ -357,14 +379,15 @@ static int urp_emit_ping_on(struct urp_endpoint *ep, struct urp_qp *qps)
 	 * count a miss. On URP_QP_MISS_THRESHOLD consecutive misses
 	 * demote the QP to DRAINING -- urp_qp_select_round_robin
 	 * stops dispatching there until it recovers. PONGs reset
-	 * last_ping_ns and consecutive_misses (see urp_recv_done). */
+	 * last_ping_ns and consecutive_misses (see urp_recv_done).
+	 */
 	if (qps->last_ping_ns) {
 		qps->consecutive_misses++;
 		qps->consecutive_pongs = 0;
 		if (qps->consecutive_misses >= URP_QP_MISS_THRESHOLD &&
 		    qps->health == URP_QP_STATE_ACTIVE) {
 			qps->health = URP_QP_STATE_DRAINING;
-			pr_warn("urp: QP %u demoted to DRAINING after %u misses\n",
+			pr_warn("QP %u demoted to DRAINING after %u misses\n",
 				qps->index, qps->consecutive_misses);
 		}
 	}
@@ -399,7 +422,7 @@ static int urp_emit_ping_on(struct urp_endpoint *ep, struct urp_qp *qps)
 
 	ret = ib_post_send(qps->qp, &wr, &bad_wr);
 	if (ret) {
-		pr_warn_ratelimited("urp: PING post_send on qp %u failed: %d\n",
+		pr_warn_ratelimited("PING post_send on qp %u failed: %d\n",
 				    qps->index, ret);
 		urp_buf_free_send(ep, buf);
 		return ret;
@@ -487,7 +510,7 @@ int urp_emit_pong_on(struct urp_endpoint *ep, struct ib_qp *qp,
 
 	ret = ib_post_send(qp, &wr, &bad_wr);
 	if (ret) {
-		pr_warn_ratelimited("urp: PONG post_send failed: %d\n", ret);
+		pr_warn_ratelimited("PONG post_send failed: %d\n", ret);
 		urp_buf_free_send(ep, buf);
 		return ret;
 	}
@@ -526,7 +549,7 @@ int urp_emit_credit_frame(struct urp_endpoint *ep, struct urp_qp *qps,
 
 	ret = ib_post_send(qps->qp, &wr, &bad_wr);
 	if (ret) {
-		pr_warn("urp: CREDIT frame post_send failed: %d\n", ret);
+		pr_warn_ratelimited("CREDIT frame post_send failed: %d\n", ret);
 		urp_buf_free_send(ep, buf);
 		return ret;
 	}

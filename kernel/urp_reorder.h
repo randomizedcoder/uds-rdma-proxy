@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * urp_reorder.h -- backend-agnostic interface for the per-stream
- *                  multi-QP reorder buffer.
+ * Backend-agnostic interface for the per-stream multi-QP reorder
+ * buffer.
  *
  * Phase 3a Step 5 introduces this interface. The default backend is a
  * native C rbtree-based implementation in kernel/urp_reorder.c.  Step 5b

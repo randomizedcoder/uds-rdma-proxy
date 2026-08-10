@@ -42,6 +42,11 @@ fn protocol_err_to_errno(e: &ProtocolError) -> c_int {
 }
 
 /// Allocate a new reorder buffer. Returns null on allocation failure.
+///
+/// # Safety
+///
+/// Always safe to call; the returned pointer must be released with
+/// [`urp_rust_reorder_free`] exactly once.
 #[no_mangle]
 pub unsafe extern "C" fn urp_rust_reorder_new(
     initial_expected: u64,
@@ -56,6 +61,11 @@ pub unsafe extern "C" fn urp_rust_reorder_new(
 
 /// Free a reorder buffer previously returned by `urp_rust_reorder_new`.
 /// `rb` must not be used afterwards. Passing null is a no-op.
+///
+/// # Safety
+///
+/// `rb` must be null or a pointer obtained from [`urp_rust_reorder_new`]
+/// that has not already been freed.
 #[no_mangle]
 pub unsafe extern "C" fn urp_rust_reorder_free(rb: *mut UrpRustReorder) {
     if rb.is_null() {
@@ -77,6 +87,11 @@ pub unsafe extern "C" fn urp_rust_reorder_free(rb: *mut UrpRustReorder) {
 ///   the buffer.
 /// * `-ENOBUFS` if the buffer is at capacity.
 /// * `-ENOMEM` if the internal copy allocation fails.
+///
+/// # Safety
+///
+/// `rb` must be null or a live pointer from [`urp_rust_reorder_new`];
+/// `data` must be null or valid for reads of `data_len` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn urp_rust_reorder_insert(
     rb: *mut UrpRustReorder,
@@ -134,6 +149,12 @@ pub unsafe extern "C" fn urp_rust_reorder_insert(
 /// * On argument errors: returns `-EINVAL`.
 ///
 /// `out_data` may be null only if `*inout_len` is 0 (used to peek the size).
+///
+/// # Safety
+///
+/// `rb` must be null or a live pointer from [`urp_rust_reorder_new`].
+/// `out_seq` and `inout_len` must be null or valid for writes; `out_data`
+/// must be valid for writes of `*inout_len` bytes when non-null.
 #[no_mangle]
 pub unsafe extern "C" fn urp_rust_reorder_drain_next(
     rb: *mut UrpRustReorder,
@@ -172,10 +193,12 @@ pub unsafe extern "C" fn urp_rust_reorder_drain_next(
 }
 
 /// Returns the next expected sequence number for in-order delivery.
+///
+/// # Safety
+///
+/// `rb` must be null or a live pointer from [`urp_rust_reorder_new`].
 #[no_mangle]
-pub unsafe extern "C" fn urp_rust_reorder_next_expected(
-    rb: *const UrpRustReorder,
-) -> u64 {
+pub unsafe extern "C" fn urp_rust_reorder_next_expected(rb: *const UrpRustReorder) -> u64 {
     if rb.is_null() {
         return 0;
     }
@@ -183,10 +206,12 @@ pub unsafe extern "C" fn urp_rust_reorder_next_expected(
 }
 
 /// Returns the number of frames currently buffered out-of-order (gap count).
+///
+/// # Safety
+///
+/// `rb` must be null or a live pointer from [`urp_rust_reorder_new`].
 #[no_mangle]
-pub unsafe extern "C" fn urp_rust_reorder_gap_count(
-    rb: *const UrpRustReorder,
-) -> usize {
+pub unsafe extern "C" fn urp_rust_reorder_gap_count(rb: *const UrpRustReorder) -> usize {
     if rb.is_null() {
         return 0;
     }
@@ -195,10 +220,12 @@ pub unsafe extern "C" fn urp_rust_reorder_gap_count(
 
 /// Returns the number of frames waiting in the drain queue
 /// (delivered-but-not-yet-popped).
+///
+/// # Safety
+///
+/// `rb` must be null or a live pointer from [`urp_rust_reorder_new`].
 #[no_mangle]
-pub unsafe extern "C" fn urp_rust_reorder_drain_pending(
-    rb: *const UrpRustReorder,
-) -> usize {
+pub unsafe extern "C" fn urp_rust_reorder_drain_pending(rb: *const UrpRustReorder) -> usize {
     if rb.is_null() {
         return 0;
     }

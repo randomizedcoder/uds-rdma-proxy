@@ -33,7 +33,10 @@ mod tests {
     fn round_robin_distributes() {
         let num_qps = 4;
         for seq in 0u64..8 {
-            assert_eq!(qp_select_round_robin(seq, num_qps), (seq as usize) % num_qps);
+            assert_eq!(
+                qp_select_round_robin(seq, num_qps),
+                (seq as usize) % num_qps
+            );
         }
     }
 

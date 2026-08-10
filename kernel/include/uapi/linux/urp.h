@@ -77,6 +77,7 @@ enum urp_cmd {
 	URP_CMD_GET_ENDPOINT	= 4,
 	__URP_CMD_MAX,
 };
+
 #define URP_CMD_MAX (__URP_CMD_MAX - 1)
 
 /* Top-level attributes */
@@ -85,6 +86,7 @@ enum urp_attr {
 	URP_A_ENDPOINT		= 1,	/* NLA_NESTED -- endpoint attrs */
 	__URP_A_MAX,
 };
+
 #define URP_A_MAX (__URP_A_MAX - 1)
 
 /*
@@ -106,8 +108,10 @@ enum urp_endpoint_attr {
 	URP_ENDPOINT_A_NAME		= 1,	/* NLA_NUL_STRING, max 16 */
 	URP_ENDPOINT_A_LISTEN_PATH	= 2,	/* NLA_NUL_STRING, max 108 (initiator UDS path) */
 	URP_ENDPOINT_A_CONNECT_PATH	= 3,	/* NLA_NUL_STRING, max 108 (acceptor UDS path) */
-	URP_ENDPOINT_A_RDMA_DEVICE	= 4,	/* NLA_NUL_STRING, max 64 -- e.g. "mlx5_0". Optional, auto-pick if absent */
-	URP_ENDPOINT_A_PEER_ADDR	= 5,	/* NLA_BINARY, exact 28 bytes (struct sockaddr_in6) -- initiator target */
+	/* NLA_NUL_STRING, max 64 -- e.g. "mlx5_0"; optional, auto-pick if absent */
+	URP_ENDPOINT_A_RDMA_DEVICE	= 4,
+	/* NLA_BINARY, exact 28 bytes (struct sockaddr_in6) -- initiator target */
+	URP_ENDPOINT_A_PEER_ADDR	= 5,
 	URP_ENDPOINT_A_BIND_ADDR	= 6,	/* NLA_BINARY, exact 28 bytes -- acceptor bind */
 	URP_ENDPOINT_A_NUM_QPS		= 7,	/* NLA_U32, range 1..32 */
 	URP_ENDPOINT_A_BUFFER_COUNT	= 8,	/* NLA_U32, min 16 */
@@ -124,6 +128,7 @@ enum urp_endpoint_attr {
 
 	__URP_ENDPOINT_A_MAX,
 };
+
 #define URP_ENDPOINT_A_MAX (__URP_ENDPOINT_A_MAX - 1)
 
 /* QP attributes (nested array inside URP_ENDPOINT_A_QPS) */
@@ -138,6 +143,7 @@ enum urp_qp_attr {
 	URP_QP_A_RX_FRAMES	= 7,	/* NLA_U64 */
 	__URP_QP_A_MAX,
 };
+
 #define URP_QP_A_MAX (__URP_QP_A_MAX - 1)
 
 /* Stream attributes (nested array inside URP_ENDPOINT_A_STREAMS) */
@@ -152,6 +158,7 @@ enum urp_stream_attr {
 	URP_STREAM_A_CREDITS_REMOTE	= 7,	/* NLA_U16 */
 	__URP_STREAM_A_MAX,
 };
+
 #define URP_STREAM_A_MAX (__URP_STREAM_A_MAX - 1)
 
 /* Aggregate stats attributes (nested inside URP_ENDPOINT_A_STATS) */
@@ -169,6 +176,7 @@ enum urp_stats_attr {
 	URP_STATS_A_AUTH_FAILURES	= 10,	/* NLA_U64 */
 	__URP_STATS_A_MAX,
 };
+
 #define URP_STATS_A_MAX (__URP_STATS_A_MAX - 1)
 
 /* Endpoint lifecycle states */
@@ -179,6 +187,7 @@ enum urp_endpoint_state {
 	URP_STATE_STOPPED	= 3,	/* All resources released, ready for removal */
 	__URP_STATE_MAX,
 };
+
 #define URP_STATE_MAX (__URP_STATE_MAX - 1)
 
 /* QP state (Phase 3 will populate; k0 reports ACTIVE for the single QP) */
@@ -189,6 +198,7 @@ enum urp_qp_state {
 	URP_QP_STATE_REMOVED	= 3,
 	__URP_QP_STATE_MAX,
 };
+
 #define URP_QP_STATE_MAX (__URP_QP_STATE_MAX - 1)
 
 /* Stream state (Phase 3 multiplexing; k0 emits ESTABLISHED if connected) */
@@ -201,6 +211,7 @@ enum urp_stream_state {
 	URP_STREAM_STATE_CLOSED		= 5,
 	__URP_STREAM_STATE_MAX,
 };
+
 #define URP_STREAM_STATE_MAX (__URP_STREAM_STATE_MAX - 1)
 
 #endif /* _UAPI_LINUX_URP_H */

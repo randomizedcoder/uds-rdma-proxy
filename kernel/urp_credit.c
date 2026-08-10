@@ -45,7 +45,8 @@ void urp_credit_grant(struct urp_credit *cs, u16 n)
 	u32 sum = (u32)cs->send_credits + (u32)n;
 
 	/* Saturating add: match the Rust impl's overflow behavior so the
-	 * KUnit/Rust diff suite stays clean. */
+	 * KUnit/Rust diff suite stays clean.
+	 */
 	cs->send_credits = sum > U16_MAX ? U16_MAX : (u16)sum;
 }
 

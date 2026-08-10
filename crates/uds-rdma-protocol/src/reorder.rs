@@ -161,10 +161,7 @@ mod tests {
 
         // Insert 1 (fills gap, drains 1, 2, 3)
         let r = rb.insert(1, vec![1]).unwrap();
-        assert_eq!(
-            r.delivered,
-            vec![(1, vec![1]), (2, vec![2]), (3, vec![3])]
-        );
+        assert_eq!(r.delivered, vec![(1, vec![1]), (2, vec![2]), (3, vec![3])]);
         assert_eq!(rb.next_expected(), 4);
         assert!(rb.is_empty());
     }

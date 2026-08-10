@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * UDS-RDMA Proxy (urp) — RDMA connection management
+ * UDS-RDMA Proxy (urp) -- RDMA connection management
  *
  * Phase k0: Single QP, simple free-list buffer pool, RDMA CM connection.
  *
@@ -9,6 +9,8 @@
  *
  * Buffer pool: URP_NUM_BUFS pages, DMA-mapped, split into send and recv pools.
  */
+
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include "urp.h"
 #include <linux/inet.h>
@@ -19,9 +21,22 @@
  * net/page_pool.h. Detect the split via __has_include so we don't hinge
  * on an exact version boundary. The page_pool_params fields and the
  * create / dev_alloc_pages / put_page / destroy calls we use are present
- * in both layouts.
+ * in both layouts. sparse (__CHECKER__) cannot lex
+ * __has_include(<...>), so it takes an explicit version-gate branch;
+ * real compilers keep the exact-header probe.
  */
-#if defined(__has_include) && __has_include(<net/page_pool/helpers.h>)
+#if defined(__CHECKER__)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#define URP_HAVE_SPLIT_PAGE_POOL 1
+#endif
+#elif defined(__has_include)
+#if __has_include(<net/page_pool/helpers.h>)
+#define URP_HAVE_SPLIT_PAGE_POOL 1
+#endif
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#define URP_HAVE_SPLIT_PAGE_POOL 1
+#endif
+#ifdef URP_HAVE_SPLIT_PAGE_POOL
 #include <net/page_pool/helpers.h>
 #include <net/page_pool/types.h>
 #else
@@ -38,7 +53,7 @@
  * PP_FLAG_DMA_MAP calls under the covers). For hardware RDMA NICs the
  * two paths happen to be equivalent, but doing it this way keeps the
  * rxe-based test environment working unchanged -- this was the plan's
- * "primary k2 engineering risk" (Plan §4.1) and the answer is
+ * "primary k2 engineering risk" (Plan section 4.1) and the answer is
  * "page_pool for page lifecycle, ib_dma_map_page for the mapping."
  *
  * Hot-path callers (urp_buf_alloc_send/recv) are unchanged: pages are
@@ -81,7 +96,7 @@ static int urp_bufs_init(struct urp_endpoint *ep, struct ib_device *dev)
 		int ret = PTR_ERR(ep->page_pool);
 
 		ep->page_pool = NULL;
-		pr_err("urp: page_pool_create failed: %d\n", ret);
+		pr_err("page_pool_create failed: %d\n", ret);
 		return ret;
 	}
 
@@ -91,7 +106,7 @@ static int urp_bufs_init(struct urp_endpoint *ep, struct ib_device *dev)
 		buf->index = i;
 		buf->page = page_pool_dev_alloc_pages(ep->page_pool);
 		if (!buf->page) {
-			pr_err("urp: page_pool_dev_alloc_pages failed for buf %d\n", i);
+			pr_err("page_pool_dev_alloc_pages failed for buf %d\n", i);
 			goto err;
 		}
 
@@ -99,7 +114,7 @@ static int urp_bufs_init(struct urp_endpoint *ep, struct ib_device *dev)
 		buf->dma_addr = ib_dma_map_page(dev, buf->page, 0,
 						URP_BUF_SIZE, DMA_BIDIRECTIONAL);
 		if (ib_dma_mapping_error(dev, buf->dma_addr)) {
-			pr_err("urp: ib_dma_map_page failed for buf %d\n", i);
+			pr_err("ib_dma_map_page failed for buf %d\n", i);
 			page_pool_put_page(ep->page_pool, buf->page, -1, false);
 			buf->page = NULL;
 			goto err;
@@ -247,13 +262,13 @@ int urp_post_recv_for_qp(struct urp_endpoint *ep, struct ib_qp *qp, u32 count)
 		ret = urp_post_recv(ep, qp, buf);
 		if (ret) {
 			urp_buf_free_recv(ep, buf);
-			pr_err("urp: post_recv failed: %d\n", ret);
+			pr_err("post_recv failed: %d\n", ret);
 			return ret;
 		}
 		posted++;
 	}
 
-	pr_info("urp: posted %u recv buffers to QP\n", posted);
+	pr_info("posted %u recv buffers to QP\n", posted);
 	return 0;
 }
 
@@ -289,7 +304,7 @@ void urp_connect_work_fn(struct work_struct *w)
 
 	ret = rdma_connect(qp->cm_id, &param);
 	if (ret)
-		pr_err("urp: rdma_connect failed on qp %u: %d\n",
+		pr_err("rdma_connect failed on qp %u: %d\n",
 		       qp->index, ret);
 }
 
@@ -317,7 +332,7 @@ static int urp_endpoint_setup_shared(struct urp_endpoint *ep,
 	if (IS_ERR(ep->pd)) {
 		ret = PTR_ERR(ep->pd);
 		ep->pd = NULL;
-		pr_err("urp: ib_alloc_pd failed: %d\n", ret);
+		pr_err("ib_alloc_pd failed: %d\n", ret);
 		return ret;
 	}
 
@@ -339,7 +354,7 @@ static int urp_endpoint_setup_shared(struct urp_endpoint *ep,
 	if (IS_ERR(ep->send_cq)) {
 		ret = PTR_ERR(ep->send_cq);
 		ep->send_cq = NULL;
-		pr_err("urp: ib_alloc_cq (send) failed: %d\n", ret);
+		pr_err("ib_alloc_cq (send) failed: %d\n", ret);
 		goto err_bufs;
 	}
 
@@ -347,7 +362,7 @@ static int urp_endpoint_setup_shared(struct urp_endpoint *ep,
 	if (IS_ERR(ep->recv_cq)) {
 		ret = PTR_ERR(ep->recv_cq);
 		ep->recv_cq = NULL;
-		pr_err("urp: ib_alloc_cq (recv) failed: %d\n", ret);
+		pr_err("ib_alloc_cq (recv) failed: %d\n", ret);
 		goto err_send_cq;
 	}
 
@@ -396,7 +411,7 @@ static int urp_qp_create_on_cm_id(struct urp_endpoint *ep,
 
 	ret = rdma_create_qp(cm_id, ep->pd, &attr);
 	if (ret) {
-		pr_err("urp: rdma_create_qp[%u] failed: %d\n", qp_index, ret);
+		pr_err("rdma_create_qp[%u] failed: %d\n", qp_index, ret);
 		return ret;
 	}
 
@@ -406,20 +421,7 @@ static int urp_qp_create_on_cm_id(struct urp_endpoint *ep,
 }
 
 /*
- * Post the per-QP slice of recv buffers. Step 3 will replace this with
- * SRQ-based watermark refill; until then each QP owns roughly
- * (recv_pool_size / num_qps) buffers on its dedicated RQ.
- */
-static u32 urp_recvs_per_qp(struct urp_endpoint *ep)
-{
-	u32 recv_pool = URP_NUM_BUFS / 2;
-	u32 per_qp = recv_pool / ep->num_qps;
-
-	return per_qp ? per_qp : 1;
-}
-
-/*
- * CQ completion callbacks — wired up after connection is established.
+ * CQ completion callbacks -- wired up after connection is established.
  * These are called from ib_poll_cq workqueue context.
  */
 void urp_send_done(struct ib_cq *cq, struct ib_wc *wc)
@@ -428,8 +430,8 @@ void urp_send_done(struct ib_cq *cq, struct ib_wc *wc)
 	struct urp_endpoint *ep = cq->cq_context;
 
 	if (wc->status != IB_WC_SUCCESS && wc->status != IB_WC_WR_FLUSH_ERR)
-		pr_err("urp: send completion error: %s (%d)\n",
-		       ib_wc_status_msg(wc->status), wc->status);
+		pr_err_ratelimited("send completion error: %s (%d)\n",
+				   ib_wc_status_msg(wc->status), wc->status);
 
 	/*
 	 * Always return the buffer to the pool, including on flush after QP
@@ -444,6 +446,7 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 	struct urp_buffer *buf = container_of(wc->wr_cqe, struct urp_buffer, cqe);
 	struct urp_endpoint *ep = cq->cq_context;
 	struct socket *uds = NULL;
+	struct urp_stream *rx_stream = NULL;
 	struct msghdr msg = {};
 	struct kvec iov;
 	u32 payload_len;
@@ -453,16 +456,27 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 
 	if (wc->status != IB_WC_SUCCESS) {
 		if (wc->status != IB_WC_WR_FLUSH_ERR)
-			pr_err("urp: recv completion error: %s (%d)\n",
-			       ib_wc_status_msg(wc->status), wc->status);
+			pr_err_ratelimited("recv completion error: %s (%d)\n",
+					   ib_wc_status_msg(wc->status), wc->status);
 		/* Return buffer to pool so it can be reposted. */
 		urp_buf_free_recv(ep, buf);
 		return;
 	}
 
+	/*
+	 * NOTE: eager reap-on-close is intentionally NOT done here. Reaping on
+	 * tx_done (client half-closed its write) races an in-flight response:
+	 * `echo X | socat - UNIX-CONNECT` half-closes after sending, so the
+	 * stream would be destroyed before the reply is delivered back, losing
+	 * it. Correct reap-on-close needs the FIN handshake (reap when the PEER
+	 * closes), which is a follow-up. Streams are still reaped safely at
+	 * endpoint drain (urp_streams_destroy_all), so nothing leaks per
+	 * endpoint lifetime. See urp_streams_reap() (retained for that work).
+	 */
+
 	payload_len = urp_frame_decode_payload_len(buf->data);
 	if (payload_len > URP_MAX_PAYLOAD) {
-		pr_err("urp: received oversized frame: %u\n", payload_len);
+		pr_err_ratelimited("received oversized frame: %u\n", payload_len);
 		goto repost;
 	}
 
@@ -523,7 +537,8 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 					 * reset misses. A future Qualifying
 					 * promotion step will use
 					 * consecutive_pongs >= 3 to lift
-					 * the QP to ACTIVE. */
+					 * the QP to ACTIVE.
+					 */
 					q->last_ping_ns = 0;
 					q->consecutive_misses = 0;
 					q->consecutive_pongs++;
@@ -551,12 +566,30 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 			uds = ep->conn.uds_sock;
 	} else {
 		struct urp_stream *s = NULL;
+		bool need_backend = false;
 
 		rcu_read_lock();
 		(void)urp_stream_rx_dispatch(ep, stream_id, flags, &s);
-		if (s)
+		if (s) {
 			uds = s->uds_sock;
+			need_backend = urp_stream_needs_backend(ep, s);
+		}
 		rcu_read_unlock();
+
+		/*
+		 * Acceptor: a freshly SYN'd stream has no backend UDS yet.
+		 * Do the (blocking) connect here, OUTSIDE rcu_read_lock. Safe
+		 * because the recv CQ is IB_POLL_WORKQUEUE (sleepable) and its
+		 * completions are serialized, so `s` cannot be freed between the
+		 * rcu_read_unlock and here (RST frees it, but rx_dispatch returns
+		 * s == NULL for RST, and drain only runs after the data path
+		 * quiesces).
+		 */
+		if (need_backend) {
+			urp_stream_open_backend(s);
+			uds = s->uds_sock;
+		}
+		rx_stream = s;
 	}
 
 	if (!uds) {
@@ -571,14 +604,17 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 
 	ret = kernel_sendmsg(uds, &msg, &iov, 1, payload_len);
 	if (ret < 0) {
-		pr_err("urp: kernel_sendmsg failed: %d\n", ret);
+		pr_err_ratelimited("kernel_sendmsg failed: %d\n", ret);
 	} else {
 		int qp_idx;
 
 		atomic64_add(payload_len, &ep->stats.rx_bytes);
 		atomic64_inc(&ep->stats.rx_frames);
+		if (rx_stream)
+			atomic64_add(payload_len, &rx_stream->rx_bytes);
 		/* Step 8: per-QP RX counters. wc->qp identifies the source
-		 * QP; linear scan is fine for the supported num_qps range. */
+		 * QP; linear scan is fine for the supported num_qps range.
+		 */
 		qp_idx = urp_qp_index_of(ep, wc->qp);
 		if (qp_idx >= 0) {
 			struct urp_qp *qps = &ep->qps[qp_idx];
@@ -670,10 +706,11 @@ static int urp_cm_accept_one(struct rdma_cm_id *child, struct urp_endpoint *ep,
 		if (peer_priv_len < sizeof(ep->auth_priv) ||
 		    memcmp(peer_priv, ep->auth_priv, sizeof(ep->auth_priv))) {
 			atomic64_inc(&ep->stats.auth_failures);
-			pr_warn("urp: rejecting CONNECT_REQUEST with bad/missing PSK\n");
+			pr_warn("rejecting CONNECT_REQUEST with bad/missing PSK\n");
 			rdma_reject(child, NULL, 0, 0);
 			/* Step 9: multicast event so `urp monitor` users see
-			 * auth failures alongside state transitions. */
+			 * auth failures alongside state transitions.
+			 */
 			urp_send_event(ep);
 			return 0;
 		}
@@ -682,7 +719,7 @@ static int urp_cm_accept_one(struct rdma_cm_id *child, struct urp_endpoint *ep,
 	qp_index = (u32)atomic_inc_return(&ep->qps_accepted) - 1;
 	if (qp_index >= ep->num_qps) {
 		atomic_dec(&ep->qps_accepted);
-		pr_warn("urp: rejecting extra CONNECT_REQUEST (%u >= %u QPs)\n",
+		pr_warn("rejecting extra CONNECT_REQUEST (%u >= %u QPs)\n",
 			qp_index, ep->num_qps);
 		rdma_reject(child, NULL, 0, 0);
 		return 0;
@@ -713,8 +750,10 @@ static int urp_cm_accept_one(struct rdma_cm_id *child, struct urp_endpoint *ep,
 	}
 
 	child_ctx = kzalloc(sizeof(*child_ctx), GFP_KERNEL);
-	if (!child_ctx)
-		return -ENOMEM;
+	if (!child_ctx) {
+		ret = -ENOMEM;
+		goto err_release_slot;
+	}
 	child_ctx->ep = ep;
 	child_ctx->qp_index = qp_index;
 	child_ctx->is_listener = false;
@@ -744,13 +783,14 @@ static int urp_cm_accept_one(struct rdma_cm_id *child, struct urp_endpoint *ep,
 		if (!ret)
 			ret = urp_pump_start(ep);
 		if (ret) {
-			pr_err("urp: acceptor data path setup failed: %d\n", ret);
+			pr_err("acceptor data path setup failed: %d\n", ret);
 			goto err_destroy_qp;
 		}
 	}
 
 	/* Recv buffers are pre-posted to ep->srq inside
-	 * urp_endpoint_setup_shared; no per-QP RQ to fill (Step 3). */
+	 * urp_endpoint_setup_shared; no per-QP RQ to fill (Step 3).
+	 */
 
 	param.responder_resources = 1;
 	param.initiator_depth = 1;
@@ -794,7 +834,7 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 	struct urp_endpoint *ep = ctx->ep;
 	int ret = 0;
 
-	pr_info("urp: CM event: %s (%d) [%s qp=%u]\n",
+	pr_info("CM event: %s (%d) [%s qp=%u]\n",
 		rdma_event_msg(event->event), event->event,
 		ctx->is_listener ? "listener" : "qp", ctx->qp_index);
 
@@ -814,14 +854,14 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 	case RDMA_CM_EVENT_ROUTE_RESOLVED:
 		ret = urp_endpoint_setup_shared(ep, id->device);
 		if (ret) {
-			pr_err("urp: setup_shared failed on qp %u: %d\n",
+			pr_err("setup_shared failed on qp %u: %d\n",
 			       ctx->qp_index, ret);
 			break;
 		}
 
 		ret = urp_qp_create_on_cm_id(ep, id, ctx->qp_index);
 		if (ret) {
-			pr_err("urp: qp_create_on_cm_id failed on qp %u: %d\n",
+			pr_err("qp_create_on_cm_id failed on qp %u: %d\n",
 			       ctx->qp_index, ret);
 			break;
 		}
@@ -847,13 +887,14 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 			/* Step 5: skip the probe-driven QUALIFYING grace
 			 * period for now and go straight to ACTIVE. The
 			 * miss-counter in probe_work_fn still demotes to
-			 * DRAINING on >= URP_QP_MISS_THRESHOLD misses. */
+			 * DRAINING on >= URP_QP_MISS_THRESHOLD misses.
+			 */
 			ep->qps[ctx->qp_index].health = URP_QP_STATE_ACTIVE;
 			if ((u32)atomic_inc_return(&ep->qps_connected) ==
 			    ep->num_qps) {
 				ep->connected = true;
 				complete(&ep->cm_done);
-				pr_info("urp: all %u QPs established\n",
+				pr_info("all %u QPs established\n",
 					ep->num_qps);
 			}
 		}
@@ -894,12 +935,12 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 			urp_socket_conn_cleanup(ep);
 		ep->cm_status = event->status;
 		complete(&ep->cm_done);
-		pr_info("urp: QP %u CM down: %s\n", ctx->qp_index,
+		pr_info("QP %u CM down: %s\n", ctx->qp_index,
 			rdma_event_msg(event->event));
 		break;
 
 	default:
-		pr_info("urp: unhandled CM event: %s\n",
+		pr_info("unhandled CM event: %s\n",
 			rdma_event_msg(event->event));
 		break;
 	}
@@ -956,7 +997,7 @@ int urp_rdma_init(struct urp_endpoint *ep, const char *peer_addr,
 
 			ret = urp_make_cm_id(ep, i, false, &id);
 			if (ret) {
-				pr_err("urp: cm_id %u create failed: %d\n",
+				pr_err("cm_id %u create failed: %d\n",
 				       i, ret);
 				goto err_destroy_all;
 			}
@@ -966,7 +1007,7 @@ int urp_rdma_init(struct urp_endpoint *ep, const char *peer_addr,
 			ret = rdma_resolve_addr(id, NULL,
 						(struct sockaddr *)&addr, 2000);
 			if (ret) {
-				pr_err("urp: rdma_resolve_addr[%u] failed: %d\n",
+				pr_err("rdma_resolve_addr[%u] failed: %d\n",
 				       i, ret);
 				goto err_destroy_all;
 			}
@@ -980,23 +1021,23 @@ int urp_rdma_init(struct urp_endpoint *ep, const char *peer_addr,
 
 	ret = urp_make_cm_id(ep, 0, true, &ep->listen_id);
 	if (ret) {
-		pr_err("urp: listener cm_id create failed: %d\n", ret);
+		pr_err("listener cm_id create failed: %d\n", ret);
 		return ret;
 	}
 
 	ret = rdma_bind_addr(ep->listen_id, (struct sockaddr *)&addr);
 	if (ret) {
-		pr_err("urp: rdma_bind_addr failed: %d\n", ret);
+		pr_err("rdma_bind_addr failed: %d\n", ret);
 		goto err_destroy_listen;
 	}
 
 	ret = rdma_listen(ep->listen_id, ep->num_qps);
 	if (ret) {
-		pr_err("urp: rdma_listen failed: %d\n", ret);
+		pr_err("rdma_listen failed: %d\n", ret);
 		goto err_destroy_listen;
 	}
 
-	pr_info("urp: RDMA listening on port %d for %u QPs\n",
+	pr_info("RDMA listening on port %d for %u QPs\n",
 		bind_port, ep->num_qps);
 	return 0;
 

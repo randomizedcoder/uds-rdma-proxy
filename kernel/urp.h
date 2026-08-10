@@ -158,7 +158,7 @@ struct urp_qp {
 	u64			rtt_ewma_ns;
 
 	/*
-	 * Phase 3b Step 5: per-QP health state machine (design 08a §8a.9).
+	 * Phase 3b Step 5: per-QP health state machine (design 08a section 8a.9).
 	 * Values are from UAPI `enum urp_qp_state`
 	 * (QUALIFYING / ACTIVE / DRAINING / REMOVED). For now QPs start
 	 * directly in ACTIVE on RDMA_CM_EVENT_ESTABLISHED (Qualifying is
@@ -222,7 +222,7 @@ struct urp_connection {
  *                     QP set (Phase 3a Step 6).
  *
  * Each accepted UDS connection (Step 7) maps to one stream.  Sequence
- * spaces are per-stream (design 09 §9.6); reorder buffer + credit
+ * spaces are per-stream (design 09 section 9.6); reorder buffer + credit
  * state are per-stream because multi-QP delivery across an endpoint is
  * shared by all of its streams.
  *
@@ -239,11 +239,17 @@ struct urp_stream {
 	u64			tx_seq;		/* next outgoing seq */
 	u64			rx_next;	/* next expected incoming seq */
 
+	atomic64_t		tx_bytes;	/* payload bytes sent on this stream */
+	atomic64_t		rx_bytes;	/* payload bytes delivered to its UDS */
+
 	struct urp_credit	credit;		/* per-stream flow control */
 	struct urp_reorder	*reorder;	/* per-stream reorder buffer */
 
 	struct socket		*uds_sock;	/* this stream's UDS endpoint */
 	struct task_struct	*tx_thread;	/* per-stream TX kthread (Step 7c) */
+	bool			tx_done;	/* TX pump exited (client closed);
+						 * eligible for reap-on-close
+						 */
 
 	struct rhash_head	ht_node;
 	struct rcu_head		rcu;
@@ -269,7 +275,8 @@ struct urp_endpoint {
 	u32			num_qps;		/* mutable via SET */
 	u32			buffer_count;		/* mutable via SET */
 	u32			buffer_size;
-	u8			password[URP_PASSWORD_MAX];	/* raw input from netlink (cfg only) */
+	/* raw PSK input from netlink; used at cfg time only */
+	u8			password[URP_PASSWORD_MAX];
 	bool			has_password;
 	/*
 	 * Phase 3b Step 7: SHA-256(password) lives here once
@@ -320,13 +327,16 @@ struct urp_endpoint {
 	struct rhashtable	streams;	/* keyed by u32 stream_id */
 	bool			streams_inited;
 	atomic_t		next_stream_id;	/* monotonic per-direction allocator */
+	atomic_t		pending_reap;	/* # of tx_done streams awaiting reap;
+						 * swept from the serialized RX path
+						 */
 
 	/* Buffer pool */
 	struct urp_buffer	bufs[URP_NUM_BUFS];
 	struct list_head	send_free;
 	struct list_head	recv_free;
-	spinlock_t		send_lock;
-	spinlock_t		recv_lock;
+	spinlock_t		send_lock;	/* protects send_free */
+	spinlock_t		recv_lock;	/* protects recv_free */
 
 	/* Runtime state */
 	struct urp_stats	stats;
@@ -341,7 +351,8 @@ struct urp_endpoint {
 	/* Phase 3b: per-endpoint probe ticker. Fires every
 	 * URP_PROBE_INTERVAL_MS on the system workqueue, emits one PING
 	 * per established QP, reschedules itself. Cancelled in
-	 * urp_endpoint_drain. */
+	 * urp_endpoint_drain.
+	 */
 	struct delayed_work	probe_work;
 	bool			probe_active;
 
@@ -399,6 +410,11 @@ int  urp_qp_index_of(struct urp_endpoint *ep, struct ib_qp *qp);
 /* urp_stream.c -- stream multiplexing core (Phase 3a Step 6) */
 int  urp_streams_init(struct urp_endpoint *ep);
 void urp_streams_destroy_all(struct urp_endpoint *ep);
+/* Reap tx_done (client-closed) streams. MUST be called only from the
+ * serialized RX completion path (urp_recv_done) so it never races the
+ * lock-free stream lookups there. Cheap no-op when nothing is pending.
+ */
+void urp_streams_reap(struct urp_endpoint *ep);
 u32  urp_stream_next_id(struct urp_endpoint *ep);
 int  urp_stream_create(struct urp_endpoint *ep, u32 stream_id,
 		       struct urp_stream **out_stream);
@@ -414,6 +430,12 @@ void urp_stream_tx_fin(struct urp_stream *s);
 void urp_stream_tx_rst(struct urp_stream *s);
 int  urp_stream_rx_dispatch(struct urp_endpoint *ep, u32 stream_id, u8 flags,
 			    struct urp_stream **out_stream);
+/* Acceptor-side backend-connect split (Step 7d): needs_backend() is a cheap
+ * predicate safe to call under rcu_read_lock; open_backend() does the blocking
+ * kernel_connect and must be called outside it.
+ */
+bool urp_stream_needs_backend(struct urp_endpoint *ep, struct urp_stream *s);
+void urp_stream_open_backend(struct urp_stream *s);
 
 /* urp_pump.c */
 int  urp_pump_start(struct urp_endpoint *ep);
@@ -429,6 +451,11 @@ void urp_probe_work_stop(struct urp_endpoint *ep);
 
 /* CQ completion callbacks (urp_rdma.c) -- used by pump when posting sends */
 void urp_send_done(struct ib_cq *cq, struct ib_wc *wc);
+/* Recv completion for SRQ-posted buffers -- urp_srq.c wires it as the
+ * cqe.done of every SRQ recv; lives in urp_rdma.c beside the buffer
+ * pool helpers it shares with the non-SRQ path.
+ */
+void urp_recv_done_for_srq(struct ib_cq *cq, struct ib_wc *wc);
 
 /* urp_proc.c */
 int  urp_proc_init(void);
@@ -489,7 +516,7 @@ static inline u16 urp_frame_decode_credits(const void *buf)
 }
 
 /*
- * QP health probe wire payloads (Phase 3b, design 08a §8a.2).
+ * QP health probe wire payloads (Phase 3b, design 08a section 8a.2).
  * Carried inside a frame_type == URP_FRAME_TYPE_PROBE frame; flags
  * distinguish PING (0) from PONG (URP_PROBE_FLAG_PONG).
  *
@@ -509,7 +536,7 @@ static inline u16 urp_frame_decode_credits(const void *buf)
  */
 #define URP_PING_PAYLOAD_SIZE	32
 #define URP_PONG_PAYLOAD_SIZE	48
-#define URP_PROBE_FLAG_PONG	(1 << 0)
+#define URP_PROBE_FLAG_PONG	BIT(0)
 
 static inline void urp_ping_encode(void *buf, u32 probe_seq, u16 qp_index,
 				   u64 t_send_mono, u64 t_send_real)
@@ -546,7 +573,8 @@ static inline u64 urp_ping_decode_t_send_real(const void *buf)
 }
 
 /* Encode a PONG by echoing the PING fields and appending responder
- * timestamps. ping must point to the received PING payload. */
+ * timestamps. ping must point to the received PING payload.
+ */
 static inline void urp_pong_encode(void *buf, const void *ping,
 				   u64 t_recv_real, u64 t_pong_mono,
 				   u64 t_pong_real)
@@ -555,7 +583,8 @@ static inline void urp_pong_encode(void *buf, const void *ping,
 	const u8 *q = ping;
 
 	/* Echo PING [0..24) -- probe_seq, qp_index, clock_flags, reserved,
-	 * t_send_mono, t_send_real. */
+	 * t_send_mono, t_send_real.
+	 */
 	memcpy(p, q, 24);
 	put_unaligned_le64(t_recv_real, p + 24);
 	put_unaligned_le64(t_pong_mono, p + 32);
