@@ -154,9 +154,18 @@ paths F0/F1 can't.
    mutation. Oracle: KASAN/KMEMLEAK/lockdep, now also scanned inline per fuzz
    phase (`scan_splat`).
 
-   Still open: **KCOV_TRACE_CMP** operand feedback (config already enabled) for
-   smarter mutation, and — if deeper coverage warrants — real syzkaller with
-   authored `urp.txt` descriptions.
+   **KCOV_TRACE_CMP operand feedback** — **IMPLEMENTED.** The fuzzer
+   periodically re-runs a corpus input under `KCOV_TRACE_CMP` (toggling the
+   shared kcov fd's mode), reads the comparison records, and harvests the
+   compile-time constants the kernel checked the input against (`KCOV_CMP_CONST`
+   arg2 — magic numbers, enum values, exact-length gates) into a dictionary. A
+   new mutation injects those constants into attr payloads (u32/u64), so the
+   fuzzer can satisfy value-gated branches it would never guess. Measured
+   effect: the dictionary saturates (`dict=512`) and edge coverage rose from
+   ~3300 to ~3540 in the same 25 s window, KASAN/KMEMLEAK clean.
+
+   Still open: if deeper coverage warrants, real syzkaller with authored
+   `urp.txt` descriptions (this in-house engine is the pragmatic substitute).
 
 1b. **Concurrent netlink racer** (S3 concurrency) — **IMPLEMENTED**
    (`nix/fuzz/netlink_race.c`, Phase 10c3): the coverage-guided fuzzer is
