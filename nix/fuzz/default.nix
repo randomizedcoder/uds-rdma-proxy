@@ -155,6 +155,15 @@ in
     units = [ "kernel/urp_frame.c" ];
   };
 
+  # RX decision pipeline as a SEQUENCE: classify -> flag/event dispatch ->
+  # stream state machine, statefully (design 27 item 3). Compiles the real
+  # kernel C (urp_frame.c + urp_stream_sm.c).
+  fuzz-rx-seq = mkCFuzzer {
+    name = "fuzz-rx-seq";
+    harness = "rx_seq_fuzz.c";
+    units = [ "kernel/urp_frame.c" "kernel/urp_stream_sm.c" ];
+  };
+
   # Live-kernel netlink fuzzer binary (for the microVM rootfs).
   inherit netlinkFuzz;
 

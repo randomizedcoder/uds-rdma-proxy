@@ -106,8 +106,25 @@ under ASAN/UBSan — no VM, fast iteration, runs in CI.
 against `nix/fuzz/urp_fuzz_shim.h` under `-fsanitize=fuzzer,address,undefined`.
 First run: 55M execs, full branch coverage, no ASAN/UBSan report, and the
 in-harness §27.8 invariant (never route an overrun frame) held throughout.
+
+The **stateful RX sequence harness** is also **implemented** —
+`nix run .#fuzz-rx-seq` compiles the real `kernel/urp_frame.c` +
+`kernel/urp_stream_sm.c` (the pure state machine `urp_stream_next_state`,
+extracted per E2 into its own dual-compile unit so it fuzzes standalone) and
+drives a *sequence* of frames through classify -> flag/event dispatch ->
+state machine with an in-memory per-stream table. This is the coverage-guided,
+hermetic counterpart to the live wire fuzzer (F2): it reaches the *composition*
+(SYN->RST->DATA on a destroyed stream, id reuse, SYN|RST in one frame,
+interleaved half-closes) that single-function harnesses miss. Oracles:
+ASAN/UBSan + decision invariants (next_state never yields an out-of-range
+state; a rejected event never changes state; the §27.8 overrun guard). First
+run: **6.0M execs in 91 s, no ASAN/UBSan/invariant abort**, corpus still growing.
+
 The remaining targets below (codec truncations, reorder, credit, PSK) reuse
-the same shim + `nix/fuzz/` scaffolding.
+the same shim + `nix/fuzz/` scaffolding. The C reorder backend still needs the
+kernel rbtree bundled (`lib/rbtree.c`) to fuzz standalone -- the one RX piece
+not yet under the userspace harness (the Rust reorder twin is fuzzed via
+cargo-fuzz `reorder_ops`).
 
 The pure, allocator-and-verbs-free C units compile standalone if we stub a
 handful of kernel symbols (`kmalloc`→`malloc`, `kfree`→`free`,
