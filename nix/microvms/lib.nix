@@ -157,6 +157,19 @@ in rec {
       pass() { printf "  %sPASS:%s %s\n" "$GREEN" "$NC" "$1"; }
       fail() { printf "  %sFAIL:%s %s\n" "$RED" "$NC" "$1"; exit 1; }
       info() { printf "  %sINFO:%s %s\n" "$YELLOW" "$NC" "$1"; }
+      # scan_splat <diag-file> <phase-label>: a fuzz phase runs its command on
+      # the VM console, so any kernel splat (KASAN / GP fault / BUG / Oops)
+      # interleaves into the captured output. A crash there must fail the run
+      # inline -- the later Phase 11b dmesg scan can miss it if the crash
+      # wedged the VM (as the SET-num_qps OOB did: the fuzz phase captured the
+      # KASAN report but Phase 11b came back "clean"). Fatal on match.
+      SPLAT_RE='KASAN:|general protection fault|BUG:|Oops:|Kernel panic|use-after-free|slab-out-of-bounds'
+      scan_splat() {
+        if grep -qE "$SPLAT_RE" "$1" 2>/dev/null; then
+          grep -nE "$SPLAT_RE" "$1" | head -6 | awk '{print "    "$0}'
+          fail "$2: kernel splat detected during fuzzing (see $1)"
+        fi
+      }
 
       VM1_PID=""
       VM2_PID=""
@@ -514,10 +527,33 @@ in rec {
       vm_run "$VM1_VIRTIO" "$VM1_PROC" \
         "netlink_fuzz $NLFUZZ_SECS 1 2>&1 | tail -3" $((NLFUZZ_SECS + 25)) \
         > "$RUNDIR/diag/vm1.netlink-fuzz.txt" 2>&1 || true
+      scan_splat "$RUNDIR/diag/vm1.netlink-fuzz.txt" "netlink fuzz"
       if grep -q NETLINK_FUZZ_DONE "$RUNDIR/diag/vm1.netlink-fuzz.txt" 2>/dev/null; then
         info "netlink fuzz completed ($(grep -o 'iters=[0-9]*' "$RUNDIR/diag/vm1.netlink-fuzz.txt" | tail -1))"
       else
         info "netlink fuzz did not report DONE (check diag/vm1.netlink-fuzz.txt)"
+      fi
+      echo ""
+
+      # -----------------------------------------------------------------
+      # Phase 10c2 — KCOV coverage-guided netlink fuzz (design 27 F2, S3).
+      # Same genl control plane, but driven by KCOV coverage feedback so
+      # inputs get pushed past the policy layer into the handler bodies that
+      # blind fuzzing (10c) rarely reaches. Requires the CONFIG_KCOV sanitizer
+      # kernel; on the non-sanitizer kernel it falls back to blind mode (still
+      # runs, just no coverage signal). Oracle is the same Phase 11b scan.
+      # -----------------------------------------------------------------
+      echo "--- Phase 10c2: coverage-guided netlink fuzz (vm1, KCOV) ---"
+      COVFUZZ_SECS=${if sanitizer then "25" else "8"}
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+        "netlink_cov_fuzz $COVFUZZ_SECS 1 2>&1 | tail -4" $((COVFUZZ_SECS + 25)) \
+        > "$RUNDIR/diag/vm1.cov-fuzz.txt" 2>&1 || true
+      scan_splat "$RUNDIR/diag/vm1.cov-fuzz.txt" "coverage-guided netlink fuzz"
+      if grep -q COV_FUZZ_DONE "$RUNDIR/diag/vm1.cov-fuzz.txt" 2>/dev/null; then
+        info "cov fuzz completed ($(grep -o 'execs=[0-9]* corpus=[0-9]* edges=[0-9]*' "$RUNDIR/diag/vm1.cov-fuzz.txt" | tail -1))"
+        info "kcov: $(grep -o 'kcov=[a-z]*' "$RUNDIR/diag/vm1.cov-fuzz.txt" | tail -1)"
+      else
+        info "cov fuzz did not report DONE (check diag/vm1.cov-fuzz.txt)"
       fi
       echo ""
 
@@ -550,6 +586,7 @@ in rec {
         vm_run "$VM2_VIRTIO" "$VM2_PROC" \
           "wire_fuzz $VM1_IP 4792 $WIREFUZZ_SECS 1 2>&1 | tail -4" $((WIREFUZZ_SECS + 25)) \
           > "$RUNDIR/diag/vm2.wire-fuzz.txt" 2>&1 || true
+        scan_splat "$RUNDIR/diag/vm2.wire-fuzz.txt" "wire fuzz"
         if grep -q WIRE_FUZZ_DONE "$RUNDIR/diag/vm2.wire-fuzz.txt" 2>/dev/null; then
           info "wire fuzz completed ($(grep -o 'frames=[0-9]* reconnects=[0-9]*' "$RUNDIR/diag/vm2.wire-fuzz.txt" | tail -1))"
         else

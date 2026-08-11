@@ -513,10 +513,43 @@ static int urp_set_endpoint_doit(struct sk_buff *skb, struct genl_info *info)
 	}
 
 	mutex_lock(&ep->lock);
-	if (tb[URP_ENDPOINT_A_NUM_QPS])
-		ep->num_qps = nla_get_u32(tb[URP_ENDPOINT_A_NUM_QPS]);
-	if (tb[URP_ENDPOINT_A_BUFFER_COUNT])
-		ep->buffer_count = nla_get_u32(tb[URP_ENDPOINT_A_BUFFER_COUNT]);
+	/*
+	 * num_qps and buffer_count are activation-time sizing parameters:
+	 * urp_qps_init() does ep->qps = kcalloc(ep->num_qps, ...) and the
+	 * buffer pool / CQ depth are scaled from buffer_count at setup. Once
+	 * the endpoint is active (ep->qps allocated) these cannot be changed:
+	 * the arrays are not resized, so a larger num_qps makes every
+	 * "for (i = 0; i < ep->num_qps; i++) ep->qps[i]" walk (urp_rdma_cleanup,
+	 * the RX/TX paths) run off the end of the allocation -- a slab
+	 * out-of-bounds / use-after-free that faults in rdma_disconnect(), and
+	 * a smaller value silently leaks the QPs above the new count. The
+	 * coverage-guided netlink fuzzer (design 27 F2) caught this as a KASAN
+	 * OOB in urp_rdma_cleanup on NEW(num_qps=1) + SET(num_qps=8) + DEL.
+	 * A live QP array cannot be safely resized, so refuse: callers must
+	 * remove and re-add the endpoint to change these.
+	 */
+	if (tb[URP_ENDPOINT_A_NUM_QPS]) {
+		u32 want = nla_get_u32(tb[URP_ENDPOINT_A_NUM_QPS]);
+
+		if (ep->qps && want != ep->num_qps) {
+			mutex_unlock(&ep->lock);
+			GENL_SET_ERR_MSG(info,
+					 "num_qps is fixed once the endpoint is active; remove and re-add to change it");
+			return -EBUSY;
+		}
+		ep->num_qps = want;
+	}
+	if (tb[URP_ENDPOINT_A_BUFFER_COUNT]) {
+		u32 want = nla_get_u32(tb[URP_ENDPOINT_A_BUFFER_COUNT]);
+
+		if (ep->qps && want != ep->buffer_count) {
+			mutex_unlock(&ep->lock);
+			GENL_SET_ERR_MSG(info,
+					 "buffer_count is fixed once the endpoint is active; remove and re-add to change it");
+			return -EBUSY;
+		}
+		ep->buffer_count = want;
+	}
 	if (tb[URP_ENDPOINT_A_PASSWORD]) {
 		nla_strscpy((char *)ep->password,
 			    tb[URP_ENDPOINT_A_PASSWORD], URP_PASSWORD_MAX);

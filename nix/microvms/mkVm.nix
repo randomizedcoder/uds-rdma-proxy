@@ -55,6 +55,16 @@ let
         DEBUG_KMEMLEAK_AUTO_SCAN  = lib.mkForce yes;
         DEBUG_KMEMLEAK_DEFAULT_OFF = lib.mkForce no;
         FRAME_WARN         = lib.mkForce (freeform "8192");
+        # KCOV: per-task coverage feedback for the coverage-guided netlink
+        # fuzzer (design 27 F2). Exposes /sys/kernel/debug/kcov; the genl
+        # doit/dumpit handlers run synchronously in the caller's syscall
+        # context, so per-task KCOV captures their edges. KCOV_ENABLE_COMPARISONS
+        # adds KCOV_TRACE_CMP (comparison operands) for smarter mutation.
+        # DEBUG_FS is required for the kcov debugfs node. Instruments all
+        # kernel code -> full rebuild, cached thereafter.
+        KCOV                     = lib.mkForce yes;
+        KCOV_ENABLE_COMPARISONS  = lib.mkForce yes;
+        DEBUG_FS                 = lib.mkForce yes;
       };
     }];
   };
@@ -245,6 +255,9 @@ in
         # Live-kernel netlink fuzzer (design 27 F2). Tiny standalone binary;
         # invoked by the pair harness's fuzz phase against the loaded module.
         (import ../fuzz { inherit pkgs lib; }).netlinkFuzz
+        # KCOV coverage-guided netlink fuzzer (design 27 F2, S3). Needs the
+        # CONFIG_KCOV sanitizer kernel; run in the sanitizer pair test.
+        (import ../fuzz { inherit pkgs lib; }).covFuzz
         # Hostile-peer RDMA wire fuzzer (design 27 F2, S1/S2). Run from the
         # peer VM against the acceptor to fuzz the RX frame path under KASAN.
         (import ../fuzz { inherit pkgs lib; }).wireFuzz
