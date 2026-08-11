@@ -193,7 +193,7 @@
           # Userspace C fuzzers (manual): nix run .#fuzz-classify
           # Live-kernel fuzzers (baked into the pair-test rootfs; exposed here
           # so they build standalone): netlinkFuzz (S3), wireFuzz (S1/S2).
-          inherit (fuzz) fuzz-classify netlinkFuzz covFuzz wireFuzz;
+          inherit (fuzz) fuzz-classify netlinkFuzz covFuzz raceFuzz wireFuzz;
         } // microvms.packages // redpandaUdsTest;
 
         # `nix run .#test-redpanda-uds` (Linux only). Needs root at runtime.
