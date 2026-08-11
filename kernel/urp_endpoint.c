@@ -54,7 +54,12 @@ void urp_endpoint_table_destroy(void)
 	urp_endpoints_inited = false;
 }
 
-struct urp_endpoint *urp_endpoint_lookup(const char *name)
+/*
+ * Raw table lookup -- returns a bare pointer valid only within the caller's
+ * RCU read-side critical section. Internal; external callers use
+ * urp_endpoint_get() so they hold a reference.
+ */
+static struct urp_endpoint *urp_endpoint_lookup(const char *name)
 {
 	char key[URP_NAME_MAX];
 	size_t len;
@@ -73,6 +78,25 @@ struct urp_endpoint *urp_endpoint_lookup(const char *name)
 
 	return rhashtable_lookup_fast(&urp_endpoints, key,
 				      urp_endpoints_params);
+}
+
+/*
+ * Look up an endpoint and take a reference so the returned pointer stays valid
+ * after this returns (the netlink handlers dereference it outside any RCU
+ * section). kref_get_unless_zero() fails if the endpoint's last reference has
+ * already been dropped (it is mid-teardown), in which case we treat it as not
+ * found. Caller must urp_endpoint_put().
+ */
+struct urp_endpoint *urp_endpoint_get(const char *name)
+{
+	struct urp_endpoint *ep;
+
+	rcu_read_lock();
+	ep = urp_endpoint_lookup(name);
+	if (ep && !kref_get_unless_zero(&ep->refcount))
+		ep = NULL;
+	rcu_read_unlock();
+	return ep;
 }
 
 /*
@@ -164,25 +188,31 @@ int urp_endpoint_create(struct urp_endpoint *cfg, struct urp_endpoint **out)
 	ep->state        = URP_STATE_CREATING;
 	mutex_init(&ep->lock);
 	init_completion(&ep->cm_done);
+	/* One reference for the table entry (dropped by urp_endpoint_remove). */
+	kref_init(&ep->refcount);
 
 	mutex_lock(&urp_endpoints_mutex);
 	ret = rhashtable_lookup_insert_fast(&urp_endpoints, &ep->ht_node,
 					    urp_endpoints_params);
 	mutex_unlock(&urp_endpoints_mutex);
 	if (ret) {
+		/* Never published; no other reference exists -> free directly. */
 		mutex_destroy(&ep->lock);
 		kfree(ep);
 		return ret == -EEXIST ? -EEXIST : ret;
 	}
 
+	/* A second reference for the caller (dropped once it finishes with ep). */
+	kref_get(&ep->refcount);
 	*out = ep;
 	return 0;
 }
 
 /*
  * Bring an endpoint up: create the /proc subdir, start RDMA CM, create the
- * UDS socket. On any failure, the caller should call urp_endpoint_drain()
- * then urp_endpoint_destroy(). State moves CREATING -> ACTIVE on success.
+ * UDS socket. On any failure, the caller should call urp_endpoint_remove()
+ * (which unpublishes + drains) and drop its reference. State moves
+ * CREATING -> ACTIVE on success.
  */
 int urp_endpoint_activate(struct urp_endpoint *ep)
 {
@@ -307,19 +337,45 @@ static void urp_endpoint_rcu_free(struct rcu_head *rcu)
 }
 
 /*
- * Remove from the rhashtable and schedule deferred free. Caller must have
- * already invoked urp_endpoint_drain() (or be calling from the create-rollback
- * path before activation). Concurrent rhashtable walks observe the entry
- * until their RCU read-side critical section ends.
+ * kref release: the last reference is gone. Defer the free through RCU so any
+ * concurrent rhashtable walk (dumpit, drain_all) that still holds a bare
+ * pointer within its read-side critical section stays valid until it ends.
  */
-void urp_endpoint_destroy(struct urp_endpoint *ep)
+static void urp_endpoint_release(struct kref *kref)
 {
-	mutex_lock(&urp_endpoints_mutex);
-	rhashtable_remove_fast(&urp_endpoints, &ep->ht_node,
-			       urp_endpoints_params);
-	mutex_unlock(&urp_endpoints_mutex);
+	struct urp_endpoint *ep = container_of(kref, struct urp_endpoint, refcount);
 
 	call_rcu(&ep->rcu, urp_endpoint_rcu_free);
+}
+
+void urp_endpoint_put(struct urp_endpoint *ep)
+{
+	if (ep)
+		kref_put(&ep->refcount, urp_endpoint_release);
+}
+
+/*
+ * Unpublish from the table and tear down, exactly once. Removing from the
+ * rhashtable is the serialization point: only the thread whose
+ * rhashtable_remove_fast() succeeds drains the endpoint and drops the table
+ * reference. Concurrent removers (two DELs, or DEL racing module exit) get
+ * -ENOENT and return, so the endpoint is drained once and the table reference
+ * is dropped once -- no double-drain, no double-free. Any references still
+ * held by concurrent lookups keep the object alive until they are dropped.
+ */
+void urp_endpoint_remove(struct urp_endpoint *ep)
+{
+	int ret;
+
+	mutex_lock(&urp_endpoints_mutex);
+	ret = rhashtable_remove_fast(&urp_endpoints, &ep->ht_node,
+				     urp_endpoints_params);
+	mutex_unlock(&urp_endpoints_mutex);
+	if (ret)
+		return;			/* another remover won */
+
+	urp_endpoint_drain(ep);
+	urp_endpoint_put(ep);		/* drop the table reference */
 }
 
 /*
@@ -338,11 +394,17 @@ void urp_endpoint_drain_all(void)
 		rhashtable_walk_enter(&urp_endpoints, &iter);
 		rhashtable_walk_start(&iter);
 
+		/*
+		 * Grab a reference on the first live entry while inside the walk
+		 * (RCU) so it stays valid after we stop the walk. Skip entries
+		 * already dropping their last reference.
+		 */
 		ep = NULL;
 		while ((ep = rhashtable_walk_next(&iter))) {
 			if (IS_ERR(ep))
 				continue;
-			break;
+			if (kref_get_unless_zero(&ep->refcount))
+				break;
 		}
 
 		rhashtable_walk_stop(&iter);
@@ -351,8 +413,8 @@ void urp_endpoint_drain_all(void)
 		if (!ep || IS_ERR(ep))
 			break;
 
-		urp_endpoint_drain(ep);
-		urp_endpoint_destroy(ep);
+		urp_endpoint_remove(ep);	/* unpublish + drain + drop table ref */
+		urp_endpoint_put(ep);		/* drop our walk reference */
 	}
 
 	/* Wait for any in-flight RCU callbacks (RCU-deferred frees) */

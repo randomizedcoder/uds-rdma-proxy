@@ -114,12 +114,19 @@ These are the reason the tooling exists — none were style:
 
 Ordered by what a maintainer would flag first:
 
-1. **Endpoint lifetime / kref** — there is no refcounting anywhere.
-   `urp_endpoint_lookup()` is RCU-safe, but callers in `urp_netlink.c`
-   dereference (and even `mutex_lock`) the endpoint *after*
-   `rcu_read_unlock()`. Serialization currently leans on the genl family
-   mutex + `urp_endpoints_mutex`; two concurrent removes are racy.
-   Needs `kref` + release-via-RCU.
+1. **Endpoint lifetime / kref** — **FIXED.** Was: no refcounting anywhere;
+   callers in `urp_netlink.c` dereferenced (and `mutex_lock`ed) the endpoint
+   *after* `rcu_read_unlock()`, and two concurrent removes were racy (a UAF /
+   double-free window; targeted by the design-27 concurrent racer). Now
+   `struct urp_endpoint` carries a `struct kref`: `urp_endpoint_get()` takes a
+   reference under RCU (`kref_get_unless_zero`) so a looked-up pointer stays
+   valid after the RCU section; `urp_endpoint_remove()` unpublishes from the
+   rhashtable and drops the *table* reference exactly once (the
+   `rhashtable_remove_fast` winner drains — no double-drain, no double-free for
+   concurrent DELs); the object is freed via `call_rcu` only when the last
+   reference is dropped. Every genl handler (`NEW`/`DEL`/`SET`/`GET`) now holds
+   a ref across its use and `urp_endpoint_put()`s it. Validated: KASAN +
+   KMEMLEAK clean under ~18.7k concurrent NEW/DEL/SET/GET ops (the racer).
 2. **netns awareness** — every `sock_create_kern(&init_net, ...)` and
    `rdma_create_id(&init_net, ...)`, plus `.netnsok = false`. Design and
    scope decision already recorded in

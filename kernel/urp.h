@@ -28,6 +28,7 @@
 #include <linux/mutex.h>
 #include <linux/rhashtable.h>
 #include <linux/rcupdate.h>
+#include <linux/kref.h>
 
 #include <rdma/ib_verbs.h>
 #include <rdma/rdma_cm.h>
@@ -298,6 +299,16 @@ struct urp_endpoint {
 	struct mutex		lock;			/* serializes state transitions */
 	struct rhash_head	ht_node;		/* urp_endpoints rhashtable linkage */
 	struct rcu_head		rcu;			/* deferred free */
+	/*
+	 * Reference count. Initialised to 1 (the table reference) at create;
+	 * urp_endpoint_get() takes an additional ref under RCU so a looked-up
+	 * pointer stays valid after the RCU section ends (the SET/GET/DEL
+	 * handlers deref ep outside RCU). urp_endpoint_remove() drops the table
+	 * reference exactly once (the rhashtable_remove winner); the object is
+	 * freed via call_rcu only when the last reference is dropped. Closes the
+	 * lookup-vs-DEL use-after-free (design 26 / 27.8).
+	 */
+	struct kref		refcount;
 	bool			is_initiator;		/* derived from listen_path != "" */
 
 	/* UDS side */
@@ -367,11 +378,27 @@ extern bool			urp_endpoints_inited;
 /* urp_endpoint.c -- lifecycle */
 int  urp_endpoint_table_init(void);
 void urp_endpoint_table_destroy(void);
+/*
+ * On success *out holds a caller reference (count = table ref + 1); the caller
+ * must urp_endpoint_put() it when done.
+ */
 int  urp_endpoint_create(struct urp_endpoint *cfg, struct urp_endpoint **out);
 int  urp_endpoint_activate(struct urp_endpoint *ep);
 void urp_endpoint_drain(struct urp_endpoint *ep);
-void urp_endpoint_destroy(struct urp_endpoint *ep);
-struct urp_endpoint *urp_endpoint_lookup(const char *name);
+/*
+ * Look up an endpoint by name and take a reference. Self-brackets RCU, so the
+ * returned pointer is safe to dereference after this returns; the caller must
+ * urp_endpoint_put() it. Returns NULL if not found (or being torn down).
+ */
+struct urp_endpoint *urp_endpoint_get(const char *name);
+void urp_endpoint_put(struct urp_endpoint *ep);
+/*
+ * Unpublish from the table and tear down, exactly once. The thread that wins
+ * the rhashtable removal drains the endpoint and drops the table reference;
+ * concurrent removers return without double-draining. The object is freed via
+ * call_rcu when its last reference is dropped.
+ */
+void urp_endpoint_remove(struct urp_endpoint *ep);
 void urp_endpoint_drain_all(void);
 
 /* urp_socket.c */
