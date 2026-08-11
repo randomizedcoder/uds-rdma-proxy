@@ -97,6 +97,29 @@ let
     '';
     meta.mainProgram = "netlink_cov_fuzz";
   };
+  # Concurrent netlink racer (design 27 F2, S3 concurrency). Multi-threaded
+  # NEW/DEL/SET/GET churn on a shared name pool to shake out the endpoint
+  # lifecycle races (deref-after-rcu-unlock UAF; no kref, design 26). Baked
+  # into the microVM rootfs; run in the sanitizer VM.
+  raceFuzz = pkgs.stdenv.mkDerivation {
+    pname = "urp-netlink-race";
+    version = "0.1.0";
+    src = fuzzSrc;
+    nativeBuildInputs = [ pkgs.clang ];
+    buildPhase = ''
+      runHook preBuild
+      clang -O1 -std=gnu11 -Wall -Wextra \
+        nix/fuzz/netlink_race.c -o netlink_race -lpthread
+      runHook postBuild
+    '';
+    installPhase = ''
+      runHook preInstall
+      mkdir -p $out/bin
+      cp netlink_race $out/bin/
+      runHook postInstall
+    '';
+    meta.mainProgram = "netlink_race";
+  };
   # Hostile-peer RDMA wire fuzzer (design 27 F2, S1/S2). A standalone
   # librdmacm/libibverbs RC peer that connects to a urp acceptor and injects
   # malformed frames into the RX path (urp_recv_done). Baked into the microVM
@@ -137,6 +160,9 @@ in
 
   # KCOV coverage-guided netlink fuzzer binary (for the microVM rootfs).
   inherit covFuzz;
+
+  # Concurrent netlink racer binary (for the microVM rootfs).
+  inherit raceFuzz;
 
   # Hostile-peer RDMA wire fuzzer binary (for the microVM rootfs).
   inherit wireFuzz;

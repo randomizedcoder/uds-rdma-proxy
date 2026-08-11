@@ -155,9 +155,24 @@ paths F0/F1 can't.
    phase (`scan_splat`).
 
    Still open: **KCOV_TRACE_CMP** operand feedback (config already enabled) for
-   smarter mutation, concurrent multi-proc execution to reach the
-   DEL-after-RCU-drop *race* (single-threaded coverage can't), and — if deeper
-   coverage warrants — real syzkaller with authored `urp.txt` descriptions.
+   smarter mutation, and — if deeper coverage warrants — real syzkaller with
+   authored `urp.txt` descriptions.
+
+1b. **Concurrent netlink racer** (S3 concurrency) — **IMPLEMENTED**
+   (`nix/fuzz/netlink_race.c`, Phase 10c3): the coverage-guided fuzzer is
+   single-threaded, so it cannot reach concurrency bugs. This spawns N threads
+   (default 8, oversubscribed vs the 2-vCPU guest so preemption is frequent),
+   each on its own netlink socket, hammering a small shared name pool (`r0..r3`)
+   with NEW/DEL/SET/GET so lookups, inserts, `call_rcu` frees, and derefs
+   collide on the same endpoint objects. Target: the **deref-after-rcu-unlock
+   UAF** — endpoints have no kref (design 26), and the SET/GET handlers do
+   `rcu_read_lock(); ep = lookup(); rcu_read_unlock(); ... deref ep` while DEL
+   frees via `call_rcu`; also the double-DEL free. Oracle: KASAN + `scan_splat`.
+   Status: runs ~18k concurrent ops with real endpoint bind/listen churn under
+   KASAN, **clean in a 25 s window** — which does *not* disprove the hazard (the
+   grace-period alignment is narrow; syzkaller finds these over hours). The
+   endpoint-kref refactor (design 26) is the definitive fix; the racer is the
+   regression guard and the nightly-long-run tool that would catch a live UAF.
 2. **Hostile-peer wire fuzzer** (S1/S2) — **IMPLEMENTED** (`nix/fuzz/wire_fuzz.c`):
    a standalone librdmacm/libibverbs RC peer that completes the CM handshake
    into a live acceptor endpoint and injects malformed frames into the RX path

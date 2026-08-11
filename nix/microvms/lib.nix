@@ -558,6 +558,26 @@ in rec {
       echo ""
 
       # -----------------------------------------------------------------
+      # Phase 10c3 — concurrent netlink race (design 27 F2, S3 concurrency).
+      # Multi-threaded NEW/DEL/SET/GET churn on a small shared name pool to
+      # trip the endpoint-lifecycle races the single-threaded fuzzers can't:
+      # the deref-after-rcu-unlock UAF (no kref on endpoints, design 26) and
+      # the double-DEL free. Oracle: the same KASAN scan (scan_splat + 11b).
+      # -----------------------------------------------------------------
+      echo "--- Phase 10c3: concurrent netlink race (vm1, ${if sanitizer then "KASAN" else "smoke"}) ---"
+      RACE_SECS=${if sanitizer then "25" else "6"}
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+        "netlink_race $RACE_SECS $VM1_IP 1 8 2>&1 | tail -4" $((RACE_SECS + 25)) \
+        > "$RUNDIR/diag/vm1.race-fuzz.txt" 2>&1 || true
+      scan_splat "$RUNDIR/diag/vm1.race-fuzz.txt" "concurrent netlink race"
+      if grep -q RACE_DONE "$RUNDIR/diag/vm1.race-fuzz.txt" 2>/dev/null; then
+        info "race completed ($(grep -o 'ops=[0-9]* threads=[0-9]*' "$RUNDIR/diag/vm1.race-fuzz.txt" | tail -1))"
+      else
+        info "race did not report DONE (check diag/vm1.race-fuzz.txt)"
+      fi
+      echo ""
+
+      # -----------------------------------------------------------------
       # Phase 10d — hostile-peer wire fuzz (design 27 F2, S1/S2). Stand up a
       # DEDICATED acceptor endpoint on vm1 (fuzz_acceptor, port 4792, its own
       # socat backend) — the live pair_acceptor's QP slots are already full

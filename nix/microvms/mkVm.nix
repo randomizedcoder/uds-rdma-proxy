@@ -258,6 +258,9 @@ in
         # KCOV coverage-guided netlink fuzzer (design 27 F2, S3). Needs the
         # CONFIG_KCOV sanitizer kernel; run in the sanitizer pair test.
         (import ../fuzz { inherit pkgs lib; }).covFuzz
+        # Concurrent netlink racer (design 27 F2, S3 concurrency). Multi-thread
+        # NEW/DEL/SET/GET churn to trip endpoint-lifecycle UAF under KASAN.
+        (import ../fuzz { inherit pkgs lib; }).raceFuzz
         # Hostile-peer RDMA wire fuzzer (design 27 F2, S1/S2). Run from the
         # peer VM against the acceptor to fuzz the RX frame path under KASAN.
         (import ../fuzz { inherit pkgs lib; }).wireFuzz
