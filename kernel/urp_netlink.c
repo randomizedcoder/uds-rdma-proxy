@@ -128,6 +128,16 @@ static int urp_fill_endpoint(struct sk_buff *skb, struct urp_endpoint *ep,
 		u32 active_streams = 0;
 		u32 i;
 
+		/*
+		 * The verbose payload dereferences ep->qps[] and walks the
+		 * ep->streams table, both of which urp_endpoint_drain() frees
+		 * under ep->lock. Verbose callers must hold ep->lock so the read
+		 * cannot race the free (a UAF); assert it here. Non-verbose
+		 * callers (dumpit, inside the endpoints RCU walk where a mutex is
+		 * illegal) touch only scalar/immutable fields and skip this.
+		 */
+		lockdep_assert_held(&ep->lock);
+
 		/* Per-QP nested blocks (Phase 3a Step 8). One entry per QP
 		 * in ep->qps[] -- the array is allocated by urp_qps_init at
 		 * activate time.
@@ -608,7 +618,17 @@ static int urp_get_endpoint_doit(struct sk_buff *skb, struct genl_info *info)
 		goto out;
 	}
 
+	/*
+	 * Hold ep->lock across the verbose fill: it dereferences the sub-objects
+	 * (ep->qps[], the ep->streams table) that urp_endpoint_drain() frees --
+	 * urp_qps_destroy()/urp_streams_destroy_all() -- under the same lock.
+	 * Without this, an unprivileged GET racing an admin DEL reads freed
+	 * memory (a UAF). The dumpit path fills non-verbose (scalars only) so it
+	 * does not need the lock (and could not take it inside its RCU walk).
+	 */
+	mutex_lock(&ep->lock);
 	ret = urp_fill_endpoint(msg, ep, true);
+	mutex_unlock(&ep->lock);
 	if (ret) {
 		genlmsg_cancel(msg, hdr);
 		nlmsg_free(msg);
