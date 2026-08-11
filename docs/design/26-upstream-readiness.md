@@ -127,6 +127,14 @@ Ordered by what a maintainer would flag first:
    reference is dropped. Every genl handler (`NEW`/`DEL`/`SET`/`GET`) now holds
    a ref across its use and `urp_endpoint_put()`s it. Validated: KASAN +
    KMEMLEAK clean under ~18.7k concurrent NEW/DEL/SET/GET ops (the racer).
+   Follow-on (also **FIXED**): kref makes the endpoint *object* safe, but its
+   sub-objects (`ep->qps[]`, the `ep->streams` table) are freed by
+   `urp_endpoint_drain()` under `ep->lock`, while the *verbose* `GET` fill
+   (`urp_fill_endpoint`, unprivileged) read them with no lock — an unprivileged
+   GET racing an admin DEL read freed memory. Fixed by holding `ep->lock`
+   across the verbose fill (the only verbose caller, `GET` doit, runs in
+   sleepable context; dumpit fills scalars only and stays lock-free inside its
+   RCU walk), with a `lockdep_assert_held(&ep->lock)` guarding the contract.
 2. **netns awareness** — every `sock_create_kern(&init_net, ...)` and
    `rdma_create_id(&init_net, ...)`, plus `.netnsok = false`. Design and
    scope decision already recorded in
