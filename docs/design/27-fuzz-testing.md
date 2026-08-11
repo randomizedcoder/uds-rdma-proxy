@@ -136,15 +136,28 @@ Goal: attacker-grade coverage of S1/S2/S3 through the **real module** in a
 KCOV+KASAN guest — the only way to reach the RCU/locking/verbs integration
 paths F0/F1 can't.
 
-1. **syzkaller on the genl family** (S3): author syscall descriptions
-   (`urp.txt`) for the `"urp"` family — `URP_CMD_{NEW,DEL,SET,GET}_ENDPOINT`
-   with the nested `URP_A_ENDPOINT` attr grammar (name/paths/device strings,
-   `sockaddr_in6` binary attrs, num_qps/buffer_* u32s, PSK). Reuse the
-   existing microVM sanitizer kernel (KASAN+KMEMLEAK+lockdep already wired in
-   `nix/microvms/mkVm.nix`) but add **KCOV** for coverage feedback. syzkaller
-   drives malformed nesting, truncated/oversized/duplicate attrs, and
-   concurrent NEW/SET/DEL/GET on one name (the DEL-after-RCU-drop race, the
-   SET-`num_qps`-OOB path). Oracle: any KASAN/KMEMLEAK/lockdep report or leak.
+1. **Coverage-guided netlink fuzzer** (S3) — **IMPLEMENTED**
+   (`nix/fuzz/netlink_cov_fuzz.c`, added **KCOV** to the sanitizer kernel in
+   `nix/microvms/mkVm.nix`): rather than pull in syzkaller's whole VM-management
+   stack (which does not fit this expect/console microVM harness), this is an
+   in-house coverage-guided engine using syzkaller's own feedback mechanism —
+   `/sys/kernel/debug/kcov` per-task PC coverage. The genl doit/dumpit handlers
+   run synchronously in the caller's sendmsg/recvmsg context, so per-task KCOV
+   captures their edges directly. It seeds a corpus with well-formed
+   NEW/GET/SET/DEL messages (so mutation explores outward from real handler
+   depth, not from noise), mutates cmd/attr-type/attr-len/payload/dump and
+   attr add/remove/duplicate, executes each under KCOV, and keeps in the corpus
+   only inputs that hit new (hashed) edges. Reports `execs/corpus/edges`. Wired
+   as **Phase 10c2** of the sanitizer pair test (falls back to blind mode on a
+   non-KCOV kernel). **On its first real run it found the `SET num_qps` OOB
+   teardown bug (§27.8 #3)** — the payoff coverage feedback buys over blind
+   mutation. Oracle: KASAN/KMEMLEAK/lockdep, now also scanned inline per fuzz
+   phase (`scan_splat`).
+
+   Still open: **KCOV_TRACE_CMP** operand feedback (config already enabled) for
+   smarter mutation, concurrent multi-proc execution to reach the
+   DEL-after-RCU-drop *race* (single-threaded coverage can't), and — if deeper
+   coverage warrants — real syzkaller with authored `urp.txt` descriptions.
 2. **Hostile-peer wire fuzzer** (S1/S2) — **IMPLEMENTED** (`nix/fuzz/wire_fuzz.c`):
    a standalone librdmacm/libibverbs RC peer that completes the CM handshake
    into a live acceptor endpoint and injects malformed frames into the RX path
@@ -229,6 +242,28 @@ fuzzer to re-derive.**
 
 Both are the archetype of what a hostile-peer wire fuzzer (F2.2) finds and a
 cooperative integration test cannot.
+
+3. **`SET_ENDPOINT num_qps`/`buffer_count` OOB teardown (S3, local CAP_NET_ADMIN,
+   high) — FOUND LIVE by the coverage-guided netlink fuzzer, now fixed.** Not a
+   planning-time inspection finding: the KCOV-guided `netlink_cov_fuzz` (F2, §27.6)
+   hit it on essentially its first run, driving `NEW_ENDPOINT(num_qps=1)` →
+   `SET_ENDPOINT(num_qps=8)` → `DEL_ENDPOINT`. `ep->qps` is
+   `kcalloc(ep->num_qps, ...)` at activation (`urp_qp.c:26`), but
+   `urp_set_endpoint_doit` (`urp_netlink.c`) overwrote `ep->num_qps` live with no
+   realloc. Teardown then walks `for (i = 0; i < ep->num_qps; i++) ep->qps[i]`
+   (`urp_rdma_cleanup`, three loops) past the allocation → KASAN slab-out-of-bounds
+   reading `.established`/`.cm_id`, then a **general-protection fault in
+   `rdma_disconnect()`** on the garbage pointer (a smaller `num_qps` silently leaks
+   the QPs above the new count). **Fix**: `num_qps`/`buffer_count` are activation-time
+   sizing params — reject changing them on an active endpoint (`ep->qps != NULL`)
+   with `-EBUSY`; callers remove and re-add. This is exactly the "SET-`num_qps`-OOB
+   path" §27.2 flagged, now confirmed exploitable-to-crash and closed. The
+   coverage-guided fuzzer's seed sequence is the regression case.
+
+The KASAN report reached the console during the fuzz phase but the run's later
+Phase 11b dmesg scan came back "clean" (the crash wedged the VM). Fixed too: each
+fuzz phase now scans its own captured output for splats (`scan_splat`,
+`nix/microvms/lib.nix`) and fails the run inline.
 
 ## 27.9 Sequencing
 

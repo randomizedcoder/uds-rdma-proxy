@@ -75,6 +75,28 @@ let
     '';
     meta.mainProgram = "netlink_fuzz";
   };
+  # KCOV coverage-guided netlink fuzzer (design 27 F2, S3). Same libc-only
+  # build as netlinkFuzz, but drives inputs by KCOV coverage feedback; needs a
+  # CONFIG_KCOV kernel (the sanitizer VM). Baked into the microVM rootfs.
+  covFuzz = pkgs.stdenv.mkDerivation {
+    pname = "urp-netlink-cov-fuzz";
+    version = "0.1.0";
+    src = fuzzSrc;
+    nativeBuildInputs = [ pkgs.clang ];
+    buildPhase = ''
+      runHook preBuild
+      clang -O1 -std=gnu11 -Wall -Wextra \
+        nix/fuzz/netlink_cov_fuzz.c -o netlink_cov_fuzz
+      runHook postBuild
+    '';
+    installPhase = ''
+      runHook preInstall
+      mkdir -p $out/bin
+      cp netlink_cov_fuzz $out/bin/
+      runHook postInstall
+    '';
+    meta.mainProgram = "netlink_cov_fuzz";
+  };
   # Hostile-peer RDMA wire fuzzer (design 27 F2, S1/S2). A standalone
   # librdmacm/libibverbs RC peer that connects to a urp acceptor and injects
   # malformed frames into the RX path (urp_recv_done). Baked into the microVM
@@ -112,6 +134,9 @@ in
 
   # Live-kernel netlink fuzzer binary (for the microVM rootfs).
   inherit netlinkFuzz;
+
+  # KCOV coverage-guided netlink fuzzer binary (for the microVM rootfs).
+  inherit covFuzz;
 
   # Hostile-peer RDMA wire fuzzer binary (for the microVM rootfs).
   inherit wireFuzz;
