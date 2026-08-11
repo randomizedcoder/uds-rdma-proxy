@@ -19,6 +19,47 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Long hermetic fuzz run (design 27 F3). The userspace F1 harnesses compile
+  # the real kernel C (urp_frame.c, urp_stream_sm.c, urp_reorder.c) under
+  # libFuzzer + ASAN/UBSan -- no VM/KVM -- so this runs on a hosted runner and
+  # leaves the self-hosted [kvm] runner free for the VM jobs below. The F2
+  # live-module fuzzers (netlink blind/coverage-guided, racer, hostile wire)
+  # already run every night inside the microvm-sanitizers job's pair test.
+  fuzz-long:
+    name: Long hermetic fuzz (F1 harnesses)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [fuzz-classify, fuzz-rx-seq, fuzz-reorder]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+      - name: Enable Nix binary cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Replay committed crash reproducers
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          for f in "fuzz/regressions/${TARGET#fuzz-}"/*; do
+            [ -e "$f" ] || continue   # empty dir (only .gitkeep) -> skip
+            # A reproduced crash exits non-zero -> fails the job (set -e).
+            nix run ".#$TARGET" -- "$f"
+          done
+      - name: Fuzz (10 min)
+        env:
+          TARGET: ${{ matrix.target }}
+        run: nix run ".#$TARGET" -- -max_total_time=600 -print_final_stats=1
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-${{ matrix.target }}
+          path: crash-*
+          if-no-files-found: ignore
+
   microvm-pair:
     name: MicroVM x86_64 pair test (rdma_rxe)
     runs-on: [self-hosted, kvm]
