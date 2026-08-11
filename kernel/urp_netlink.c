@@ -426,12 +426,14 @@ static int urp_new_endpoint_doit(struct sk_buff *skb, struct genl_info *info)
 
 	ret = urp_endpoint_activate(ep);
 	if (ret) {
-		urp_endpoint_drain(ep);
-		urp_endpoint_destroy(ep);
+		urp_endpoint_remove(ep);	/* unpublish + drain + drop table ref */
+		urp_endpoint_put(ep);		/* drop our caller ref -> frees */
 		GENL_SET_ERR_MSG_FMT(info, "endpoint activation failed: %d", ret);
 		return ret;
 	}
 
+	/* Drop the caller ref from create; the table reference keeps ep alive. */
+	urp_endpoint_put(ep);
 	return 0;
 }
 
@@ -456,16 +458,14 @@ static int urp_del_endpoint_doit(struct sk_buff *skb, struct genl_info *info)
 	}
 	nla_strscpy(name, tb[URP_ENDPOINT_A_NAME], URP_NAME_MAX);
 
-	rcu_read_lock();
-	ep = urp_endpoint_lookup(name);
-	rcu_read_unlock();
+	ep = urp_endpoint_get(name);
 	if (!ep) {
 		GENL_SET_ERR_MSG(info, "endpoint not found");
 		return -ENOENT;
 	}
 
-	urp_endpoint_drain(ep);
-	urp_endpoint_destroy(ep);
+	urp_endpoint_remove(ep);	/* unpublish + drain + drop table ref (once) */
+	urp_endpoint_put(ep);		/* drop our caller ref */
 	return 0;
 }
 
@@ -494,9 +494,7 @@ static int urp_set_endpoint_doit(struct sk_buff *skb, struct genl_info *info)
 	}
 	nla_strscpy(name, tb[URP_ENDPOINT_A_NAME], URP_NAME_MAX);
 
-	rcu_read_lock();
-	ep = urp_endpoint_lookup(name);
-	rcu_read_unlock();
+	ep = urp_endpoint_get(name);
 	if (!ep) {
 		GENL_SET_ERR_MSG(info, "endpoint not found");
 		return -ENOENT;
@@ -507,7 +505,8 @@ static int urp_set_endpoint_doit(struct sk_buff *skb, struct genl_info *info)
 
 		if (want != URP_STATE_DRAINING) {
 			GENL_SET_ERR_MSG(info, "only DRAINING state is settable");
-			return -EINVAL;
+			ret = -EINVAL;
+			goto out;
 		}
 		drain_requested = true;
 	}
@@ -535,7 +534,8 @@ static int urp_set_endpoint_doit(struct sk_buff *skb, struct genl_info *info)
 			mutex_unlock(&ep->lock);
 			GENL_SET_ERR_MSG(info,
 					 "num_qps is fixed once the endpoint is active; remove and re-add to change it");
-			return -EBUSY;
+			ret = -EBUSY;
+			goto out;
 		}
 		ep->num_qps = want;
 	}
@@ -546,7 +546,8 @@ static int urp_set_endpoint_doit(struct sk_buff *skb, struct genl_info *info)
 			mutex_unlock(&ep->lock);
 			GENL_SET_ERR_MSG(info,
 					 "buffer_count is fixed once the endpoint is active; remove and re-add to change it");
-			return -EBUSY;
+			ret = -EBUSY;
+			goto out;
 		}
 		ep->buffer_count = want;
 	}
@@ -560,7 +561,10 @@ static int urp_set_endpoint_doit(struct sk_buff *skb, struct genl_info *info)
 	if (drain_requested)
 		urp_endpoint_drain(ep);
 
-	return 0;
+	ret = 0;
+out:
+	urp_endpoint_put(ep);
+	return ret;
 }
 
 /*
@@ -585,33 +589,37 @@ static int urp_get_endpoint_doit(struct sk_buff *skb, struct genl_info *info)
 	}
 	nla_strscpy(name, tb[URP_ENDPOINT_A_NAME], URP_NAME_MAX);
 
-	rcu_read_lock();
-	ep = urp_endpoint_lookup(name);
-	rcu_read_unlock();
+	ep = urp_endpoint_get(name);
 	if (!ep) {
 		GENL_SET_ERR_MSG(info, "endpoint not found");
 		return -ENOENT;
 	}
 
 	msg = genlmsg_new(NLMSG_GOODSIZE, GFP_KERNEL);
-	if (!msg)
-		return -ENOMEM;
+	if (!msg) {
+		ret = -ENOMEM;
+		goto out;
+	}
 
 	hdr = urp_genlmsg_iput(msg, info);
 	if (!hdr) {
 		nlmsg_free(msg);
-		return -EMSGSIZE;
+		ret = -EMSGSIZE;
+		goto out;
 	}
 
 	ret = urp_fill_endpoint(msg, ep, true);
 	if (ret) {
 		genlmsg_cancel(msg, hdr);
 		nlmsg_free(msg);
-		return ret;
+		goto out;
 	}
 
 	genlmsg_end(msg, hdr);
-	return genlmsg_reply(msg, info);
+	ret = genlmsg_reply(msg, info);
+out:
+	urp_endpoint_put(ep);
+	return ret;
 }
 
 /*
