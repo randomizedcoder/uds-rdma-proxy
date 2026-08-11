@@ -67,7 +67,18 @@
 #define KCOV_ENABLE		_IO('c', 100)
 #define KCOV_DISABLE		_IO('c', 101)
 #define KCOV_TRACE_PC		0
-#define COVER_SIZE		(256u << 10)	/* max PCs per run */
+#define KCOV_TRACE_CMP		1
+/* Comparison-record type word (KCOV_TRACE_CMP): bit0 = arg2 is a compile-time
+ * constant; bits1-2 = log2(operand size in bytes). Each record is 4 u64s
+ * [type, arg1, arg2, pc]; cover[0] is the record count.
+ */
+#define KCOV_CMP_CONST		(1u << 0)
+#define KCOV_CMP_SIZE(n)	((n) << 1)
+#define KCOV_CMP_MASK		KCOV_CMP_SIZE(3u)
+#define COVER_SIZE		(256u << 10)	/* max PCs/records per run */
+
+/* Global kcov fd so we can toggle TRACE_PC <-> TRACE_CMP mid-run. */
+static int kcov_fd = -1;
 
 /* ---- deterministic PRNG ---- */
 static uint64_t prng_state = 1;
@@ -103,6 +114,27 @@ static int cov_note(uint64_t pc)
 	cov_seen[idx] |= bit;
 	cov_total++;
 	return 1;
+}
+
+/* ---- comparison-operand dictionary (harvested via KCOV_TRACE_CMP) ---- */
+#define DICT_MAX	512
+static uint64_t dict[DICT_MAX];
+static int dict_len;
+
+static void dict_add(uint64_t v)
+{
+	int i;
+
+	/* 0/1 are already well covered by the seeds + edge-value mutation; and
+	 * likely-pointer values (very large) are noise, not magic constants.
+	 */
+	if (v <= 1 || v >= 0xffff000000000000ull)
+		return;
+	for (i = 0; i < dict_len; i++)
+		if (dict[i] == v)
+			return;
+	if (dict_len < DICT_MAX)
+		dict[dict_len++] = v;
 }
 
 /* ---- input model: one genl message ---- */
@@ -142,19 +174,17 @@ static void put_attr(struct nlmsghdr *nlh, uint16_t type,
 	nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + NLA_ALIGN(alen);
 }
 
-/* Serialize one input into a genl message and (send + drain reply) with KCOV
- * measuring the whole round. Returns how many NEW coverage buckets it hit.
+/* Serialize one input into a genl message, send it, and drain any reply.
+ * (Shared by the PC-coverage exec and the CMP-operand harvest.)
  */
-static int exec_input(int fd, int family, unsigned long *cover,
-		      const struct input *in)
+static void send_one(int fd, int family, const struct input *in)
 {
 	char buf[4096];
 	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
 	struct genlmsghdr *ghdr;
 	struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
 	struct nlattr *nest;
-	int i, newcov = 0;
-	unsigned long n, k;
+	int i;
 
 	memset(buf, 0, sizeof(buf));
 	nlh->nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN);
@@ -180,10 +210,6 @@ static int exec_input(int fd, int family, unsigned long *cover,
 	}
 	nest->nla_len = (uint16_t)((char *)NLMSG_TAIL(nlh) - (char *)nest);
 
-	/* --- measured window: reset KCOV counter, run, read --- */
-	if (cover)
-		__atomic_store_n(&cover[0], 0, __ATOMIC_RELAXED);
-
 	(void)sendto(fd, nlh, nlh->nlmsg_len, 0,
 		     (struct sockaddr *)&sa, sizeof(sa));
 	{
@@ -192,6 +218,21 @@ static int exec_input(int fd, int family, unsigned long *cover,
 		while (recv(fd, rbuf, sizeof(rbuf), MSG_DONTWAIT) > 0)
 			;	/* drain doit ACK / dumpit stream */
 	}
+}
+
+/* Run one input under KCOV_TRACE_PC. Returns how many NEW coverage buckets it
+ * hit (0 if KCOV is off).
+ */
+static int exec_input(int fd, int family, unsigned long *cover,
+		      const struct input *in)
+{
+	int newcov = 0;
+	unsigned long n, k;
+
+	if (cover)
+		__atomic_store_n(&cover[0], 0, __ATOMIC_RELAXED);
+
+	send_one(fd, family, in);
 
 	if (cover) {
 		n = __atomic_load_n(&cover[0], __ATOMIC_RELAXED);
@@ -201,6 +242,47 @@ static int exec_input(int fd, int family, unsigned long *cover,
 			newcov += cov_note(cover[k + 1]);
 	}
 	return newcov;
+}
+
+/* Re-run one input under KCOV_TRACE_CMP and harvest the compile-time
+ * comparison constants the kernel checked the input against (magic numbers,
+ * enum values, exact-length gates) into the dictionary. The mutator then
+ * injects these so the fuzzer can satisfy value-gated branches it would never
+ * guess. No-op without KCOV. Toggles the shared fd's mode and restores PC.
+ */
+static void harvest_cmp(int fd, int family, unsigned long *cover,
+			const struct input *in)
+{
+	unsigned long nrec, i;
+
+	if (!cover || kcov_fd < 0)
+		return;
+	if (ioctl(kcov_fd, KCOV_DISABLE, 0))
+		return;
+	if (ioctl(kcov_fd, KCOV_ENABLE, KCOV_TRACE_CMP)) {
+		/* Best effort: restore PC mode and give up on this harvest. */
+		(void)ioctl(kcov_fd, KCOV_ENABLE, KCOV_TRACE_PC);
+		return;
+	}
+
+	__atomic_store_n(&cover[0], 0, __ATOMIC_RELAXED);
+	send_one(fd, family, in);
+	nrec = __atomic_load_n(&cover[0], __ATOMIC_RELAXED);
+	/* Each record is 4 u64 words [type, arg1, arg2, pc]. */
+	if (nrec > (COVER_SIZE - 1) / 4)
+		nrec = (COVER_SIZE - 1) / 4;
+	for (i = 0; i < nrec; i++) {
+		uint64_t type = cover[1 + i * 4];
+
+		/* arg2 is the compile-time constant when KCOV_CMP_CONST is set --
+		 * the clean "dictionary" subset (arg1 is often a runtime pointer).
+		 */
+		if (type & KCOV_CMP_CONST)
+			dict_add(cover[1 + i * 4 + 2]);
+	}
+
+	(void)ioctl(kcov_fd, KCOV_DISABLE, 0);
+	(void)ioctl(kcov_fd, KCOV_ENABLE, KCOV_TRACE_PC);
 }
 
 /* ---- seed corpus: well-formed-ish inputs that reach deep into the handlers
@@ -296,7 +378,26 @@ static void mutate(struct input *in)
 	int rounds = 1 + xrand_below(4);
 
 	while (rounds--) {
-		switch (xrand_below(9)) {
+		switch (xrand_below(10)) {
+		case 9:	/* inject a KCOV_TRACE_CMP-harvested magic constant */
+			if (in->nattrs && dict_len) {
+				int i = xrand_below(in->nattrs);
+				uint64_t v = dict[xrand_below(dict_len)];
+
+				/* Write it at a size the policy is likely to read
+				 * (u32 for the range-checked attrs, u64 otherwise).
+				 */
+				if (xrand_below(2)) {
+					uint32_t v32 = (uint32_t)v;
+
+					in->attrs[i].len = 4;
+					memcpy(in->attrs[i].data, &v32, 4);
+				} else {
+					in->attrs[i].len = 8;
+					memcpy(in->attrs[i].data, &v, 8);
+				}
+			}
+			break;
 		case 0:	/* flip command (incl. out-of-range) */
 			in->cmd = (uint8_t)xrand_below(7);
 			break;
@@ -437,6 +538,7 @@ static unsigned long *kcov_setup(void)
 		close(fd);
 		return NULL;
 	}
+	kcov_fd = fd;	/* keep for TRACE_PC <-> TRACE_CMP toggling */
 	return cover;
 }
 
@@ -446,6 +548,7 @@ int main(int argc, char **argv)
 	long seconds = argc > 1 ? atol(argv[1]) : 20;
 	unsigned long execs = 0;
 	unsigned long *cover;
+	unsigned long long seed_used;
 	time_t start;
 	struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
 
@@ -453,6 +556,11 @@ int main(int argc, char **argv)
 		prng_state = strtoull(argv[2], NULL, 0);
 	if (prng_state == 0)
 		prng_state = 1;
+	/* Capture the input seed before seed-priming advances the PRNG, so the
+	 * banner reports the value you pass to reproduce a run (not the state
+	 * after priming).
+	 */
+	seed_used = (unsigned long long)prng_state;
 
 	cov_seen = calloc(COV_BITS / 8, 1);
 	corpus = calloc(CORPUS_MAX, sizeof(struct input));
@@ -491,8 +599,7 @@ int main(int argc, char **argv)
 			(void)exec_input(fd, family, cover, &corpus[i]);
 	}
 	printf("COV_FUZZ: urp family id=%d, kcov=%s, seeds=%d, fuzzing %lds seed=%llu\n",
-	       family, cover ? "on" : "off", corpus_len, seconds,
-	       (unsigned long long)prng_state);
+	       family, cover ? "on" : "off", corpus_len, seconds, seed_used);
 	fflush(stdout);
 
 	start = time(NULL);
@@ -506,14 +613,25 @@ int main(int argc, char **argv)
 			mutate(&cand);
 			gained = exec_input(fd, family, cover, &cand);
 			execs++;
-			/* Coverage-increasing input -> add to corpus. */
-			if (gained > 0 && corpus_len < CORPUS_MAX)
+			/* Coverage-increasing input -> add to corpus, and harvest
+			 * its comparison constants (that is where new value gates
+			 * tend to appear).
+			 */
+			if (gained > 0 && corpus_len < CORPUS_MAX) {
 				corpus[corpus_len++] = cand;
+				harvest_cmp(fd, family, cover, &cand);
+			} else if ((execs & 0x1ff) == 0) {
+				/* Periodic harvest from a random corpus entry so
+				 * the dictionary keeps growing on plateaus.
+				 */
+				harvest_cmp(fd, family, cover,
+					    &corpus[xrand_below(corpus_len)]);
+			}
 		}
 	}
 
-	printf("COV_FUZZ_DONE execs=%lu corpus=%d edges=%lu\n",
-	       execs, corpus_len, cov_total);
+	printf("COV_FUZZ_DONE execs=%lu corpus=%d edges=%lu dict=%d\n",
+	       execs, corpus_len, cov_total, dict_len);
 	fflush(stdout);
 	close(fd);
 	return 0;
