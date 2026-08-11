@@ -234,62 +234,10 @@ void urp_stream_destroy(struct urp_endpoint *ep, struct urp_stream *s)
 }
 
 /*
- * Pure stream state-machine core (design 28 E2). No locks, no sockets,
- * no allocation -- just (state, event) -> (next, actions, accepted).
- * The handlers below own the locking + side effects; this owns the
- * decision. Mirrored 1:1 by crates/uds-rdma-protocol/src/stream.rs
- * (keep in lock-step; the KUnit table in urp_test.c and the Rust table
- * test both enumerate the full matrix).
- *
- * Note: the SYN that *creates* an inbound stream is a distinct event
- * (create -> SYN_RECEIVED), handled in urp_stream_rx_syn; this function
- * models RX_SYN on an already-known stream (idempotent handshake
- * advance to ESTABLISHED, or reject on a closing/closed stream).
+ * The pure stream state-machine core urp_stream_next_state() is extracted into
+ * urp_stream_sm.c (so it can be fuzzed in userspace); the handlers below own
+ * the locking + side effects and call it for the decision.
  */
-struct urp_stream_transition
-urp_stream_next_state(enum urp_stream_state cur, enum urp_stream_event ev)
-{
-	struct urp_stream_transition t = {
-		.next = cur, .actions = 0, .accepted = true,
-	};
-
-	switch (ev) {
-	case URP_STREAM_EV_RX_SYN:
-		if (cur == URP_STREAM_STATE_SYN_SENT ||
-		    cur == URP_STREAM_STATE_SYN_RECEIVED ||
-		    cur == URP_STREAM_STATE_ESTABLISHED)
-			t.next = URP_STREAM_STATE_ESTABLISHED;
-		else
-			t.accepted = false;	/* -EEXIST: SYN on closing/closed */
-		break;
-	case URP_STREAM_EV_RX_FIN:
-		/* Peer half-close: always SHUT_WR the local UDS; advance the
-		 * two states with a defined FIN transition.
-		 */
-		t.actions = URP_STREAM_ACT_SHUTDOWN_WR;
-		if (cur == URP_STREAM_STATE_ESTABLISHED)
-			t.next = URP_STREAM_STATE_CLOSE_WAIT;
-		else if (cur == URP_STREAM_STATE_FIN_WAIT)
-			t.next = URP_STREAM_STATE_CLOSED;
-		break;
-	case URP_STREAM_EV_RX_RST:
-		t.next = URP_STREAM_STATE_CLOSED;
-		t.actions = URP_STREAM_ACT_SHUTDOWN_RDWR |
-			    URP_STREAM_ACT_DESTROY;
-		break;
-	case URP_STREAM_EV_TX_FIN:
-		if (cur == URP_STREAM_STATE_ESTABLISHED)
-			t.next = URP_STREAM_STATE_FIN_WAIT;
-		else if (cur == URP_STREAM_STATE_CLOSE_WAIT)
-			t.next = URP_STREAM_STATE_CLOSED;
-		break;
-	case URP_STREAM_EV_TX_RST:
-		t.next = URP_STREAM_STATE_CLOSED;
-		t.actions = URP_STREAM_ACT_SHUTDOWN_RDWR;
-		break;
-	}
-	return t;
-}
 
 /*
  * Handle a SYN-flagged frame arriving from the peer. Creates a stream

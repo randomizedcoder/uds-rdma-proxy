@@ -461,26 +461,13 @@ void urp_stream_destroy(struct urp_endpoint *ep, struct urp_stream *s);
  * effects the caller must apply (socket shutdown / destroy), and whether
  * the event was accepted (RX_SYN on a closing/closed stream is not).
  */
-enum urp_stream_event {
-	URP_STREAM_EV_RX_SYN,
-	URP_STREAM_EV_RX_FIN,
-	URP_STREAM_EV_RX_RST,
-	URP_STREAM_EV_TX_FIN,
-	URP_STREAM_EV_TX_RST,
-};
-
-#define URP_STREAM_ACT_SHUTDOWN_WR	BIT(0)	/* kernel_sock_shutdown SHUT_WR */
-#define URP_STREAM_ACT_SHUTDOWN_RDWR	BIT(1)	/* kernel_sock_shutdown SHUT_RDWR */
-#define URP_STREAM_ACT_DESTROY		BIT(2)	/* urp_stream_destroy */
-
-struct urp_stream_transition {
-	enum urp_stream_state	next;
-	u32			actions;	/* URP_STREAM_ACT_* bitmask */
-	bool			accepted;	/* false => event invalid in state */
-};
-
-struct urp_stream_transition
-urp_stream_next_state(enum urp_stream_state cur, enum urp_stream_event ev);
+/*
+ * The pure state-machine types + urp_stream_next_state() prototype live in
+ * urp_stream_sm.h (extracted so the transition logic can be fuzzed in
+ * userspace against the shim). enum urp_stream_state (UAPI) is already in
+ * scope by this point.
+ */
+#include "urp_stream_sm.h"
 
 /* urp_stream.c -- lifecycle handlers (Phase 3a Step 7) */
 int  urp_stream_rx_syn(struct urp_endpoint *ep, u32 stream_id,
