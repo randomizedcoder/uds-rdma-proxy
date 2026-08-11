@@ -120,11 +120,22 @@ ASAN/UBSan + decision invariants (next_state never yields an out-of-range
 state; a rejected event never changes state; the §27.8 overrun guard). First
 run: **6.0M execs in 91 s, no ASAN/UBSan/invariant abort**, corpus still growing.
 
-The remaining targets below (codec truncations, reorder, credit, PSK) reuse
-the same shim + `nix/fuzz/` scaffolding. The C reorder backend still needs the
-kernel rbtree bundled (`lib/rbtree.c`) to fuzz standalone -- the one RX piece
-not yet under the userspace harness (the Rust reorder twin is fuzzed via
-cargo-fuzz `reorder_ops`).
+The **default C reorder backend** is now fuzzed too — **`nix run .#fuzz-reorder`**
+compiles the real `kernel/urp_reorder.c` against the kernel's OWN userspace
+rbtree (`tools/lib/rbtree.c`), extracted at build time from the nixpkgs-pinned
+kernel source (narHash-secured, not vendored); the libc allocators satisfy the
+slab (with `__GFP_ZERO` honoured so `kzalloc` zeroes). Until this, only the
+*optional* Rust backend was fuzzed (cargo-fuzz `reorder_ops`) — the default C
+rbtree backend that actually runs was not. The oracle is a spec-model
+differential against the documented `urp_reorder.h` contract (the same contract
+the Rust `ReorderBuffer` mirrors): in-order contiguous delivery, byte-exact
+payloads, `gap_count ≤ max_buffered`, + ASAN/UBSan on the rbtree usage and the
+`kmalloc(sizeof+len)` add. First run: **3.7M execs, clean** (the one abort was
+the U64_MAX saturation terminal corner — a harness-model boundary the Rust
+harness also relaxes per PR #11, not a backend bug).
+
+The remaining targets below (codec truncations, credit, PSK) reuse the same
+shim + `nix/fuzz/` scaffolding.
 
 The pure, allocator-and-verbs-free C units compile standalone if we stub a
 handful of kernel symbols (`kmalloc`→`malloc`, `kfree`→`free`,
