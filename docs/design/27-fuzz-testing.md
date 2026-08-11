@@ -251,17 +251,27 @@ paths F0/F1 can't.
    than fixed patterns; run under the sanitizer kernel.
 2. **Nix targets**: `nix run .#fuzz-<name>` for every target (F0 Rust, F1 C,
    F2 syz/wire), plus `.#fuzz-all-smoke` (time-boxed, all targets).
-3. **CI wiring** (matches repo philosophy):
-   - **per-push** (`ci.yml`): `fuzz-all-smoke` — each F0/F1 target 30–60 s
-     from the committed corpus. Deterministic, cheap; a new crash fails CI.
-   - **nightly** (`nightly.yml`, self-hosted): long F0/F1 runs, the F2 syz +
-     wire fuzzer for N hours in the KASAN VM, corpus minimization.
-4. **Corpus + crashes**: commit a seed corpus per target under
-   `fuzz/corpus/<t>/` (currently empty); persist/minimize the grown corpus as
-   a nightly artifact; check crash reproducers into
-   `fuzz/regressions/<t>/` and replay them in the per-push smoke run so fixed
-   bugs stay fixed. Coverage reported per nightly (llvm-cov for F0/F1, KCOV
-   summary for F2).
+3. **CI wiring** (matches repo philosophy) — **IMPLEMENTED**:
+   - **per-push** (`ci.yml`, `fuzz-smoke` job, hosted runner): the hermetic F1
+     harnesses `fuzz-classify` + `fuzz-rx-seq` for 45 s each under libFuzzer +
+     ASAN/UBSan. Deterministic, cheap, no KVM; a new crash exits non-zero and
+     fails the gate. `fuzz-reorder` is nightly-only (it pulls the pinned
+     `kernel.src` for the rbtree, a ~140 MB fetch not worth every push).
+   - **nightly** (`nightly.yml`, `fuzz-long` job, hosted): `fuzz-classify` +
+     `fuzz-rx-seq` + `fuzz-reorder` for 10 min each (matrix), crash artifacts
+     uploaded. The F2 live-module fuzzers (netlink blind/coverage-guided,
+     racer, hostile wire) already run nightly **inside** the
+     `microvm-sanitizers` pair test under KASAN/KMEMLEAK on the `[self-hosted,
+     kvm]` runner — no separate job needed.
+4. **Corpus + crashes** — **convention wired**: crash reproducers go under
+   `fuzz/regressions/<target>/` and are replayed first by both the per-push and
+   nightly jobs, so fixed bugs stay fixed (see `fuzz/regressions/README.md`).
+   Still open: committing/minimising grown seed corpora as a nightly artifact,
+   and coverage reporting (llvm-cov for F1, KCOV summary for F2).
+
+The one F3 item still open is the **lifecycle/churn fuzz** (item 1 above): a
+randomized-pattern extension of `nix/soak-1h.nix` run under the sanitizer
+kernel.
 
 ## 27.8 Seed findings — bugs this sweep already found (fuzz oracles + fixes)
 
