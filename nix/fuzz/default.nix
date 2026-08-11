@@ -52,6 +52,43 @@ let
       '';
       meta.mainProgram = name;
     };
+
+  # Default C reorder backend fuzzer (design 27 F1.2 / F0.3). Compiles the REAL
+  # kernel/urp_reorder.c against the kernel's OWN userspace rbtree
+  # (tools/lib/rbtree.c), extracted at build time from the nixpkgs-pinned kernel
+  # source -- narHash-secured, not vendored. libc satisfies the kernel slab.
+  # Until now only the optional Rust reorder backend was fuzzed (cargo-fuzz
+  # reorder_ops); this covers the DEFAULT C rbtree backend that actually runs.
+  reorderKernelSrc = pkgs.linuxPackages_latest.kernel.src;
+  fuzz-reorder = pkgs.stdenv.mkDerivation {
+    pname = "urp-fuzz-reorder";
+    version = "0.1.0";
+    src = fuzzSrc;
+    nativeBuildInputs = [ pkgs.clang pkgs.gnutar pkgs.xz ];
+    buildPhase = ''
+      runHook preBuild
+      # Pull the kernel's userspace rbtree from the pinned source tarball.
+      mkdir -p ksrc
+      tar xf ${reorderKernelSrc} --strip-components=1 -C ksrc \
+        --wildcards '*/tools/lib/rbtree.c' '*/tools/include/*'
+      clang -g -O1 -std=gnu11 \
+        -fsanitize=fuzzer,address,undefined \
+        -fno-omit-frame-pointer \
+        -Wall -Wextra \
+        -DU64_MAX=0xffffffffffffffffULL \
+        -I ksrc/tools/include -I kernel -I nix/fuzz \
+        nix/fuzz/reorder_fuzz.c kernel/urp_reorder.c ksrc/tools/lib/rbtree.c \
+        -o fuzz-reorder
+      runHook postBuild
+    '';
+    installPhase = ''
+      runHook preInstall
+      mkdir -p $out/bin
+      cp fuzz-reorder $out/bin/
+      runHook postInstall
+    '';
+    meta.mainProgram = "fuzz-reorder";
+  };
   # Live-kernel netlink fuzzer (design 27 F2, S3). A plain standalone
   # binary -- not libFuzzer -- meant to run INSIDE a sanitizer VM against
   # the loaded urp module, hammering the genl control plane. Built here so
@@ -163,6 +200,9 @@ in
     harness = "rx_seq_fuzz.c";
     units = [ "kernel/urp_frame.c" "kernel/urp_stream_sm.c" ];
   };
+
+  # Default C reorder backend + spec-model differential (real rbtree bundled).
+  inherit fuzz-reorder;
 
   # Live-kernel netlink fuzzer binary (for the microVM rootfs).
   inherit netlinkFuzz;
