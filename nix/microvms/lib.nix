@@ -505,14 +505,74 @@ in rec {
         vm_run "$port" "$host" "dmesg | tail -40" 10 \
           > "$RUNDIR/diag/$label.dmesg-post.txt"
       done
-      # urp show after echo: traffic counters should be > 0 on the
-      # initiator if data left the box.
       for label in vm1 vm2; do
         if [ "$label" = vm1 ]; then port=$VM1_VIRTIO host=$VM1_PROC; else port=$VM2_VIRTIO host=$VM2_PROC; fi
         vm_run "$port" "$host" "urp show" 10 \
           > "$RUNDIR/diag/$label.urp-show-post.txt"
       done
       info "diagnostics written to $RUNDIR/diag/"
+      echo ""
+
+      # -----------------------------------------------------------------
+      # Phase 10b — stats liveness assertions (design 28 §28.8).
+      #
+      # Unit tests + fuzzers prove each component works in isolation; they
+      # CANNOT prove the wired-up data path actually drives it. This asserts
+      # that the counters a data round-trip MUST move are non-zero -- the
+      # cheap oracle that catches "feature silently not exercised" (the class
+      # of bug that hid the inert reorder buffer, design 29 Gap 1). A counter
+      # that no scenario can move is a dead-feature smell.
+      # -----------------------------------------------------------------
+      echo "--- Phase 10b: stats liveness ---"
+
+      # statval <stats-file> <key> -> the integer value, or "" if absent.
+      statval() { sed -n "s/^$2://p" "$1" | tail -1; }
+
+      # assert_moved <label> <stats-file> <key>: hard-fail if a counter that a
+      # completed round-trip must have driven is missing or still zero.
+      assert_moved() {
+        local v; v=$(statval "$2" "$3")
+        if [ -z "$v" ]; then fail "$1: stat '$3' not reported by urp stats"; fi
+        if [ "$v" -gt 0 ] 2>/dev/null; then
+          pass "$1: $3 = $v (moved)"
+        else
+          fail "$1: $3 is '$v' -- data path did not drive it"
+        fi
+      }
+
+      # expect_pending <label> <stats-file> <key> <why>: a counter we EXPECT
+      # to be inert today (a documented gap). Never fails; surfaces its value
+      # every run so the gap stays visible, and flags the moment it goes live
+      # so the check can be promoted to assert_moved.
+      expect_pending() {
+        local v; v=$(statval "$2" "$3")
+        if [ "''${v:-0}" -gt 0 ] 2>/dev/null; then
+          pass "$1: $3 = $v (now LIVE -- promote to assert_moved, design 28 §28.8)"
+        else
+          info "$1: $3 = ''${v:-0} (expected inert: $4)"
+        fi
+      }
+
+      for entry in "vm1:$VM1_VIRTIO:$VM1_PROC:pair_acceptor" \
+                   "vm2:$VM2_VIRTIO:$VM2_PROC:pair_initiator"; do
+        IFS=":" read -r label port host ep <<<"$entry"
+        sfile="$RUNDIR/diag/$label.stats.txt"
+        vm_run "$port" "$host" "urp stats $ep | tr -d ' '" 10 \
+          | tr -d '\r' > "$sfile"
+        # A completed echo + 12-stream burst MUST have moved frames and bytes
+        # in both directions on both endpoints.
+        assert_moved "$label" "$sfile" tx-frames
+        assert_moved "$label" "$sfile" rx-frames
+        assert_moved "$label" "$sfile" tx-bytes
+        assert_moved "$label" "$sfile" rx-bytes
+        # Reorder path is inert today: urp_recv_done delivers in completion
+        # order and never feeds urp_reorder_insert (design 29 Gap 1). Stays a
+        # pending check until the RX wiring + a multi-QP reordering scenario
+        # land (design 28 §28.8.3).
+        expect_pending "$label" "$sfile" reorder-insertions \
+          "reorder buffer not wired into the RX path -- design 29 Gap 1"
+      done
+      pass "traffic counters moved on both endpoints"
       echo ""
 
       # -----------------------------------------------------------------

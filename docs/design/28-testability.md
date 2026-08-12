@@ -152,3 +152,88 @@ failing row is identifiable (as `uapi.rs` already does).
 - [26-upstream-readiness.md](26-upstream-readiness.md) — "decide, then act"
   extraction also addresses the reviewer-facing "one function does too much"
   smell noted there.
+- [29-code-review-refactor-plan.md](29-code-review-refactor-plan.md) — its two
+  functional gaps (inert reorder buffer, ignored `buffer_count`) are the
+  motivating cases for §28.8 below: both are *fully unit-tested and fuzzed*
+  and *dead anyway*.
+
+## 28.8 The integration / liveness layer (added 2026-08-11)
+
+§28.1–28.7 are about **unit** coverage: extract pure logic, table-drive it.
+That program worked — the frame classifier and stream state machine are now
+exhaustively tested and differentially checked against Rust twins. But a
+later review (design 29) found the reorder buffer **inert**: it has KUnit
+cases, a spec-model differential, `fuzz-reorder`, and the Rust `reorder_ops`
+twin — all green — and `urp_recv_done` never calls it. `stats.reorder_insertions`
+is exported over netlink, printed by `urp stats`, and **no test asserts it is
+ever non-zero**.
+
+The lesson: **unit tests and fuzzers are structurally blind to dead code.**
+They invoke the function under test directly, so "does the wired-up system
+actually *reach* this?" is off their map. A component can be perfectly
+tested and perfectly unreachable at the same time. Catching that needs a
+different layer.
+
+### 28.8.1 The liveness oracle
+
+> For every configurable feature and every stat counter, there must be at
+> least one integration scenario that **moves** it. A counter that no
+> scenario can move is a dead-feature smell — either the feature is unwired
+> or the test that should exercise it is missing.
+
+This is cheap: the counters already exist and are already read back over
+netlink. The oracle is one assertion per counter, in the VM pair test where
+the real data path runs. It is the check that would have failed on day one
+for the reorder buffer.
+
+Two assertion primitives (implemented in `nix/microvms/lib.nix`, Phase 10b):
+
+- `assert_moved <endpoint> <counter>` — hard-fail if, after a scenario that
+  *must* have driven the counter, it is missing or still zero. Used for the
+  traffic counters (`tx-frames`/`rx-frames`/`tx-bytes`/`rx-bytes`) after the
+  echo round-trip + 12-stream burst, on **both** endpoints. This catches a
+  silent data-path break directly.
+- `expect_pending <endpoint> <counter> <why>` — a counter we *expect* inert
+  today because of a documented gap. Never fails; logs its value on every
+  run so the gap stays visible, and prints "promote this to assert_moved"
+  the moment it goes non-zero. `reorder-insertions` is the first user
+  (design 29 Gap 1). This is the honest XFAIL: green today, self-announcing
+  the day the feature is wired.
+
+### 28.8.2 Counter → scenario coverage map
+
+| Counter | Scenario that should move it | Status |
+|---|---|---|
+| `tx-frames` / `rx-frames` / `tx-bytes` / `rx-bytes` | echo round-trip + 12-stream burst (Phase 10) | **asserted** (Phase 10b) |
+| `reorder-insertions` / `reorder-drops` | multi-QP (`--num-qps > 1`) with **induced cross-QP reordering** | **pending** — needs the reorder RX wiring (design 29 Gap 1) **and** a reordering scenario; `expect_pending` today |
+| `auth-failures` | a connect with a mismatched PSK against a password-protected endpoint | **planned** — §28.8.3 |
+| `credit-stalls` | sustained load that outruns credit replenishment | **planned** — surfaces under the soak/load scenario, not the light echo |
+| `active-streams` | the 12-stream burst (transiently) | observable in diag; assert deferred (races reap) |
+| `buffer-alloc-fails` | pool exhaustion under load | planned (load scenario) |
+| effective `buffer_count` / `buffer_size` | — | **not observable** — nothing exposes the *effective* pool size (design 29 Gap 2); either plumb the config through and expose it, or drop the attrs. No liveness test is possible until then. |
+
+### 28.8.3 Roadmap for the pending scenarios
+
+1. **Reorder liveness** (unblocks the design-29 Gap-1 fix): rxe delivers
+   in-order *per QP*, so reordering only appears with `num_qps > 1` **and**
+   genuine cross-QP arrival skew. Force it deterministically with a small
+   crafted peer that sends frames with out-of-order sequence numbers (more
+   reliable for a regression than stochastic `tc netem reorder`, design 12
+   §12.7). Then flip `reorder-insertions` from `expect_pending` to
+   `assert_moved`, and assert the *delivered* byte stream is still in-order
+   and byte-exact.
+2. **PSK mismatch phase**: stand up a second endpoint pair with mismatched
+   `--password`, attempt a connect, and hard-assert (a) the connection is
+   rejected and (b) `auth-failures` moved. A failure to reject is a real
+   security regression, so this one asserts hard once added.
+3. **Load/credit phase**: fold the randomized-churn soak (design 27 F3, the
+   one open item) in under the sanitizer kernel and assert `credit-stalls`
+   and `buffer-alloc-fails` move under pressure.
+
+### 28.8.4 Why this belongs with the table-driven unit work
+
+Same thesis, one level up: the unit layer makes each *decision* exhaustively
+checkable; the liveness layer makes each *feature's participation in the
+running system* checkable. Both are needed — the reorder buffer proves that
+100% unit coverage of a component says nothing about whether the product
+uses it.
