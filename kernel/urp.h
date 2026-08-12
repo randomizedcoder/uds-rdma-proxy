@@ -64,13 +64,17 @@ typedef struct sockaddr urp_sockaddr_t;
 #define urp_strscpy(dst, src, sz) strscpy((dst), (src), (sz))
 #endif
 
-/* Buffer pool sizing -- defaults; per-endpoint values override at create */
+/*
+ * Buffer pool sizing. These compile-time values are what actually sizes
+ * the pool, SRQ, and CQs today; the per-endpoint buffer_count/buffer_size
+ * config is accepted over netlink but NOT yet plumbed into the pool --
+ * a known gap, see design doc 29 (Gap 2).
+ */
 #define URP_NUM_BUFS		64
 #define URP_BUF_SIZE		4096	/* payload + header */
 #define URP_MAX_PAYLOAD		(URP_BUF_SIZE - URP_FRAME_HEADER_SIZE)
 #define URP_CQ_ENTRIES		(URP_NUM_BUFS * 2)	/* send + recv */
 #define URP_SQ_DEPTH		URP_NUM_BUFS
-#define URP_RQ_DEPTH		URP_NUM_BUFS
 
 /*
  * struct urp_buffer - DMA-mapped buffer for RDMA send/recv
@@ -238,7 +242,6 @@ struct urp_stream {
 	struct mutex		lock;		/* serializes state changes */
 
 	u64			tx_seq;		/* next outgoing seq */
-	u64			rx_next;	/* next expected incoming seq */
 
 	atomic64_t		tx_bytes;	/* payload bytes sent on this stream */
 	atomic64_t		rx_bytes;	/* payload bytes delivered to its UDS */
@@ -355,10 +358,6 @@ struct urp_endpoint {
 	int			cm_status;
 	bool			connected;
 
-	/* RX work */
-	struct work_struct	rx_work;
-	struct workqueue_struct	*rx_wq;
-
 	/* Phase 3b: per-endpoint probe ticker. Fires every
 	 * URP_PROBE_INTERVAL_MS on the system workqueue, emits one PING
 	 * per established QP, reschedules itself. Cancelled in
@@ -419,8 +418,6 @@ struct urp_buffer *urp_buf_alloc_send(struct urp_endpoint *ep);
 void urp_buf_free_send(struct urp_endpoint *ep, struct urp_buffer *buf);
 struct urp_buffer *urp_buf_alloc_recv(struct urp_endpoint *ep);
 void urp_buf_free_recv(struct urp_endpoint *ep, struct urp_buffer *buf);
-int  urp_post_recv(struct urp_endpoint *ep, struct ib_qp *qp, struct urp_buffer *buf);
-int  urp_post_recv_for_qp(struct urp_endpoint *ep, struct ib_qp *qp, u32 count);
 
 /* urp_srq.c -- Shared Receive Queue (Phase 3a Step 3) */
 int  urp_srq_create(struct urp_endpoint *ep);
@@ -475,7 +472,6 @@ int  urp_stream_rx_syn(struct urp_endpoint *ep, u32 stream_id,
 int  urp_stream_rx_fin(struct urp_stream *s);
 int  urp_stream_rx_rst(struct urp_stream *s);
 void urp_stream_tx_fin(struct urp_stream *s);
-void urp_stream_tx_rst(struct urp_stream *s);
 int  urp_stream_rx_dispatch(struct urp_endpoint *ep, u32 stream_id, u8 flags,
 			    struct urp_stream **out_stream);
 /* Acceptor-side backend-connect split (Step 7d): needs_backend() is a cheap
@@ -490,7 +486,7 @@ int  urp_pump_start(struct urp_endpoint *ep);
 void urp_pump_stop(struct urp_endpoint *ep);
 int  urp_stream_pump_start(struct urp_stream *stream);
 void urp_stream_pump_stop(struct urp_stream *stream);
-int  urp_emit_credit_frame(struct urp_endpoint *ep, struct urp_qp *qps,
+int  urp_emit_credit_frame(struct urp_endpoint *ep, struct urp_qp *qp,
 			   u32 stream_id, u16 grants);
 int  urp_emit_pong_on(struct urp_endpoint *ep, struct ib_qp *qp,
 		      const void *ping_payload);

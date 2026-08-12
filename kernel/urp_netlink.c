@@ -352,6 +352,39 @@ static inline void *urp_genlmsg_iput(struct sk_buff *skb,
 /* ---------------------------------------------------------------- */
 
 /*
+ * Shared doit preamble: parse the attribute set and require NAME. When
+ * @out_ep is non-NULL additionally look the endpoint up by that name and
+ * take a reference (the caller must urp_endpoint_put() it). Sets an
+ * extack message and returns -errno on failure.
+ */
+static int urp_genl_lookup_by_name(struct genl_info *info, struct nlattr **tb,
+				   struct urp_endpoint **out_ep)
+{
+	int ret;
+
+	ret = urp_parse_endpoint(info, tb);
+	if (ret)
+		return ret;
+
+	if (!tb[URP_ENDPOINT_A_NAME]) {
+		GENL_SET_ERR_MSG(info, "endpoint name required");
+		return -EINVAL;
+	}
+
+	if (out_ep) {
+		char name[URP_NAME_MAX];
+
+		nla_strscpy(name, tb[URP_ENDPOINT_A_NAME], URP_NAME_MAX);
+		*out_ep = urp_endpoint_get(name);
+		if (!*out_ep) {
+			GENL_SET_ERR_MSG(info, "endpoint not found");
+			return -ENOENT;
+		}
+	}
+	return 0;
+}
+
+/*
  * URP_CMD_NEW_ENDPOINT (admin)
  *
  * Required: NAME, plus exactly one of LISTEN_PATH/CONNECT_PATH, plus the
@@ -368,14 +401,9 @@ static int urp_new_endpoint_doit(struct sk_buff *skb, struct genl_info *info)
 	struct urp_endpoint *ep;
 	int ret;
 
-	ret = urp_parse_endpoint(info, tb);
+	ret = urp_genl_lookup_by_name(info, tb, NULL);
 	if (ret)
 		return ret;
-
-	if (!tb[URP_ENDPOINT_A_NAME]) {
-		GENL_SET_ERR_MSG(info, "endpoint name required");
-		return -EINVAL;
-	}
 
 	/*
 	 * Config scratch. struct urp_endpoint embeds the buffer array, so
@@ -456,23 +484,11 @@ static int urp_del_endpoint_doit(struct sk_buff *skb, struct genl_info *info)
 {
 	struct nlattr *tb[URP_ENDPOINT_A_MAX + 1];
 	struct urp_endpoint *ep;
-	char name[URP_NAME_MAX];
 	int ret;
 
-	ret = urp_parse_endpoint(info, tb);
+	ret = urp_genl_lookup_by_name(info, tb, &ep);
 	if (ret)
 		return ret;
-	if (!tb[URP_ENDPOINT_A_NAME]) {
-		GENL_SET_ERR_MSG(info, "endpoint name required");
-		return -EINVAL;
-	}
-	nla_strscpy(name, tb[URP_ENDPOINT_A_NAME], URP_NAME_MAX);
-
-	ep = urp_endpoint_get(name);
-	if (!ep) {
-		GENL_SET_ERR_MSG(info, "endpoint not found");
-		return -ENOENT;
-	}
 
 	urp_endpoint_remove(ep);	/* unpublish + drain + drop table ref (once) */
 	urp_endpoint_put(ep);		/* drop our caller ref */
@@ -487,28 +503,42 @@ static int urp_del_endpoint_doit(struct sk_buff *skb, struct genl_info *info)
  * `urp drain`). Other attributes are silently ignored to match the UAPI
  * contract (PATH/ADDR/BUFFER_SIZE are immutable after creation).
  */
+/*
+ * Guard for the activation-time sizing attrs in SET. Once the endpoint is
+ * active (ep->qps allocated) the value cannot change (see the comment at
+ * the call site); refuse with -EBUSY + extack, otherwise store it.
+ * Called with ep->lock held.
+ */
+static int urp_set_sizing_u32(struct genl_info *info, struct urp_endpoint *ep,
+			      const struct nlattr *attr, u32 *field,
+			      const char *what)
+{
+	u32 want;
+
+	if (!attr)
+		return 0;
+
+	want = nla_get_u32(attr);
+	if (ep->qps && want != *field) {
+		GENL_SET_ERR_MSG_FMT(info,
+				     "%s is fixed once the endpoint is active; remove and re-add to change it",
+				     what);
+		return -EBUSY;
+	}
+	*field = want;
+	return 0;
+}
+
 static int urp_set_endpoint_doit(struct sk_buff *skb, struct genl_info *info)
 {
 	struct nlattr *tb[URP_ENDPOINT_A_MAX + 1];
 	struct urp_endpoint *ep;
-	char name[URP_NAME_MAX];
 	int ret;
 	bool drain_requested = false;
 
-	ret = urp_parse_endpoint(info, tb);
+	ret = urp_genl_lookup_by_name(info, tb, &ep);
 	if (ret)
 		return ret;
-	if (!tb[URP_ENDPOINT_A_NAME]) {
-		GENL_SET_ERR_MSG(info, "endpoint name required");
-		return -EINVAL;
-	}
-	nla_strscpy(name, tb[URP_ENDPOINT_A_NAME], URP_NAME_MAX);
-
-	ep = urp_endpoint_get(name);
-	if (!ep) {
-		GENL_SET_ERR_MSG(info, "endpoint not found");
-		return -ENOENT;
-	}
 
 	if (tb[URP_ENDPOINT_A_STATE]) {
 		u8 want = nla_get_u8(tb[URP_ENDPOINT_A_STATE]);
@@ -523,43 +553,32 @@ static int urp_set_endpoint_doit(struct sk_buff *skb, struct genl_info *info)
 
 	mutex_lock(&ep->lock);
 	/*
-	 * num_qps and buffer_count are activation-time sizing parameters:
-	 * urp_qps_init() does ep->qps = kcalloc(ep->num_qps, ...) and the
-	 * buffer pool / CQ depth are scaled from buffer_count at setup. Once
-	 * the endpoint is active (ep->qps allocated) these cannot be changed:
-	 * the arrays are not resized, so a larger num_qps makes every
-	 * "for (i = 0; i < ep->num_qps; i++) ep->qps[i]" walk (urp_rdma_cleanup,
-	 * the RX/TX paths) run off the end of the allocation -- a slab
-	 * out-of-bounds / use-after-free that faults in rdma_disconnect(), and
-	 * a smaller value silently leaks the QPs above the new count. The
-	 * coverage-guided netlink fuzzer (design 27 F2) caught this as a KASAN
-	 * OOB in urp_rdma_cleanup on NEW(num_qps=1) + SET(num_qps=8) + DEL.
-	 * A live QP array cannot be safely resized, so refuse: callers must
-	 * remove and re-add the endpoint to change these.
+	 * num_qps and buffer_count are activation-time sizing parameters --
+	 * urp_qps_init() does ep->qps = kcalloc(ep->num_qps, ...). (Note
+	 * buffer_count does NOT size the buffer pool yet -- that is the
+	 * compile-time URP_NUM_BUFS; see design doc 29 Gap 2 -- but it is
+	 * guarded identically so the UAPI contract holds once it does.)
+	 * Once the endpoint is active (ep->qps allocated) these cannot be
+	 * changed: the arrays are not resized, so a larger num_qps makes
+	 * every "for (i = 0; i < ep->num_qps; i++) ep->qps[i]" walk
+	 * (urp_rdma_cleanup, the RX/TX paths) run off the end of the
+	 * allocation -- a slab out-of-bounds / use-after-free that faults in
+	 * rdma_disconnect(), and a smaller value silently leaks the QPs
+	 * above the new count. The coverage-guided netlink fuzzer (design 27
+	 * F2) caught this as a KASAN OOB in urp_rdma_cleanup on
+	 * NEW(num_qps=1) + SET(num_qps=8) + DEL. A live QP array cannot be
+	 * safely resized, so refuse: callers must remove and re-add the
+	 * endpoint to change these.
 	 */
-	if (tb[URP_ENDPOINT_A_NUM_QPS]) {
-		u32 want = nla_get_u32(tb[URP_ENDPOINT_A_NUM_QPS]);
-
-		if (ep->qps && want != ep->num_qps) {
-			mutex_unlock(&ep->lock);
-			GENL_SET_ERR_MSG(info,
-					 "num_qps is fixed once the endpoint is active; remove and re-add to change it");
-			ret = -EBUSY;
-			goto out;
-		}
-		ep->num_qps = want;
-	}
-	if (tb[URP_ENDPOINT_A_BUFFER_COUNT]) {
-		u32 want = nla_get_u32(tb[URP_ENDPOINT_A_BUFFER_COUNT]);
-
-		if (ep->qps && want != ep->buffer_count) {
-			mutex_unlock(&ep->lock);
-			GENL_SET_ERR_MSG(info,
-					 "buffer_count is fixed once the endpoint is active; remove and re-add to change it");
-			ret = -EBUSY;
-			goto out;
-		}
-		ep->buffer_count = want;
+	ret = urp_set_sizing_u32(info, ep, tb[URP_ENDPOINT_A_NUM_QPS],
+				 &ep->num_qps, "num_qps");
+	if (!ret)
+		ret = urp_set_sizing_u32(info, ep,
+					 tb[URP_ENDPOINT_A_BUFFER_COUNT],
+					 &ep->buffer_count, "buffer_count");
+	if (ret) {
+		mutex_unlock(&ep->lock);
+		goto out;
 	}
 	if (tb[URP_ENDPOINT_A_PASSWORD]) {
 		nla_strscpy((char *)ep->password,
@@ -586,24 +605,12 @@ static int urp_get_endpoint_doit(struct sk_buff *skb, struct genl_info *info)
 	struct nlattr *tb[URP_ENDPOINT_A_MAX + 1];
 	struct sk_buff *msg;
 	struct urp_endpoint *ep;
-	char name[URP_NAME_MAX];
 	void *hdr;
 	int ret;
 
-	ret = urp_parse_endpoint(info, tb);
+	ret = urp_genl_lookup_by_name(info, tb, &ep);
 	if (ret)
 		return ret;
-	if (!tb[URP_ENDPOINT_A_NAME]) {
-		GENL_SET_ERR_MSG(info, "endpoint name required");
-		return -EINVAL;
-	}
-	nla_strscpy(name, tb[URP_ENDPOINT_A_NAME], URP_NAME_MAX);
-
-	ep = urp_endpoint_get(name);
-	if (!ep) {
-		GENL_SET_ERR_MSG(info, "endpoint not found");
-		return -ENOENT;
-	}
 
 	msg = genlmsg_new(NLMSG_GOODSIZE, GFP_KERNEL);
 	if (!msg) {

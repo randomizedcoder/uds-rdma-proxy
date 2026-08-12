@@ -57,11 +57,21 @@ int urp_streams_init(struct urp_endpoint *ep)
 }
 
 /*
- * Reap streams whose TX pump has exited (client closed its UDS). Called
- * ONLY from urp_recv_done, whose recv-CQ completions are serialized, so
- * this never runs concurrently with the lock-free stream lookups /
- * post-rcu backend-connect there. That serialization is what lets us
- * destroy streams here without per-stream refcounting.
+ * Reap streams whose TX pump has exited (client closed its UDS).
+ *
+ * CURRENTLY UNCALLED -- deliberately. Eager reap-on-close (calling this
+ * from urp_recv_done on tx_done) races an in-flight response:
+ * `echo X | socat - UNIX-CONNECT` half-closes after sending, so the
+ * stream would be destroyed before the reply is delivered back, losing
+ * it. Correct reap-on-close needs the FIN handshake (reap when the PEER
+ * closes), which is a follow-up; until then streams are reaped at
+ * endpoint drain (urp_streams_destroy_all), so nothing leaks per
+ * endpoint lifetime.
+ *
+ * The intended call site is urp_recv_done, whose recv-CQ completions are
+ * serialized, so this never runs concurrently with the lock-free stream
+ * lookups / post-rcu backend-connect there. That serialization is what
+ * lets us destroy streams here without per-stream refcounting.
  *
  * tx_done is set at the end of urp_stream_tx_fn, which runs only after the
  * pump kthread has returned -- so urp_stream_destroy's kthread_stop is a
@@ -146,7 +156,6 @@ int urp_stream_create(struct urp_endpoint *ep, u32 stream_id,
 	s->id = stream_id ? stream_id : urp_stream_next_id(ep);
 	s->state = URP_STREAM_STATE_SYN_SENT;
 	s->tx_seq = 0;
-	s->rx_next = 0;
 	atomic64_set(&s->tx_bytes, 0);
 	atomic64_set(&s->rx_bytes, 0);
 	s->tx_done = false;
@@ -388,27 +397,6 @@ void urp_stream_tx_fin(struct urp_stream *s)
 	mutex_lock(&s->lock);
 	t = urp_stream_next_state(s->state, URP_STREAM_EV_TX_FIN);
 	s->state = t.next;
-	mutex_unlock(&s->lock);
-}
-
-/*
- * Local-side send of RST -- abrupt close from our direction. The
- * caller will emit a DATA frame with URP_DATA_FLAG_RST; this helper
- * updates state. Subsequent calls to urp_stream_destroy reap the
- * entry from the rhashtable.
- */
-void urp_stream_tx_rst(struct urp_stream *s)
-{
-	struct urp_stream_transition t;
-
-	if (!s)
-		return;
-
-	mutex_lock(&s->lock);
-	t = urp_stream_next_state(s->state, URP_STREAM_EV_TX_RST);
-	s->state = t.next;
-	if ((t.actions & URP_STREAM_ACT_SHUTDOWN_RDWR) && s->uds_sock)
-		kernel_sock_shutdown(s->uds_sock, SHUT_RDWR);
 	mutex_unlock(&s->lock);
 }
 

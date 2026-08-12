@@ -222,56 +222,6 @@ void urp_buf_free_recv(struct urp_endpoint *ep, struct urp_buffer *buf)
 	spin_unlock_irqrestore(&ep->recv_lock, flags);
 }
 
-/* ---- RDMA post operations ---- */
-
-/* Forward declaration for recv CQE callback */
-static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc);
-
-int urp_post_recv(struct urp_endpoint *ep, struct ib_qp *qp,
-		  struct urp_buffer *buf)
-{
-	struct ib_recv_wr wr = {};
-	const struct ib_recv_wr *bad_wr;
-
-	buf->sge.length = URP_BUF_SIZE;
-	buf->cqe.done = urp_recv_done;
-
-	wr.wr_cqe = &buf->cqe;
-	wr.sg_list = &buf->sge;
-	wr.num_sge = 1;
-
-	return ib_post_recv(qp, &wr, &bad_wr);
-}
-
-/*
- * Post up to @count recv buffers from the endpoint's pool to @qp's RQ.
- * Step 2b posts a fixed slice per QP at QP-setup time; Step 3 will move
- * this work to the shared SRQ.
- */
-int urp_post_recv_for_qp(struct urp_endpoint *ep, struct ib_qp *qp, u32 count)
-{
-	u32 posted = 0;
-
-	while (posted < count) {
-		struct urp_buffer *buf = urp_buf_alloc_recv(ep);
-		int ret;
-
-		if (!buf)
-			break;	/* pool exhausted -- not fatal */
-
-		ret = urp_post_recv(ep, qp, buf);
-		if (ret) {
-			urp_buf_free_recv(ep, buf);
-			pr_err("post_recv failed: %d\n", ret);
-			return ret;
-		}
-		posted++;
-	}
-
-	pr_info("posted %u recv buffers to QP\n", posted);
-	return 0;
-}
-
 /* ---- Deferred rdma_connect ---- */
 
 /*
@@ -469,14 +419,9 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 	}
 
 	/*
-	 * NOTE: eager reap-on-close is intentionally NOT done here. Reaping on
-	 * tx_done (client half-closed its write) races an in-flight response:
-	 * `echo X | socat - UNIX-CONNECT` half-closes after sending, so the
-	 * stream would be destroyed before the reply is delivered back, losing
-	 * it. Correct reap-on-close needs the FIN handshake (reap when the PEER
-	 * closes), which is a follow-up. Streams are still reaped safely at
-	 * endpoint drain (urp_streams_destroy_all), so nothing leaks per
-	 * endpoint lifetime. See urp_streams_reap() (retained for that work).
+	 * Eager reap-on-close is intentionally NOT done here -- see the
+	 * comment on urp_streams_reap() (urp_stream.c) for why, and where
+	 * streams do get reaped.
 	 */
 
 	/*
@@ -616,10 +561,10 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 		 */
 		qp_idx = urp_qp_index_of(ep, wc->qp);
 		if (qp_idx >= 0) {
-			struct urp_qp *qps = &ep->qps[qp_idx];
+			struct urp_qp *qp = &ep->qps[qp_idx];
 
-			atomic64_add(payload_len, &qps->rx_bytes);
-			atomic64_inc(&qps->rx_frames);
+			atomic64_add(payload_len, &qp->rx_bytes);
+			atomic64_inc(&qp->rx_frames);
 
 			/*
 			 * Step 4b: record_recv + threshold-driven CREDIT
@@ -632,7 +577,7 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 			 * frame; URP-to-URP peers consume it via the
 			 * URP_FRAME_TYPE_CONTROL branch above.
 			 */
-			urp_credit_record_recv(&qps->credit);
+			urp_credit_record_recv(&qp->credit);
 			/*
 			 * Only emit CREDIT frames toward peers that speak
 			 * the multi-stream protocol (non-zero stream_id).
@@ -643,10 +588,10 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 			 * there causes RNR on the peer.
 			 */
 			if (stream_id != 0 &&
-			    urp_credit_should_grant(&qps->credit)) {
-				u16 grants = urp_credit_take_grants(&qps->credit);
+			    urp_credit_should_grant(&qp->credit)) {
+				u16 grants = urp_credit_take_grants(&qp->credit);
 
-				urp_emit_credit_frame(ep, qps, stream_id,
+				urp_emit_credit_frame(ep, qp, stream_id,
 						      grants);
 			}
 		}
@@ -676,6 +621,20 @@ repost:
 void urp_recv_done_for_srq(struct ib_cq *cq, struct ib_wc *wc)
 {
 	urp_recv_done(cq, wc);
+}
+
+/*
+ * Destroy a cm_id together with the urp_cm_ctx hanging off its context
+ * pointer, and clear the caller's pointer. Every cm_id we create gets a
+ * kzalloc'd ctx, so the pair must always be freed together.
+ */
+static void urp_cm_id_destroy(struct rdma_cm_id **idp)
+{
+	struct urp_cm_ctx *ctx = (*idp)->context;
+
+	rdma_destroy_id(*idp);
+	kfree(ctx);
+	*idp = NULL;
 }
 
 /*
@@ -735,16 +694,12 @@ static int urp_cm_accept_one(struct rdma_cm_id *child, struct urp_endpoint *ep,
 	 * avoid destroying a cm_id from inside its own event handler.
 	 */
 	if (ep->qps[qp_index].cm_id) {
-		struct urp_cm_ctx *old_ctx = ep->qps[qp_index].cm_id->context;
-
 		if (ep->qps[qp_index].qp) {
 			ib_drain_qp(ep->qps[qp_index].qp);
 			rdma_destroy_qp(ep->qps[qp_index].cm_id);
 			ep->qps[qp_index].qp = NULL;
 		}
-		rdma_destroy_id(ep->qps[qp_index].cm_id);
-		kfree(old_ctx);
-		ep->qps[qp_index].cm_id = NULL;
+		urp_cm_id_destroy(&ep->qps[qp_index].cm_id);
 		ep->qps[qp_index].established = false;
 	}
 
@@ -1041,24 +996,13 @@ int urp_rdma_init(struct urp_endpoint *ep, const char *peer_addr,
 	return 0;
 
 err_destroy_listen:
-	{
-		struct urp_cm_ctx *ctx = ep->listen_id->context;
-
-		rdma_destroy_id(ep->listen_id);
-		kfree(ctx);
-		ep->listen_id = NULL;
-	}
+	urp_cm_id_destroy(&ep->listen_id);
 	return ret;
 
 err_destroy_all:
 	for (i = 0; i < ep->num_qps; i++) {
-		if (ep->qps[i].cm_id) {
-			struct urp_cm_ctx *ctx = ep->qps[i].cm_id->context;
-
-			rdma_destroy_id(ep->qps[i].cm_id);
-			kfree(ctx);
-			ep->qps[i].cm_id = NULL;
-		}
+		if (ep->qps[i].cm_id)
+			urp_cm_id_destroy(&ep->qps[i].cm_id);
 	}
 	return ret;
 }
@@ -1088,13 +1032,8 @@ void urp_rdma_cleanup(struct urp_endpoint *ep)
 
 		/* Free per-QP cm_ids (and their cm_ctx). */
 		for (i = 0; i < ep->num_qps; i++) {
-			if (ep->qps[i].cm_id) {
-				struct urp_cm_ctx *ctx = ep->qps[i].cm_id->context;
-
-				rdma_destroy_id(ep->qps[i].cm_id);
-				kfree(ctx);
-				ep->qps[i].cm_id = NULL;
-			}
+			if (ep->qps[i].cm_id)
+				urp_cm_id_destroy(&ep->qps[i].cm_id);
 		}
 	}
 
@@ -1117,11 +1056,6 @@ void urp_rdma_cleanup(struct urp_endpoint *ep)
 	}
 	ep->ib_dev = NULL;
 
-	if (ep->listen_id) {
-		struct urp_cm_ctx *ctx = ep->listen_id->context;
-
-		rdma_destroy_id(ep->listen_id);
-		kfree(ctx);
-		ep->listen_id = NULL;
-	}
+	if (ep->listen_id)
+		urp_cm_id_destroy(&ep->listen_id);
 }
