@@ -63,5 +63,9 @@ To build the module against your **running** kernel, see the `buildUrpKo`
   netns/multi-tenancy + k8s provisioning design in §24–25).
 - **[docs/KERNEL-MODULE-PLAN.md](docs/KERNEL-MODULE-PLAN.md)** — phased
   implementation plan; **[status.md](status.md)** — current status.
+- **[docs/BENCHMARKING.md](docs/BENCHMARKING.md)** — how the buffer geometry
+  (`buffer_count`/`buffer_size`) is benchmarked and the emulated-harness results
+  (⚠️ soft-RoCE VM numbers, not a performance baseline; real RoCEv2-hardware
+  testing is a TODO).
 
 > Prototype / research code. Not production-hardened.
