@@ -217,7 +217,7 @@ soak fuzz, corpus artifact management, coverage reporting).
 ## Known functional gaps
 
 Found by the 2026-08-11 docs-vs-implementation review (full analysis and
-wiring plans land in `docs/design/29-code-review-refactor-plan.md`):
+wiring plans: `docs/design/29-code-review-refactor-plan.md`):
 
 1. **Per-stream reorder buffer is not wired into the RX path.** Both backends
    (C rbtree default, optional Rust FFI) are implemented, KUnit-tested, and
