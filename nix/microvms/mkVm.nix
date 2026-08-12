@@ -252,19 +252,14 @@ in
         procps
         util-linux
         urpCli
-        # Live-kernel netlink fuzzer (design 27 F2). Tiny standalone binary;
-        # invoked by the pair harness's fuzz phase against the loaded module.
-        (import ../fuzz { inherit pkgs lib; }).netlinkFuzz
-        # KCOV coverage-guided netlink fuzzer (design 27 F2, S3). Needs the
-        # CONFIG_KCOV sanitizer kernel; run in the sanitizer pair test.
-        (import ../fuzz { inherit pkgs lib; }).covFuzz
-        # Concurrent netlink racer (design 27 F2, S3 concurrency). Multi-thread
-        # NEW/DEL/SET/GET churn to trip endpoint-lifecycle UAF under KASAN.
-        (import ../fuzz { inherit pkgs lib; }).raceFuzz
-        # Hostile-peer RDMA wire fuzzer (design 27 F2, S1/S2). Run from the
-        # peer VM against the acceptor to fuzz the RX frame path under KASAN.
-        (import ../fuzz { inherit pkgs lib; }).wireFuzz
-      ];
+      ]
+      # Live-kernel + live-wire fuzzers (design 27 F2), baked into the rootfs
+      # and invoked by the pair harness's fuzz phases against the loaded
+      # module / acceptor under KASAN: fuzz-netlink (S3 blind),
+      # fuzz-netlink-cov (S3 KCOV-guided), fuzz-netlink-race (S3 concurrency),
+      # fuzz-wire (S1/S2 hostile peer).
+      ++ (with (import ../fuzz { inherit pkgs lib; });
+        [ fuzz-netlink fuzz-netlink-cov fuzz-netlink-race fuzz-wire ]);
 
       # Expose the .ko via an env var on root's shell so test scripts
       # can `insmod $URP_KO` without hardcoding store paths.
