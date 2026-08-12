@@ -37,6 +37,17 @@ for the full picture):
   (`nix build .#analysis-all`); all clean except a small documented
   checkpatch residual (see
   [docs/design/26-upstream-readiness.md](docs/design/26-upstream-readiness.md)).
+- **Fuzzing** — a comprehensive program covering every attack surface (see
+  [docs/design/27-fuzz-testing.md](docs/design/27-fuzz-testing.md)): hermetic
+  libFuzzer+ASAN/UBSan harnesses that compile the real kernel C (frame
+  classifier, RX state-machine pipeline, C reorder backend), cargo-fuzz on the
+  shared Rust crate, and live-VM fuzzers (coverage-guided netlink via KCOV,
+  concurrent netlink racer, hostile-peer RDMA wire fuzzer) that run inside the
+  KASAN/KMEMLEAK/lockdep pair test. Three real memory-safety bugs found and
+  fixed so far.
+- **CI** — every push: Nix build matrix + fuzz smoke ([ci.yml](.github/workflows/ci.yml));
+  nightly: 10-minute fuzz runs, both microVM pair tests (incl. sanitizers),
+  the 1-hour soak, and cross-arch gates ([nightly.yml](.github/workflows/nightly.yml)).
 
 ## Quick start (Nix)
 
@@ -51,6 +62,11 @@ nix run  .#urp-microvm-pair-test-debug  # ...under KASAN/KMEMLEAK/lockdep
 # fork flake the first time):
 nix run  .#test-redpanda-uds                # metadata round-trip
 nix run  .#test-redpanda-produce-consume    # full produce/consume
+
+# Hermetic fuzzing (libFuzzer + ASAN/UBSan on the real kernel C):
+nix run  .#fuzz-classify -- -max_total_time=60   # RX frame classifier
+nix run  .#fuzz-rx-seq   -- -max_total_time=60   # RX state-machine pipeline
+nix run  .#fuzz-reorder  -- -max_total_time=60   # C reorder backend
 ```
 
 To build the module against your **running** kernel, see the `buildUrpKo`

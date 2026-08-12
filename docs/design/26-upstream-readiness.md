@@ -147,14 +147,18 @@ Ordered by what a maintainer would flag first:
 4. **1 ms poll loops in the pumps** — buffer-exhaustion and QP-selection
    backoff spin on `schedule_timeout_interruptible(1ms)`. Should be a
    waitqueue woken from `urp_send_done`.
-5. **kthread lifecycle** — pumps park forever after EOF because the
-   `task_struct` handed to `kthread_stop()` isn't pinned. Proper fix:
-   `get_task_struct()` at start, let the pump self-exit, `put` after
-   `kthread_stop()`. Also name threads per-endpoint/stream
-   (`"urp-tx/%s"`) so `ps` output is usable.
-6. **`urp.h` monolith** (600+ lines, every struct + prototype for 11 TUs)
-   — split (`urp_frame.h` for the codec inlines is the natural first
-   cut); replace open-coded frame-offset arithmetic with a
+5. **kthread lifecycle** — **FIXED** (`ef59a55`): pump/listener
+   `task_struct`s are now pinned with `get_task_struct()` at spawn and
+   `put_task_struct()` after `kthread_stop()`, so `kthread_stop()` can
+   never see a freed task (this was an observable refcount-saturate oops
+   on the drain path that left the module unremovable). Still open from
+   this item: instance-qualified thread names (`"urp-tx/%s"`) so `ps`
+   output is usable.
+6. **`urp.h` monolith** — partially done: `urp_frame.h` (codec inlines),
+   `urp_stream_sm.h`, `urp_credit.h`, and `urp_reorder.h` are extracted;
+   `urp.h` still carries every core struct (incl. the 100+-line
+   `struct urp_endpoint`) + prototypes for 9 TUs. Finish the split;
+   replace open-coded frame-offset arithmetic with a
    `struct urp_frame_hdr` of `__le32`/`__le64` members.
 7. **Annotations** — no `__read_mostly` / `__ro_after_init` anywhere;
    `urp_endpoints`/`urp_endpoints_inited` are non-static module globals.

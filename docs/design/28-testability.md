@@ -1,8 +1,14 @@
 # 28. Testability Review + Table-Driven-Test Refactoring Plan
 
-Status: **review + plan** — 2026-08-09. Prompted by the observation that the
-two RX security bugs (design 27 §27.8, fixed in the rx-hardening PR) both
-lived in code that **no unit test could reach**.
+Status: **review + plan (steps 1–2 implemented)** — 2026-08-09, updated
+2026-08-11. Prompted by the observation that the two RX security bugs
+(design 27 §27.8, fixed in the rx-hardening PR) both lived in code that
+**no unit test could reach**. Since drafting: **E1 landed**
+(`urp_classify_frame` in the dual-compile `kernel/urp_frame.c`, table-tested,
+fuzzed by `.#fuzz-classify`) and **E2 landed** (`urp_stream_next_state` in
+the dual-compile `kernel/urp_stream_sm.{h,c}`, with the Rust twin
+`uds_rdma_protocol::stream`, table-tested, fuzzed by `.#fuzz-rx-seq`).
+Steps 3–5 of §28.5 remain open.
 
 ## 28.1 The thesis
 
@@ -19,6 +25,10 @@ entangled callbacks into small, side-effect-free functions, and (b)
 table-driven style is what makes that coverage exhaustive and cheap to extend.
 
 ## 28.2 Where we are today
+
+*(Counts below are as of drafting, 2026-08-09; after E1/E2 the suite is 34
+KUnit cases — the additions cover the stream state machine and the RX
+classifier — and the protocol crate gained the `stream` module twin.)*
 
 **KUnit (`kernel/urp_test.c`, 30 cases, suite `"urp"`)** covers the pure
 leaves only — frame/probe codec inlines (12), credit state (8, a 1:1 mirror
@@ -44,7 +54,7 @@ bugs were.**
 
 ## 28.3 The extract points (highest leverage first)
 
-### E1 — Frame classifier out of `urp_recv_done` (`urp_rdma.c:444`)
+### E1 — Frame classifier out of `urp_recv_done` (`urp_rdma.c:444`) — **DONE** (`kernel/urp_frame.c`)
 
 Today one `void(ib_cq*, ib_wc*)` callback interleaves the whole
 classify→validate→route decision tree with `wc` reads, DMA, credit/EWMA
@@ -64,7 +74,7 @@ DELIVER_LEGACY, DELIVER_STREAM}` plus decoded `payload_len/stream_id/flags`.
 surface — **including a regression row for each §27.8 bug** — and it has a
 direct Rust twin in `frame::FrameHeader` to diff against.
 
-### E2 — Stream state machine out of the handlers (`urp_stream.c`) — *the big one*
+### E2 — Stream state machine out of the handlers (`urp_stream.c`) — *the big one* — **DONE** (`kernel/urp_stream_sm.{h,c}` + Rust twin `stream.rs`)
 
 The SYN/FIN/RST transitions are embedded in handlers that each `mutex_lock`
 and do socket/kthread/rhashtable side effects, reachable only via the live RX
@@ -77,9 +87,9 @@ CLOSE_WAIT→CLOSED.
 cur, enum urp_stream_event ev, u32 *action_mask)` where the action mask is
 `{SHUTDOWN_WR, SHUTDOWN_RDWR, CREATE, DESTROY}`. Handlers keep the locking +
 socket calls but delegate the decision. A `{state, event} → {next, actions}`
-table then covers the **entire transition matrix** in KUnit — the state
-machine currently has *zero* direct tests (the header comment at
-`urp_stream.c` even claims KUnit coverage that does not exist).
+table then covers the **entire transition matrix** in KUnit — at drafting
+time the state machine had *zero* direct tests (since fixed by this
+extraction; the transition table is now KUnit-covered and fuzzed).
 
 This is also the **highest-leverage shared-logic win**: confirmed, the stream
 state machine exists **only in C** — the Rust protocol crate has frame/probe/
@@ -116,12 +126,13 @@ failing row is identifiable (as `uapi.rs` already does).
 
 ## 28.5 Phased plan
 
-1. **E2 stream state machine** (biggest security + shared-logic win): extract
-   `urp_stream_next_state`, add a `{state,event}` KUnit table, add a Rust
-   `stream` module twin + its own table, wire a differential check like
-   credit/reorder. Land the §27.8 RST transition as an explicit row.
-2. **E1 frame classifier**: extract `urp_classify_frame`, table-test it with
-   the two §27.8 bugs as regression rows, diff against `frame::FrameHeader`.
+1. **E2 stream state machine** — **DONE**: `urp_stream_next_state` extracted
+   into the dual-compile `kernel/urp_stream_sm.{h,c}`, `{state,event}` KUnit
+   table added, Rust `stream` module twin added, and the whole pipeline is
+   additionally fuzzed by `.#fuzz-rx-seq` (design 27 F1).
+2. **E1 frame classifier** — **DONE**: `urp_classify_frame` extracted into
+   the dual-compile `kernel/urp_frame.c`, table-tested with the §27.8 bugs
+   as regression rows, and fuzzed by `.#fuzz-classify`.
 3. **Convert existing tests to tables**: `mtu.rs` (13→1), the per-flag/per-
    type frame and credit/reorder cases, and the KUnit frame/probe cases —
    using the 28.4 idiom. Pure mechanical, no code under test changes.
