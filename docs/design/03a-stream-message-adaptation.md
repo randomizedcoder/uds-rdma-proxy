@@ -1,5 +1,13 @@
 # Stream-to-Message Adaptation
 
+> **Note (2026-08-11):** Written during the original userspace-proxy design
+> era (2026-05). The protocol and architecture content below still describes
+> the implemented wire behavior, but implementation specifics are
+> userspace-flavored (Rust proxy process, userspace ibverbs) — the shipped
+> implementation is the `urp` **kernel module** (see [DESIGN.md](../DESIGN.md)),
+> and v0–v4 phase references follow the abandoned userspace roadmap (see the
+> phase-numbering note in [KERNEL-MODULE-PLAN.md](../KERNEL-MODULE-PLAN.md)).
+
 ## 3a.1 The Fundamental Problem
 
 The UDS-RDMA proxy's core operation is bridging two fundamentally different I/O models:

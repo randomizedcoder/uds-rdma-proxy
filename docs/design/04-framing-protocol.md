@@ -1,5 +1,13 @@
 # Framing Protocol
 
+> **Note (2026-08-11):** Written during the original userspace-proxy design
+> era (2026-05). The protocol and architecture content below still describes
+> the implemented wire behavior, but implementation specifics are
+> userspace-flavored (Rust proxy process, userspace ibverbs) — the shipped
+> implementation is the `urp` **kernel module** (see [DESIGN.md](../DESIGN.md)),
+> and v0–v4 phase references follow the abandoned userspace roadmap (see the
+> phase-numbering note in [KERNEL-MODULE-PLAN.md](../KERNEL-MODULE-PLAN.md)).
+
 ## 4.1 Why Framing Is Needed
 
 UDS uses `SOCK_STREAM` (byte stream semantics) while RDMA SEND/RECV is message-oriented. The proxy must delimit messages so the receiver knows where one UDS write ends and the next begins. Framing is also required for:

@@ -1,5 +1,14 @@
 # Kernel Module Alternative
 
+> **Status: this is the implemented architecture.** Written as an
+> "alternative" to the userspace proxy design (docs 01–20), this approach
+> won: the project **was built as this kernel module** (see
+> [DESIGN.md](../DESIGN.md), `kernel/`, and
+> [KERNEL-MODULE-PLAN.md](../KERNEL-MODULE-PLAN.md), whose Phases 0–5 map the
+> k0/k1/k2 milestones below onto the executed plan). The userspace v0–v4
+> roadmap this document "runs parallel to" was abandoned. The analysis below
+> is kept as originally written.
+
 This document explores an alternative implementation of the UDS-RDMA proxy as a Linux kernel module, assessing the architectural trade-offs, Rust-in-kernel feasibility, code sharing strategy, and a phased approach that runs parallel to the userspace v0-v4 roadmap.
 
 ## 21.1 Motivation: Eliminating the UDS Copies
