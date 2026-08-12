@@ -629,7 +629,7 @@ static int connect_to_server(struct test_context *ctx, const char *server, int p
 static int mode_bigframe(struct test_context *ctx, size_t payload_len, int count)
 {
 	struct timespec start, end;
-	double elapsed, us_per_frame, mbps;
+	double elapsed, us_per_frame, mbps, msgs_per_s;
 	int i;
 
 	if (payload_len > MAX_PAYLOAD) {
@@ -673,10 +673,14 @@ static int mode_bigframe(struct test_context *ctx, size_t payload_len, int count
 	us_per_frame = elapsed * 1e6 / (count > 0 ? count : 1);
 	mbps = (double)(payload_len * (size_t)count) / (1024.0 * 1024.0) /
 	       (elapsed > 0 ? elapsed : 1e-9);
+	/* messages/sec is the meaningful metric for small messages, where
+	 * per-message overhead (headers, round-trip) dominates the byte rate.
+	 */
+	msgs_per_s = (double)count / (elapsed > 0 ? elapsed : 1e-9);
 
 	/* Single machine-parseable line for the pair-test oracle. */
-	printf("BIGFRAME_OK payload=%zu frames=%d rtt_us=%.1f mbps=%.1f\n",
-	       payload_len, count, us_per_frame, mbps);
+	printf("BIGFRAME_OK payload=%zu frames=%d rtt_us=%.1f mbps=%.1f msgs_per_s=%.0f\n",
+	       payload_len, count, us_per_frame, mbps, msgs_per_s);
 	return 0;
 }
 

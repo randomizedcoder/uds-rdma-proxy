@@ -768,11 +768,17 @@ in rec {
         || info "vm1 geom socat backend may not have started"
       geomtab="$RUNDIR/diag/geom-tradeoff.txt"
       : > "$geomtab"
-      GEOM_BFRAMES=16
+      GEOM_BFRAMES=32
       gport=4794
-      # count:size:payload  -- payload > 4076 on the 2nd/3rd proves the slot
-      # and max-payload were sized from buffer_size (not the old fixed 4096).
-      for spec in 16:4096:4000 32:16384:8000 64:32768:12000; do
+      # count:size:payload -- swept from tiny (256 B, small order-0 slots near
+      # URP_BUFFER_SIZE_MIN) up to 12000 B (order-3 slots > PAGE_SIZE). The
+      # small end is the RDMA/kernel-bypass sweet spot (per-message overhead
+      # dominates -> the msgs/s column is the interesting one); the payload >
+      # 4076 entries prove the slot + max-payload were sized from buffer_size
+      # (not the old fixed 4096). buffer_size is matched to the payload -- the
+      # realistic "size the pool for the workload" config -- so the sweep also
+      # exercises the whole page_pool order range end to end.
+      for spec in 64:512:256 64:1024:512 64:2048:1024 64:4096:2048 32:16384:8000 64:32768:12000; do
         gc=''${spec%%:*}; grest=''${spec#*:}; gs=''${grest%%:*}; gp=''${grest##*:}
         vm_run "$VM1_VIRTIO" "$VM1_PROC" \
           "urp add geom_acc --connect-path /tmp/urp-geom-echo.sock --bind $VM1_IP:$gport --buffer-count $gc --buffer-size $gs" "$T_URP" \
@@ -791,7 +797,7 @@ in rec {
         else
           fail "geom_acc: show reports count=''${rc:-?}/size=''${rs:-?}, want $gc/$gs"
         fi
-        # (3) push large single frames; the client verifies each echo byte-exact.
+        # (3) push single frames of this payload; client verifies each echo byte-exact.
         sleep "$POLL"
         gcli="$RUNDIR/diag/vm2.geom-client-$gs.txt"
         vm_run "$VM2_VIRTIO" "$VM2_PROC" \
@@ -802,8 +808,9 @@ in rec {
           gline=$(grep BIGFRAME_OK "$gcli" | tail -1)
           rtt=$(echo "$gline" | sed -n 's/.*rtt_us=\([0-9.]*\).*/\1/p')
           mbps=$(echo "$gline" | sed -n 's/.*mbps=\([0-9.]*\).*/\1/p')
+          msgs=$(echo "$gline" | sed -n 's/.*msgs_per_s=\([0-9.]*\).*/\1/p')
           pass "geom_acc size=$gs payload=$gp: $GEOM_BFRAMES frames echoed byte-exact"
-          printf "  %8s %8s %10s %10s\n" "$gs" "$gp" "''${rtt:-?}" "''${mbps:-?}" >> "$geomtab"
+          printf "  %8s %8s %10s %10s %10s\n" "$gs" "$gp" "''${rtt:-?}" "''${mbps:-?}" "''${msgs:-?}" >> "$geomtab"
         else
           awk '{print "    "$0}' "$gcli"
           fail "geom_acc size=$gs payload=$gp: bigframe did not report BIGFRAME_OK"
@@ -825,8 +832,8 @@ in rec {
         sleep "$POLL"
       done
       if [ -s "$geomtab" ]; then
-        info "geometry tradeoff (larger buffer_size -> higher per-frame RTT, higher MB/s):"
-        printf "  %8s %8s %10s %10s\n" "bufsize" "payload" "rtt_us" "mbps"
+        info "geometry tradeoff (small msgs -> more msgs/s, less MB/s; larger buffer_size -> higher MB/s):"
+        printf "  %8s %8s %10s %10s %10s\n" "bufsize" "payload" "rtt_us" "mbps" "msgs/s"
         cat "$geomtab"
       fi
       vm_run "$VM1_VIRTIO" "$VM1_PROC" "pkill -f urp-geom-echo.sock 2>/dev/null; rm -f /tmp/urp-geom-echo.sock; echo GBC" 5 >/dev/null 2>&1 || true
