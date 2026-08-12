@@ -15,8 +15,10 @@ use crate::uapi::NLA_F_NESTED;
 
 const NLA_HDR_LEN: usize = 4;
 
+/// Round up to the 4-byte netlink attribute alignment. Also used by the
+/// message-level framing in netlink.rs (same NLMSG_ALIGNTO).
 #[inline]
-fn align4(n: usize) -> usize {
+pub(crate) fn align4(n: usize) -> usize {
     (n + 3) & !3
 }
 

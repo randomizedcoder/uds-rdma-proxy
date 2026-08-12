@@ -1,15 +1,16 @@
 use clap::Args;
 
 use crate::attr::AttrBuf;
+use crate::commands::num_qps_parser;
 use crate::error::UrpError;
 use crate::netlink::UrpSocket;
-use crate::uapi::{UrpAttr, UrpCmd, UrpEndpointAttr, URP_NUM_QPS_MAX, URP_NUM_QPS_MIN};
+use crate::uapi::{UrpAttr, UrpCmd, UrpEndpointAttr};
 
 #[derive(Args, Debug)]
 pub struct SetArgs {
     pub name: String,
 
-    #[arg(long, value_parser = clap::value_parser!(u32).range((URP_NUM_QPS_MIN as i64)..((URP_NUM_QPS_MAX + 1) as i64)))]
+    #[arg(long, value_parser = num_qps_parser())]
     pub num_qps: Option<u32>,
 
     #[arg(long)]

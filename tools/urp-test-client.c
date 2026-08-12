@@ -30,12 +30,18 @@
 #include <rdma/rdma_cma.h>
 #include <infiniband/verbs.h>
 
-/* URP frame header (matches kernel/include/uapi/linux/urp.h) */
-#define URP_FRAME_HEADER_SIZE	20
-#define URP_FRAME_TYPE_DATA	0x00
-#define URP_DEFAULT_PORT	4791
+/*
+ * The real wire constants + frame codec: urp_fuzz_shim.h provides the
+ * fixed-width types and unaligned-LE helpers the kernel headers expect,
+ * then includes the actual UAPI header (URP_FRAME_HEADER_SIZE,
+ * URP_FRAME_TYPE_*, URP_DEFAULT_PORT) and kernel/urp_frame.h
+ * (urp_frame_encode, urp_frame_decode_payload_len). No private copy of
+ * the wire format here -- drift is impossible by construction.
+ */
+#include "urp_fuzz_shim.h"
+
 #define BUF_SIZE		4096
-#define MAX_PAYLOAD		(BUF_SIZE - URP_FRAME_HEADER_SIZE)
+#define MAX_PAYLOAD		URP_MAX_PAYLOAD
 
 struct test_context {
 	struct rdma_cm_id	*id;
@@ -48,49 +54,6 @@ struct test_context {
 	char			recv_buf[BUF_SIZE];
 	struct rdma_event_channel *ec;
 };
-
-static void urp_frame_encode(void *buf, uint32_t stream_id, uint64_t seq,
-			     uint8_t frame_type, uint8_t flags,
-			     uint16_t credits, uint32_t payload_len)
-{
-	uint8_t *p = buf;
-
-	/* Little-endian encoding matching the kernel module */
-	p[0] = stream_id & 0xFF;
-	p[1] = (stream_id >> 8) & 0xFF;
-	p[2] = (stream_id >> 16) & 0xFF;
-	p[3] = (stream_id >> 24) & 0xFF;
-
-	p[4] = seq & 0xFF;
-	p[5] = (seq >> 8) & 0xFF;
-	p[6] = (seq >> 16) & 0xFF;
-	p[7] = (seq >> 24) & 0xFF;
-	p[8] = (seq >> 32) & 0xFF;
-	p[9] = (seq >> 40) & 0xFF;
-	p[10] = (seq >> 48) & 0xFF;
-	p[11] = (seq >> 56) & 0xFF;
-
-	p[12] = frame_type;
-	p[13] = flags;
-
-	p[14] = credits & 0xFF;
-	p[15] = (credits >> 8) & 0xFF;
-
-	p[16] = payload_len & 0xFF;
-	p[17] = (payload_len >> 8) & 0xFF;
-	p[18] = (payload_len >> 16) & 0xFF;
-	p[19] = (payload_len >> 24) & 0xFF;
-}
-
-static uint32_t urp_frame_decode_payload_len(const void *buf)
-{
-	const uint8_t *p = buf;
-
-	return (uint32_t)p[16] |
-	       ((uint32_t)p[17] << 8) |
-	       ((uint32_t)p[18] << 16) |
-	       ((uint32_t)p[19] << 24);
-}
 
 static int wait_for_event(struct test_context *ctx, enum rdma_cm_event_type expected)
 {
