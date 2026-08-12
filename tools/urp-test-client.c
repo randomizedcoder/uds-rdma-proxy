@@ -34,8 +34,16 @@
 #define URP_FRAME_HEADER_SIZE	20
 #define URP_FRAME_TYPE_DATA	0x00
 #define URP_DEFAULT_PORT	4791
-#define BUF_SIZE		4096
+/*
+ * Registered buffers span the largest slot an endpoint can have
+ * (URP_BUFFER_SIZE_MAX 65536) so the `bigframe` mode can prove that an endpoint
+ * created with a large buffer_size actually carries a single >4076-byte payload
+ * (design 29 Gap 2). Small-frame modes (echo/latency/reorder) are unaffected.
+ */
+#define BUF_SIZE		65536
 #define MAX_PAYLOAD		(BUF_SIZE - URP_FRAME_HEADER_SIZE)
+/* Chunk that fits a default (4096-slot) endpoint, for the throughput mode. */
+#define DEFAULT_CHUNK		(4096 - URP_FRAME_HEADER_SIZE)
 
 struct test_context {
 	struct rdma_cm_id	*id;
@@ -311,7 +319,7 @@ static int mode_echo(struct test_context *ctx, const char *message, int count)
 static int mode_throughput(struct test_context *ctx, int size_mb)
 {
 	size_t total = (size_t)size_mb * 1024 * 1024;
-	size_t chunk = MAX_PAYLOAD;
+	size_t chunk = DEFAULT_CHUNK;	/* stay within a default 4096-slot endpoint */
 	size_t sent = 0;
 	uint64_t seq = 0;
 	struct timespec start, end;
@@ -607,6 +615,71 @@ static int connect_to_server(struct test_context *ctx, const char *server, int p
 	return 0;
 }
 
+/* ---- Mode: bigframe ----
+ *
+ * Sends `count` single DATA frames of `payload_len` bytes each on the legacy
+ * stream and verifies every echo comes back byte-for-byte. This is the
+ * discriminating proof that a large buffer_size is actually wired (design 29
+ * Gap 2): a payload_len > the default 4076 only survives if the target
+ * endpoint's slot (buffer_size) and wire max-payload were sized from its
+ * config -- with the old fixed 4096 slot the frame would be dropped OVERSIZE /
+ * fail to DMA. It also reports per-frame RTT (latency) and aggregate MB/s
+ * (throughput) so the buffer-size / latency-vs-throughput tradeoff is visible.
+ */
+static int mode_bigframe(struct test_context *ctx, size_t payload_len, int count)
+{
+	struct timespec start, end;
+	double elapsed, us_per_frame, mbps;
+	int i;
+
+	if (payload_len > MAX_PAYLOAD) {
+		fprintf(stderr, "bigframe payload %zu exceeds client max %d\n",
+			payload_len, MAX_PAYLOAD);
+		return 1;
+	}
+	/* Distinct byte pattern so a truncated / stale echo is caught. */
+	for (i = 0; i < (int)payload_len; i++)
+		ctx->send_buf[URP_FRAME_HEADER_SIZE + i] = (char)('A' + (i & 31));
+
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	for (i = 0; i < count; i++) {
+		uint32_t rlen;
+
+		/* do_echo consumes one pre-posted recv; replenish each iteration. */
+		if (post_recv(ctx)) {
+			perror("post_recv");
+			return 1;
+		}
+		if (do_echo(ctx, (uint64_t)i,
+			    ctx->send_buf + URP_FRAME_HEADER_SIZE, payload_len)) {
+			fprintf(stderr, "bigframe echo failed at frame %d\n", i);
+			return 1;
+		}
+		rlen = urp_frame_decode_payload_len(ctx->recv_buf);
+		if (rlen != payload_len) {
+			printf("BIGFRAME_FAIL frame=%d rx_payload=%u want=%zu\n",
+			       i, rlen, payload_len);
+			return 1;
+		}
+		if (memcmp(ctx->recv_buf + URP_FRAME_HEADER_SIZE,
+			   ctx->send_buf + URP_FRAME_HEADER_SIZE, payload_len)) {
+			printf("BIGFRAME_FAIL frame=%d payload mismatch\n", i);
+			return 1;
+		}
+	}
+	clock_gettime(CLOCK_MONOTONIC, &end);
+
+	elapsed = (double)timespec_diff_ns(&start, &end) / 1e9;
+	us_per_frame = elapsed * 1e6 / (count > 0 ? count : 1);
+	mbps = (double)(payload_len * (size_t)count) / (1024.0 * 1024.0) /
+	       (elapsed > 0 ? elapsed : 1e-9);
+
+	/* Single machine-parseable line for the pair-test oracle. */
+	printf("BIGFRAME_OK payload=%zu frames=%d rtt_us=%.1f mbps=%.1f\n",
+	       payload_len, count, us_per_frame, mbps);
+	return 0;
+}
+
 static void usage(const char *prog)
 {
 	fprintf(stderr, "Usage:\n");
@@ -614,6 +687,7 @@ static void usage(const char *prog)
 	fprintf(stderr, "  %s <ip> <port> throughput [size_mb]\n", prog);
 	fprintf(stderr, "  %s <ip> <port> latency [count]\n", prog);
 	fprintf(stderr, "  %s <ip> <port> reorder [nframes]\n", prog);
+	fprintf(stderr, "  %s <ip> <port> bigframe [payload_bytes] [count]\n", prog);
 	fprintf(stderr, "\nLegacy (no mode keyword):\n");
 	fprintf(stderr, "  %s <ip> [port] [message] [count]\n", prog);
 }
@@ -663,6 +737,17 @@ int main(int argc, char *argv[])
 		printf("RDMA connected to %s:%d\n", server, port);
 		int count = argc > 4 ? atoi(argv[4]) : 1000;
 		ret = mode_latency(&ctx, count);
+
+	} else if (argc >= 4 && strcmp(argv[3], "bigframe") == 0) {
+		port = atoi(argv[2]);
+		if (connect_to_server(&ctx, server, port)) {
+			cleanup(&ctx);
+			return 1;
+		}
+		printf("RDMA connected to %s:%d\n", server, port);
+		size_t payload = argc > 4 ? (size_t)strtoul(argv[4], NULL, 10) : 8000;
+		int count = argc > 5 ? atoi(argv[5]) : 4;
+		ret = mode_bigframe(&ctx, payload, count);
 
 	} else if (argc >= 4 && strcmp(argv[3], "reorder") == 0) {
 		port = atoi(argv[2]);

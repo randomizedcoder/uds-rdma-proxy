@@ -25,7 +25,7 @@ int urp_post_srq_recv(struct urp_endpoint *ep, struct urp_buffer *buf)
 	struct ib_recv_wr wr = {};
 	const struct ib_recv_wr *bad_wr;
 
-	buf->sge.length = URP_BUF_SIZE;
+	buf->sge.length = ep->buf_size;
 	buf->cqe.done = urp_recv_done_for_srq;
 
 	wr.wr_cqe = &buf->cqe;

@@ -747,6 +747,92 @@ in rec {
       echo ""
 
       # -----------------------------------------------------------------
+      # Phase 10f — buffer geometry proof (design 29 Gap 2). buffer_count
+      # and buffer_size are now wired: pool depth, CQ/SRQ/SQ, DMA slot bytes
+      # and the wire max-payload are all sized from the endpoint config. For
+      # each (count,size) we (1) add a dedicated acceptor with that geometry,
+      # (2) assert `urp show` reports the EFFECTIVE count/size (closes the
+      # design 28 observability gap), (3) from vm2 push single DATA frames of
+      # payload > the old fixed 4076 ceiling and verify each echo returns
+      # byte-exact -- only possible if the slot + max-payload were sized from
+      # buffer_size (the old fixed 4096 slot would drop them OVERSIZE / fail
+      # to DMA), and (4) assert the acceptor delivered every frame. Per-frame
+      # RTT and MB/s are logged so the size / latency-vs-throughput tradeoff
+      # is visible. Under the sanitizer kernel this also KASAN-checks the
+      # high-order (>PAGE_SIZE) page_pool allocation.
+      # -----------------------------------------------------------------
+      echo "--- Phase 10f: buffer geometry (buffer_count + buffer_size) ---"
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+        "rm -f /tmp/urp-geom-echo.sock; nohup socat -b 65536 UNIX-LISTEN:/tmp/urp-geom-echo.sock,fork EXEC:cat </dev/null >/dev/null 2>&1 & sleep 0.3; echo GEOM_SOCAT_OK" 5 \
+        | grep -q GEOM_SOCAT_OK \
+        || info "vm1 geom socat backend may not have started"
+      geomtab="$RUNDIR/diag/geom-tradeoff.txt"
+      : > "$geomtab"
+      GEOM_BFRAMES=16
+      gport=4794
+      # count:size:payload  -- payload > 4076 on the 2nd/3rd proves the slot
+      # and max-payload were sized from buffer_size (not the old fixed 4096).
+      for spec in 16:4096:4000 32:16384:8000 64:32768:12000; do
+        gc=''${spec%%:*}; grest=''${spec#*:}; gs=''${grest%%:*}; gp=''${grest##*:}
+        vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+          "urp add geom_acc --connect-path /tmp/urp-geom-echo.sock --bind $VM1_IP:$gport --buffer-count $gc --buffer-size $gs" "$T_URP" \
+          > "$RUNDIR/diag/vm1.geom-add-$gs.txt" 2>&1
+        if ! grep -q "ok:" "$RUNDIR/diag/vm1.geom-add-$gs.txt"; then
+          awk '{print "    "$0}' "$RUNDIR/diag/vm1.geom-add-$gs.txt"
+          fail "geom_acc add failed (count=$gc size=$gs)"
+        fi
+        # (2) GET must report the EFFECTIVE geometry.
+        gshow="$RUNDIR/diag/vm1.geom-show-$gs.txt"
+        vm_run "$VM1_VIRTIO" "$VM1_PROC" "urp show geom_acc" 10 | tr -d '\r' > "$gshow"
+        rc=$(sed -n 's/.*buffer-count: *//p' "$gshow" | tail -1)
+        rs=$(sed -n 's/.*buffer-size: *//p' "$gshow" | tail -1)
+        if [ "''${rc:-0}" = "$gc" ] && [ "''${rs:-0}" = "$gs" ]; then
+          pass "geom_acc: show reports buffer-count=$rc buffer-size=$rs (effective)"
+        else
+          fail "geom_acc: show reports count=''${rc:-?}/size=''${rs:-?}, want $gc/$gs"
+        fi
+        # (3) push large single frames; the client verifies each echo byte-exact.
+        sleep "$POLL"
+        gcli="$RUNDIR/diag/vm2.geom-client-$gs.txt"
+        vm_run "$VM2_VIRTIO" "$VM2_PROC" \
+          "urp-test-client $VM1_IP $gport bigframe $gp $GEOM_BFRAMES 2>&1 | tail -4" 40 \
+          > "$gcli" 2>&1 || true
+        scan_splat "$gcli" "geom client"
+        if grep -q BIGFRAME_OK "$gcli"; then
+          gline=$(grep BIGFRAME_OK "$gcli" | tail -1)
+          rtt=$(echo "$gline" | sed -n 's/.*rtt_us=\([0-9.]*\).*/\1/p')
+          mbps=$(echo "$gline" | sed -n 's/.*mbps=\([0-9.]*\).*/\1/p')
+          pass "geom_acc size=$gs payload=$gp: $GEOM_BFRAMES frames echoed byte-exact"
+          printf "  %8s %8s %10s %10s\n" "$gs" "$gp" "''${rtt:-?}" "''${mbps:-?}" >> "$geomtab"
+        else
+          awk '{print "    "$0}' "$gcli"
+          fail "geom_acc size=$gs payload=$gp: bigframe did not report BIGFRAME_OK"
+        fi
+        # (4) acceptor must have received + delivered every frame.
+        sleep 1
+        gstat="$RUNDIR/diag/vm1.geom-stats-$gs.txt"
+        vm_run "$VM1_VIRTIO" "$VM1_PROC" "urp stats geom_acc | tr -d ' '" 10 | tr -d '\r' > "$gstat"
+        grxf=$(statval "$gstat" rx-frames)
+        grxb=$(statval "$gstat" rx-bytes)
+        want_b=$((gp * GEOM_BFRAMES))
+        if [ "''${grxf:-0}" -ge "$GEOM_BFRAMES" ] 2>/dev/null && [ "''${grxb:-0}" -ge "$want_b" ] 2>/dev/null; then
+          pass "geom_acc size=$gs: rx-frames=$grxf rx-bytes=$grxb (>= $GEOM_BFRAMES / $want_b)"
+        else
+          fail "geom_acc size=$gs: rx-frames=''${grxf:-0} rx-bytes=''${grxb:-0}, want >= $GEOM_BFRAMES / $want_b"
+        fi
+        vm_run "$VM1_VIRTIO" "$VM1_PROC" "urp drain geom_acc 2>/dev/null; urp remove geom_acc 2>/dev/null; echo GEOM_GONE" 15 >/dev/null 2>&1 || true
+        gport=$((gport + 1))
+        sleep "$POLL"
+      done
+      if [ -s "$geomtab" ]; then
+        info "geometry tradeoff (larger buffer_size -> higher per-frame RTT, higher MB/s):"
+        printf "  %8s %8s %10s %10s\n" "bufsize" "payload" "rtt_us" "mbps"
+        cat "$geomtab"
+      fi
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" "pkill -f urp-geom-echo.sock 2>/dev/null; rm -f /tmp/urp-geom-echo.sock; echo GBC" 5 >/dev/null 2>&1 || true
+      echo ""
+
+      # -----------------------------------------------------------------
       # Phase 11 — teardown (drain, remove, rmmod), each step timed
       # so the slow command pops out of the verdict table.
       # -----------------------------------------------------------------

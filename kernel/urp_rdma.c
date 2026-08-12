@@ -67,7 +67,15 @@ static int urp_bufs_init(struct urp_endpoint *ep, struct ib_device *dev)
 {
 	struct page_pool_params pp = {
 		.flags		= 0,	/* no DMA mapping -- see comment above */
-		.order		= 0,
+		/*
+		 * order covers the whole slot: for the default 4096-byte slot on
+		 * a 4K-page host this is 0 (one page, unchanged); a larger
+		 * buffer_size raises it so each slot is one physically-contiguous
+		 * compound page. A high-order allocation can fail under memory
+		 * fragmentation -- page_pool returns NULL and activation fails
+		 * cleanly rather than corrupting anything.
+		 */
+		.order		= get_order(ep->buf_size),
 		.pool_size	= ep->num_bufs,
 		/*
 		 * Phase 4 Step 2: NUMA-aware allocation. When the
@@ -82,7 +90,7 @@ static int urp_bufs_init(struct urp_endpoint *ep, struct ib_device *dev)
 				   : NUMA_NO_NODE),
 		.dev		= NULL,
 		.dma_dir	= DMA_BIDIRECTIONAL,
-		.max_len	= URP_BUF_SIZE,
+		.max_len	= ep->buf_size,
 		.offset		= 0,
 	};
 	int i;
@@ -120,7 +128,7 @@ static int urp_bufs_init(struct urp_endpoint *ep, struct ib_device *dev)
 
 		buf->data = page_address(buf->page);
 		buf->dma_addr = ib_dma_map_page(dev, buf->page, 0,
-						URP_BUF_SIZE, DMA_BIDIRECTIONAL);
+						ep->buf_size, DMA_BIDIRECTIONAL);
 		if (ib_dma_mapping_error(dev, buf->dma_addr)) {
 			pr_err("ib_dma_map_page failed for buf %d\n", i);
 			page_pool_put_page(ep->page_pool, buf->page, -1, false);
@@ -129,7 +137,7 @@ static int urp_bufs_init(struct urp_endpoint *ep, struct ib_device *dev)
 		}
 
 		buf->sge.addr = buf->dma_addr;
-		buf->sge.length = URP_BUF_SIZE;
+		buf->sge.length = ep->buf_size;
 		/* lkey set after PD creation */
 
 		INIT_LIST_HEAD(&buf->list);
@@ -148,7 +156,7 @@ err:
 		struct urp_buffer *buf = &ep->bufs[i];
 
 		if (buf->page) {
-			ib_dma_unmap_page(dev, buf->dma_addr, URP_BUF_SIZE,
+			ib_dma_unmap_page(dev, buf->dma_addr, ep->buf_size,
 					  DMA_BIDIRECTIONAL);
 			page_pool_put_page(ep->page_pool, buf->page, -1, false);
 			buf->page = NULL;
@@ -174,7 +182,7 @@ static void urp_bufs_cleanup(struct urp_endpoint *ep, struct ib_device *dev)
 		if (!buf->page)
 			continue;
 
-		ib_dma_unmap_page(dev, buf->dma_addr, URP_BUF_SIZE,
+		ib_dma_unmap_page(dev, buf->dma_addr, ep->buf_size,
 				  DMA_BIDIRECTIONAL);
 		page_pool_put_page(ep->page_pool, buf->page, -1, false);
 		buf->page = NULL;
@@ -245,7 +253,7 @@ int urp_post_recv(struct urp_endpoint *ep, struct ib_qp *qp,
 	struct ib_recv_wr wr = {};
 	const struct ib_recv_wr *bad_wr;
 
-	buf->sge.length = URP_BUF_SIZE;
+	buf->sge.length = ep->buf_size;
 	buf->cqe.done = urp_recv_done;
 
 	wr.wr_cqe = &buf->cqe;
@@ -502,10 +510,10 @@ static int urp_rx_send_uds(struct urp_endpoint *ep, struct urp_stream *s,
  * single QP the frame is always the next expected, so this reduces to
  * insert-then-immediately-drain (one buffer copy, no reordering).
  *
- * @scratch is a URP_BUF_SIZE staging buffer supplied by the caller (the
+ * @scratch is an ep->buf_size staging buffer supplied by the caller (the
  * recv buffer itself, already copied out of by the insert). The reorder
- * buffer never yields more than URP_MAX_PAYLOAD < URP_BUF_SIZE, so drain
- * never reports -ENOBUFS.
+ * buffer never yields more than this endpoint's max payload
+ * (buf_size - header) < buf_size, so drain never reports -ENOBUFS.
  *
  * Serialization: the recv CQ is IB_POLL_WORKQUEUE, so completions for an
  * endpoint run one at a time -- the same invariant that lets the caller
@@ -538,7 +546,7 @@ static void urp_rx_deliver_stream(struct urp_endpoint *ep, struct urp_stream *s,
 
 	for (;;) {
 		u64 dseq;
-		size_t dlen = URP_BUF_SIZE;
+		size_t dlen = ep->buf_size;
 
 		if (urp_reorder_drain_next(s->reorder, &dseq, scratch, &dlen))
 			break;	/* -ENOENT: no more in-order frames ready */

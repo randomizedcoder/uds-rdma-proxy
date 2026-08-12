@@ -62,7 +62,7 @@
 /* Defaults applied when attribute absent in NEW_ENDPOINT */
 #define URP_NUM_QPS_DEFAULT	1
 #define URP_BUFFER_COUNT_DEFAULT 1024
-#define URP_BUFFER_SIZE_DEFAULT	4076
+#define URP_BUFFER_SIZE_DEFAULT	4096	/* slot = header + 4076 payload */
 
 /*
  * GENL commands

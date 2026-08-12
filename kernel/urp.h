@@ -71,8 +71,45 @@ typedef struct sockaddr urp_sockaddr_t;
  * is the default DMA slot size (frame header + max payload) used when buffer_size
  * is the default; the per-endpoint slot size is ep->buffer_size.
  */
-#define URP_BUF_SIZE		4096	/* payload + header */
-#define URP_MAX_PAYLOAD		(URP_BUF_SIZE - URP_FRAME_HEADER_SIZE)
+#define URP_BUF_SIZE		4096	/* default slot: payload + header */
+/*
+ * URP_MAX_PAYLOAD is the ABSOLUTE, compile-time payload ceiling used by the
+ * pure frame decoder (urp_frame.c, also dual-compiled into the fuzzers): the
+ * largest payload any endpoint could ever carry = the biggest slot
+ * (URP_BUFFER_SIZE_MAX) minus the header. Per-endpoint enforcement is tighter
+ * and automatic: a recv buffer is posted with sge.length = ep->buf_size, so a
+ * completion's byte_len can never exceed the endpoint's slot, and the decoder's
+ * "payload_len > byte_len - header" check rejects anything larger than that
+ * endpoint's real capacity. See urp_ep_max_payload().
+ */
+#define URP_MAX_PAYLOAD		(URP_BUFFER_SIZE_MAX - URP_FRAME_HEADER_SIZE)
+
+/*
+ * Pure per-endpoint sizing resolvers (table-tested in urp_test.c). Kept inline
+ * and side-effect-free so the KUnit suite can pin every boundary without a live
+ * RDMA device.
+ *
+ *   num_bufs  = buffer_count clamped to [MIN, MAX]      (pool depth)
+ *   buf_size  = buffer_size  clamped to [MIN, MAX]      (DMA slot bytes)
+ *   payload   = buf_size - header                       (max wire payload)
+ */
+static inline u32 urp_resolve_num_bufs(u32 buffer_count)
+{
+	return clamp_t(u32, buffer_count,
+		       URP_BUFFER_COUNT_MIN, URP_BUFFER_COUNT_MAX);
+}
+
+static inline u32 urp_resolve_buf_size(u32 buffer_size)
+{
+	return clamp_t(u32, buffer_size,
+		       URP_BUFFER_SIZE_MIN, URP_BUFFER_SIZE_MAX);
+}
+
+static inline u32 urp_ep_max_payload(u32 buf_size)
+{
+	/* buf_size >= URP_BUFFER_SIZE_MIN (= header) so this never underflows */
+	return buf_size - URP_FRAME_HEADER_SIZE;
+}
 
 /*
  * struct urp_buffer - DMA-mapped buffer for RDMA send/recv
@@ -350,6 +387,7 @@ struct urp_endpoint {
 	 */
 	struct urp_buffer	*bufs;
 	u32			num_bufs;
+	u32			buf_size;	/* live DMA slot bytes (from buffer_size) */
 	struct list_head	send_free;
 	struct list_head	recv_free;
 	spinlock_t		send_lock;	/* protects send_free */
