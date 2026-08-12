@@ -55,6 +55,7 @@
 #define URP_NUM_QPS_MAX		32
 #define URP_NUM_QPS_MIN		1
 #define URP_BUFFER_COUNT_MIN	16
+#define URP_BUFFER_COUNT_MAX	65536	/* hard cap: bounds the pool allocation */
 #define URP_BUFFER_SIZE_MIN	URP_FRAME_HEADER_SIZE
 #define URP_BUFFER_SIZE_MAX	65536
 

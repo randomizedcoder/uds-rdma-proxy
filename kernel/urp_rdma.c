@@ -7,7 +7,8 @@
  * Initiator: rdma_resolve_addr() -> rdma_connect() to peer.
  * Acceptor:  rdma_listen() -> rdma_accept() from peer.
  *
- * Buffer pool: URP_NUM_BUFS pages, DMA-mapped, split into send and recv pools.
+ * Buffer pool: ep->num_bufs pages (from buffer_count), DMA-mapped, split into
+ * send and recv pools.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -67,7 +68,7 @@ static int urp_bufs_init(struct urp_endpoint *ep, struct ib_device *dev)
 	struct page_pool_params pp = {
 		.flags		= 0,	/* no DMA mapping -- see comment above */
 		.order		= 0,
-		.pool_size	= URP_NUM_BUFS,
+		.pool_size	= ep->num_bufs,
 		/*
 		 * Phase 4 Step 2: NUMA-aware allocation. When the
 		 * underlying NIC has a real PCI parent we can read its
@@ -91,16 +92,23 @@ static int urp_bufs_init(struct urp_endpoint *ep, struct ib_device *dev)
 	spin_lock_init(&ep->send_lock);
 	spin_lock_init(&ep->recv_lock);
 
+	/* ep->num_bufs is resolved (and bounds-clamped) in urp_endpoint_activate */
+	ep->bufs = kcalloc(ep->num_bufs, sizeof(*ep->bufs), GFP_KERNEL);
+	if (!ep->bufs)
+		return -ENOMEM;
+
 	ep->page_pool = page_pool_create(&pp);
 	if (IS_ERR(ep->page_pool)) {
 		int ret = PTR_ERR(ep->page_pool);
 
 		ep->page_pool = NULL;
+		kfree(ep->bufs);
+		ep->bufs = NULL;
 		pr_err("page_pool_create failed: %d\n", ret);
 		return ret;
 	}
 
-	for (i = 0; i < URP_NUM_BUFS; i++) {
+	for (i = 0; i < ep->num_bufs; i++) {
 		struct urp_buffer *buf = &ep->bufs[i];
 
 		buf->index = i;
@@ -127,7 +135,7 @@ static int urp_bufs_init(struct urp_endpoint *ep, struct ib_device *dev)
 		INIT_LIST_HEAD(&buf->list);
 
 		/* Split: first half send, second half recv */
-		if (i < URP_NUM_BUFS / 2)
+		if (i < ep->num_bufs / 2)
 			list_add_tail(&buf->list, &ep->send_free);
 		else
 			list_add_tail(&buf->list, &ep->recv_free);
@@ -148,6 +156,8 @@ err:
 	}
 	page_pool_destroy(ep->page_pool);
 	ep->page_pool = NULL;
+	kfree(ep->bufs);
+	ep->bufs = NULL;
 	return -ENOMEM;
 }
 
@@ -158,7 +168,7 @@ static void urp_bufs_cleanup(struct urp_endpoint *ep, struct ib_device *dev)
 	if (!ep->page_pool)
 		return;
 
-	for (i = 0; i < URP_NUM_BUFS; i++) {
+	for (i = 0; i < ep->num_bufs; i++) {
 		struct urp_buffer *buf = &ep->bufs[i];
 
 		if (!buf->page)
@@ -172,6 +182,8 @@ static void urp_bufs_cleanup(struct urp_endpoint *ep, struct ib_device *dev)
 
 	page_pool_destroy(ep->page_pool);
 	ep->page_pool = NULL;
+	kfree(ep->bufs);
+	ep->bufs = NULL;
 }
 
 struct urp_buffer *urp_buf_alloc_send(struct urp_endpoint *ep)
@@ -340,15 +352,17 @@ static int urp_endpoint_setup_shared(struct urp_endpoint *ep,
 	if (ret)
 		goto err_pd;
 
-	for (i = 0; i < URP_NUM_BUFS; i++)
+	for (i = 0; i < ep->num_bufs; i++)
 		ep->bufs[i].sge.lkey = ep->pd->local_dma_lkey;
 
 	/*
 	 * Shared CQs sized so completions don't back up under N QPs of
-	 * sustained traffic. URP_CQ_ENTRIES (URP_NUM_BUFS * 2) is the
-	 * single-QP figure that worked in k0; scale it by num_qps.
+	 * sustained traffic. num_bufs*2 (send + recv halves) is the single-QP
+	 * figure; scale it by num_qps. Clamp to the device's max_cqe so a large
+	 * buffer_count x num_qps product can't push ib_alloc_cq past HW limits.
 	 */
-	cq_entries = URP_CQ_ENTRIES * ep->num_qps;
+	cq_entries = min_t(u32, (u32)ep->num_bufs * 2 * ep->num_qps,
+			   (u32)dev->attrs.max_cqe);
 
 	ep->send_cq = ib_alloc_cq(dev, ep, cq_entries, 0, IB_POLL_WORKQUEUE);
 	if (IS_ERR(ep->send_cq)) {
@@ -402,7 +416,9 @@ static int urp_qp_create_on_cm_id(struct urp_endpoint *ep,
 	attr.send_cq = ep->send_cq;
 	attr.recv_cq = ep->recv_cq;
 	attr.srq = ep->srq;			/* Step 3: shared RQ */
-	attr.cap.max_send_wr = URP_SQ_DEPTH;
+	/* SQ deep enough for the send half of the pool; never past HW limit. */
+	attr.cap.max_send_wr = min_t(u32, ep->num_bufs,
+				     (u32)ep->ib_dev->attrs.max_qp_wr);
 	attr.cap.max_recv_wr = 0;		/* recvs flow through SRQ */
 	attr.cap.max_send_sge = 1;
 	attr.cap.max_recv_sge = 1;

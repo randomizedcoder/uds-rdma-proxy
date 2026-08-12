@@ -73,10 +73,12 @@ int urp_srq_create(struct urp_endpoint *ep)
 		return 0;
 
 	/*
-	 * Cap the SRQ at the size of the recv half of the buffer pool.
-	 * We never need more outstanding posts than the pool can supply.
+	 * Cap the SRQ at the size of the recv half of the buffer pool -- we
+	 * never need more outstanding posts than the pool can supply -- and
+	 * never past the device's max_srq_wr.
 	 */
-	max_wr = URP_NUM_BUFS / 2;
+	max_wr = min_t(u32, ep->num_bufs / 2,
+		       (u32)ep->ib_dev->attrs.max_srq_wr);
 	ep->srq_pool_target = max_wr;
 
 	attr.event_handler = NULL;

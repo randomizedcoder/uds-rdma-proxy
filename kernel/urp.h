@@ -64,13 +64,15 @@ typedef struct sockaddr urp_sockaddr_t;
 #define urp_strscpy(dst, src, sz) strscpy((dst), (src), (sz))
 #endif
 
-/* Buffer pool sizing -- defaults; per-endpoint values override at create */
-#define URP_NUM_BUFS		64
+/*
+ * Buffer pool sizing. The pool depth is per-endpoint (ep->num_bufs, resolved
+ * from buffer_count at activation); CQ/SQ/SRQ depths and the credit window are
+ * all derived from it at setup time (see urp_endpoint_setup_shared). URP_BUF_SIZE
+ * is the default DMA slot size (frame header + max payload) used when buffer_size
+ * is the default; the per-endpoint slot size is ep->buffer_size.
+ */
 #define URP_BUF_SIZE		4096	/* payload + header */
 #define URP_MAX_PAYLOAD		(URP_BUF_SIZE - URP_FRAME_HEADER_SIZE)
-#define URP_CQ_ENTRIES		(URP_NUM_BUFS * 2)	/* send + recv */
-#define URP_SQ_DEPTH		URP_NUM_BUFS
-#define URP_RQ_DEPTH		URP_NUM_BUFS
 
 /*
  * struct urp_buffer - DMA-mapped buffer for RDMA send/recv
@@ -342,8 +344,12 @@ struct urp_endpoint {
 						 * swept from the serialized RX path
 						 */
 
-	/* Buffer pool */
-	struct urp_buffer	bufs[URP_NUM_BUFS];
+	/* Buffer pool -- depth is ep->num_bufs (resolved from buffer_count at
+	 * activation, clamped to [URP_BUFFER_COUNT_MIN, URP_BUFFER_COUNT_MAX]).
+	 * bufs is a kcalloc'd array of num_bufs slots; page_pool backs them.
+	 */
+	struct urp_buffer	*bufs;
+	u32			num_bufs;
 	struct list_head	send_free;
 	struct list_head	recv_free;
 	spinlock_t		send_lock;	/* protects send_free */

@@ -229,6 +229,16 @@ int urp_endpoint_activate(struct urp_endpoint *ep)
 		goto unlock;
 	}
 
+	/*
+	 * Resolve the live pool depth from the (mutable-while-inactive)
+	 * buffer_count config. The netlink policy already bounds buffer_count
+	 * to [MIN, MAX]; clamp defensively so num_bufs is trustworthy for every
+	 * downstream sizing (pool, CQ, SRQ, SQ depth, credit window) even if the
+	 * value arrived by some other path.
+	 */
+	ep->num_bufs = clamp_t(u32, ep->buffer_count,
+			       URP_BUFFER_COUNT_MIN, URP_BUFFER_COUNT_MAX);
+
 	if (ep->is_initiator) {
 		ret = urp_endpoint_extract_v4(&ep->peer_addr, ip_buf,
 					      sizeof(ip_buf), &peer_port);
