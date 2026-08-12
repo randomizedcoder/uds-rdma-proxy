@@ -565,12 +565,12 @@ in rec {
         assert_moved "$label" "$sfile" rx-frames
         assert_moved "$label" "$sfile" tx-bytes
         assert_moved "$label" "$sfile" rx-bytes
-        # Reorder path is inert today: urp_recv_done delivers in completion
-        # order and never feeds urp_reorder_insert (design 29 Gap 1). Stays a
-        # pending check until the RX wiring + a multi-QP reordering scenario
-        # land (design 28 §28.8.3).
+        # The pair traffic above is in-order (single QP, sequential seqs), so
+        # nothing is buffered here and reorder-insertions stays 0. The reorder
+        # buffer IS wired into the RX path (design 29 Gap 1 fix); Phase 10e
+        # proves it fires by sending frames deliberately out of sequence.
         expect_pending "$label" "$sfile" reorder-insertions \
-          "reorder buffer not wired into the RX path -- design 29 Gap 1"
+          "0 for in-order pair traffic; exercised in Phase 10e"
       done
       pass "traffic counters moved on both endpoints"
       echo ""
@@ -679,6 +679,71 @@ in rec {
         info "fuzz_acceptor add failed; skipping wire fuzz (check diag)"
       fi
       vm_run "$VM1_VIRTIO" "$VM1_PROC" "pkill -f urp-fuzz-echo.sock 2>/dev/null; rm -f /tmp/urp-fuzz-echo.sock; echo FZC" 5 >/dev/null 2>&1 || true
+      echo ""
+
+      # -----------------------------------------------------------------
+      # Phase 10e — reorder-buffer wiring proof (design 29 Gap 1,
+      # design 28 §28.8.3). A DEDICATED acceptor (reorder_acc, port
+      # 4793, its own echo backend) -- pair_acceptor's single QP slot is
+      # taken by the real initiator. From vm2 the urp-test-client `reorder`
+      # mode opens a stream and sends frames OUT OF SEQUENCE (SYN, then
+      # adjacent pairs swapped), so on the single RC QP they ARRIVE out of
+      # order and the acceptor's per-stream reorder buffer must buffer +
+      # reassemble them before UDS delivery. We then assert the buffer
+      # actually fired (reorder-insertions > 0) and every frame was
+      # delivered with none dropped (rx-frames == nframes, reorder-drops
+      # == 0). This is the scenario Phase 10b's in-order traffic cannot
+      # reach. Byte-exact ordering itself is the reorder buffer's own
+      # contract (fuzz-reorder + KUnit + Rust twin), not re-proven here.
+      # -----------------------------------------------------------------
+      echo "--- Phase 10e: reorder-buffer wiring proof ---"
+      RB_FRAMES=8
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+        "rm -f /tmp/urp-reorder-echo.sock; nohup socat UNIX-LISTEN:/tmp/urp-reorder-echo.sock,fork EXEC:cat </dev/null >/dev/null 2>&1 & sleep 0.3; echo RB_SOCAT_OK" 5 \
+        | grep -q RB_SOCAT_OK \
+        || info "vm1 reorder socat backend may not have started"
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+        "urp add reorder_acc --connect-path /tmp/urp-reorder-echo.sock --bind $VM1_IP:4793" "$T_URP" \
+        > "$RUNDIR/diag/vm1.reorder-add.txt" 2>&1
+      if grep -q "ok:" "$RUNDIR/diag/vm1.reorder-add.txt"; then
+        sleep "$POLL"
+        vm_run "$VM2_VIRTIO" "$VM2_PROC" \
+          "urp-test-client $VM1_IP 4793 reorder $RB_FRAMES 2>&1 | tail -4" 30 \
+          > "$RUNDIR/diag/vm2.reorder-client.txt" 2>&1 || true
+        scan_splat "$RUNDIR/diag/vm2.reorder-client.txt" "reorder client"
+        if grep -q REORDER_SENT "$RUNDIR/diag/vm2.reorder-client.txt" 2>/dev/null; then
+          info "reorder client sent $(grep -o 'frames=[0-9]*' "$RUNDIR/diag/vm2.reorder-client.txt" | tail -1)"
+        else
+          awk '{print "    "$0}' "$RUNDIR/diag/vm2.reorder-client.txt"
+          fail "reorder client did not report REORDER_SENT"
+        fi
+        # Let the acceptor finish delivering the reassembled stream.
+        sleep 1
+        rbfile="$RUNDIR/diag/vm1.reorder-stats.txt"
+        vm_run "$VM1_VIRTIO" "$VM1_PROC" "urp stats reorder_acc | tr -d ' '" 10 \
+          | tr -d '\r' > "$rbfile"
+        # The buffer must have fired -- frames arrived out of order.
+        assert_moved "reorder_acc" "$rbfile" reorder-insertions
+        # And every crafted frame must have been delivered, none dropped.
+        rxf=$(statval "$rbfile" rx-frames)
+        drp=$(statval "$rbfile" reorder-drops)
+        if [ "''${rxf:-0}" -eq "$RB_FRAMES" ] 2>/dev/null; then
+          pass "reorder_acc: rx-frames = $rxf (all $RB_FRAMES delivered)"
+        else
+          fail "reorder_acc: rx-frames = ''${rxf:-0}, expected $RB_FRAMES"
+        fi
+        if [ "''${drp:-0}" -eq 0 ] 2>/dev/null; then
+          pass "reorder_acc: reorder-drops = 0"
+        else
+          fail "reorder_acc: reorder-drops = ''${drp:-0} (frames lost)"
+        fi
+        vm_run "$VM1_VIRTIO" "$VM1_PROC" "urp drain reorder_acc 2>&1; urp remove reorder_acc 2>&1; echo RB_EP_GONE" 15 \
+          > "$RUNDIR/diag/vm1.reorder-teardown.txt" 2>&1 || true
+      else
+        awk '{print "    "$0}' "$RUNDIR/diag/vm1.reorder-add.txt"
+        fail "reorder_acc add failed (see diag/vm1.reorder-add.txt)"
+      fi
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" "pkill -f urp-reorder-echo.sock 2>/dev/null; rm -f /tmp/urp-reorder-echo.sock; echo RBC" 5 >/dev/null 2>&1 || true
       echo ""
 
       # -----------------------------------------------------------------

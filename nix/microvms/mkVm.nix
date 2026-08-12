@@ -264,6 +264,10 @@ in
         # Hostile-peer RDMA wire fuzzer (design 27 F2, S1/S2). Run from the
         # peer VM against the acceptor to fuzz the RX frame path under KASAN.
         (import ../fuzz { inherit pkgs lib; }).wireFuzz
+        # Userspace RDMA test client. Its `reorder` mode sends stream frames
+        # out of sequence to exercise the per-stream reorder buffer wiring
+        # (design 29 Gap 1) from the peer VM.
+        (import ../urp-test-client.nix { inherit pkgs; })
       ];
 
       # Expose the .ko via an env var on root's shell so test scripts

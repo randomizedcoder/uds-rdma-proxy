@@ -445,14 +445,97 @@ void urp_send_done(struct ib_cq *cq, struct ib_wc *wc)
  * compiled into the userspace fuzz harness as well as the module.
  */
 
+/*
+ * Deliver @len payload bytes at @data to the UDS socket @uds and account
+ * the delivered frame. @s is the owning stream (NULL for the legacy k0
+ * connection). Runs in the serialized recv-CQ workqueue context, so
+ * kernel_sendmsg may sleep. Returns 0 or the sendmsg error.
+ */
+static int urp_rx_send_uds(struct urp_endpoint *ep, struct urp_stream *s,
+			   struct socket *uds, const void *data, u32 len)
+{
+	struct msghdr msg = {};
+	struct kvec iov;
+	int ret;
+
+	if (len == 0)
+		return 0;	/* nothing to deliver (e.g. a bare FIN frame) */
+
+	iov.iov_base = (void *)data;
+	iov.iov_len = len;
+	iov_iter_kvec(&msg.msg_iter, ITER_SOURCE, &iov, 1, len);
+
+	ret = kernel_sendmsg(uds, &msg, &iov, 1, len);
+	if (ret < 0) {
+		pr_err_ratelimited("kernel_sendmsg failed: %d\n", ret);
+		return ret;
+	}
+
+	atomic64_add(len, &ep->stats.rx_bytes);
+	atomic64_inc(&ep->stats.rx_frames);
+	if (s)
+		atomic64_add(len, &s->rx_bytes);
+	return 0;
+}
+
+/*
+ * Stream delivery through the per-stream reorder buffer (design 29 Gap 1
+ * fix). Multi-QP arrival skew means frames can complete out of sequence;
+ * feeding them through s->reorder keyed by @seq and draining the in-order
+ * prefix restores the byte stream before it reaches the UDS socket. On a
+ * single QP the frame is always the next expected, so this reduces to
+ * insert-then-immediately-drain (one buffer copy, no reordering).
+ *
+ * @scratch is a URP_BUF_SIZE staging buffer supplied by the caller (the
+ * recv buffer itself, already copied out of by the insert). The reorder
+ * buffer never yields more than URP_MAX_PAYLOAD < URP_BUF_SIZE, so drain
+ * never reports -ENOBUFS.
+ *
+ * Serialization: the recv CQ is IB_POLL_WORKQUEUE, so completions for an
+ * endpoint run one at a time -- the same invariant that lets the caller
+ * touch @s without a per-stream ref. s->reorder is thus accessed by a
+ * single context here, matching the reorder buffer's "external
+ * serialization required" contract.
+ */
+static void urp_rx_deliver_stream(struct urp_endpoint *ep, struct urp_stream *s,
+				  struct socket *uds, u64 seq,
+				  const u8 *payload, u32 payload_len,
+				  u8 *scratch)
+{
+	u64 expected = urp_reorder_next_expected(s->reorder);
+	int ret = urp_reorder_insert(s->reorder, seq, payload, payload_len);
+
+	if (ret == 0) {
+		/* A frame that is not the next expected got buffered: real
+		 * out-of-order arrival. In-order frames (seq == expected)
+		 * drain immediately and are not counted as reorderings.
+		 */
+		if (seq != expected)
+			atomic64_inc(&ep->stats.reorder_insertions);
+	} else {
+		/* -EEXIST (duplicate/retransmit), -ENOBUFS (window full), or
+		 * -ENOMEM: this frame is dropped. Whatever is already in order
+		 * still drains below.
+		 */
+		atomic64_inc(&ep->stats.reorder_drops);
+	}
+
+	for (;;) {
+		u64 dseq;
+		size_t dlen = URP_BUF_SIZE;
+
+		if (urp_reorder_drain_next(s->reorder, &dseq, scratch, &dlen))
+			break;	/* -ENOENT: no more in-order frames ready */
+		urp_rx_send_uds(ep, s, uds, scratch, (u32)dlen);
+	}
+}
+
 static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 {
 	struct urp_buffer *buf = container_of(wc->wr_cqe, struct urp_buffer, cqe);
 	struct urp_endpoint *ep = cq->cq_context;
 	struct socket *uds = NULL;
 	struct urp_stream *rx_stream = NULL;
-	struct msghdr msg = {};
-	struct kvec iov;
 	struct urp_rx_decoded dec;
 	enum urp_rx_action action;
 	u32 payload_len;
@@ -596,58 +679,51 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 		goto repost;
 	}
 
-	/* Forward payload to UDS socket */
-	iov.iov_base = buf->data + URP_FRAME_HEADER_SIZE;
-	iov.iov_len = payload_len;
-	iov_iter_kvec(&msg.msg_iter, ITER_SOURCE, &iov, 1, payload_len);
+	/*
+	 * Deliver the payload to the UDS socket. Stream frames pass through
+	 * the per-stream reorder buffer (design 29 Gap 1) so multi-QP arrival
+	 * skew is corrected before delivery; the legacy k0 path is a single
+	 * in-order QP and delivers directly. The recv buffer doubles as the
+	 * reorder drain staging area -- safe because insert copies the payload
+	 * out before we drain back into it.
+	 */
+	if (rx_stream)
+		urp_rx_deliver_stream(ep, rx_stream, uds,
+				      urp_frame_decode_seq(buf->data),
+				      buf->data + URP_FRAME_HEADER_SIZE,
+				      payload_len, buf->data);
+	else
+		urp_rx_send_uds(ep, NULL, uds,
+				buf->data + URP_FRAME_HEADER_SIZE, payload_len);
 
-	ret = kernel_sendmsg(uds, &msg, &iov, 1, payload_len);
-	if (ret < 0) {
-		pr_err_ratelimited("kernel_sendmsg failed: %d\n", ret);
-	} else {
-		int qp_idx;
+	/*
+	 * Per-QP RX accounting + credit for the frame received on wc->qp,
+	 * independent of how many frames the reorder buffer released. Peer
+	 * sends DATA -> we count a pending grant; once accumulated grants
+	 * reach the threshold (initial_credits / 4) we emit a CONTROL/CREDIT
+	 * frame back. Non-URP peers (the userspace test client) ignore it;
+	 * URP peers consume it via the URP_RX_CREDIT branch above.
+	 */
+	{
+		int qp_idx = urp_qp_index_of(ep, wc->qp);
 
-		atomic64_add(payload_len, &ep->stats.rx_bytes);
-		atomic64_inc(&ep->stats.rx_frames);
-		if (rx_stream)
-			atomic64_add(payload_len, &rx_stream->rx_bytes);
-		/* Step 8: per-QP RX counters. wc->qp identifies the source
-		 * QP; linear scan is fine for the supported num_qps range.
-		 */
-		qp_idx = urp_qp_index_of(ep, wc->qp);
 		if (qp_idx >= 0) {
-			struct urp_qp *qps = &ep->qps[qp_idx];
+			struct urp_qp *qp = &ep->qps[qp_idx];
 
-			atomic64_add(payload_len, &qps->rx_bytes);
-			atomic64_inc(&qps->rx_frames);
-
+			atomic64_add(payload_len, &qp->rx_bytes);
+			atomic64_inc(&qp->rx_frames);
+			urp_credit_record_recv(&qp->credit);
 			/*
-			 * Step 4b: record_recv + threshold-driven CREDIT
-			 * frame emission. Peer sends DATA -> we count a
-			 * pending grant; once accumulated grants reach
-			 * threshold (initial_credits / 4) we emit a
-			 * CONTROL/CREDIT frame back to peer carrying the
-			 * granted count. Peers that don't speak credit
-			 * (the userspace test client) ignore the CREDIT
-			 * frame; URP-to-URP peers consume it via the
-			 * URP_FRAME_TYPE_CONTROL branch above.
-			 */
-			urp_credit_record_recv(&qps->credit);
-			/*
-			 * Only emit CREDIT frames toward peers that speak
-			 * the multi-stream protocol (non-zero stream_id).
-			 * Legacy stream_id == 0 traffic (userspace
-			 * urp-test-client and other non-URP peers) doesn't
-			 * expect them and posts only as many recv WRs as
-			 * its echo logic needs; an unsolicited CREDIT frame
-			 * there causes RNR on the peer.
+			 * Only grant toward multi-stream peers (non-zero
+			 * stream_id). Legacy stream_id == 0 traffic posts only
+			 * as many recv WRs as its echo logic needs; an
+			 * unsolicited CREDIT frame there causes RNR.
 			 */
 			if (stream_id != 0 &&
-			    urp_credit_should_grant(&qps->credit)) {
-				u16 grants = urp_credit_take_grants(&qps->credit);
+			    urp_credit_should_grant(&qp->credit)) {
+				u16 grants = urp_credit_take_grants(&qp->credit);
 
-				urp_emit_credit_frame(ep, qps, stream_id,
-						      grants);
+				urp_emit_credit_frame(ep, qp, stream_id, grants);
 			}
 		}
 	}

@@ -424,6 +424,129 @@ static int mode_latency(struct test_context *ctx, int count)
 	return 0;
 }
 
+/* ---- Mode: reorder (design 29 Gap 1 / design 28 §28.8.3) ---- */
+
+#ifndef URP_DATA_FLAG_SYN
+#define URP_DATA_FLAG_SYN	(1 << 0)
+#endif
+
+/*
+ * Send one framed stream message and reap its send completion. A stray
+ * early echo (RECV) can also land on the shared CQ; skip it and re-post a
+ * recv -- echoes are drained politely later. Bounded so a stuck QP fails
+ * rather than spins forever.
+ */
+static int send_frame(struct test_context *ctx, uint32_t stream_id,
+		      uint64_t seq, uint8_t flags, size_t payload_len)
+{
+	struct ibv_wc wc;
+	int spins = 5000;	/* ~5 s at 1 ms */
+
+	urp_frame_encode(ctx->send_buf, stream_id, seq, URP_FRAME_TYPE_DATA,
+			 flags, 0, payload_len);
+	if (post_send(ctx, URP_FRAME_HEADER_SIZE + payload_len)) {
+		perror("post_send");
+		return -1;
+	}
+
+	while (spins-- > 0) {
+		int n = ibv_poll_cq(ctx->cq, 1, &wc);
+
+		if (n < 0) {
+			perror("ibv_poll_cq");
+			return -1;
+		}
+		if (n == 0) {
+			usleep(1000);
+			continue;
+		}
+		if (wc.opcode == IBV_WC_SEND) {
+			if (wc.status != IBV_WC_SUCCESS) {
+				fprintf(stderr, "send failed: %s\n",
+					ibv_wc_status_str(wc.status));
+				return -1;
+			}
+			return 0;
+		}
+		/* RECV (early echo): re-post and keep waiting for the send. */
+		post_recv(ctx);
+	}
+	fprintf(stderr, "send_frame: no completion for seq %lu\n",
+		(unsigned long)seq);
+	return -1;
+}
+
+/*
+ * Open a stream and deliberately send frames OUT OF SEQUENCE so the
+ * acceptor's per-stream reorder buffer must restore order before it
+ * delivers to the backend UDS socket. Sends SYN (seq 0) first so the
+ * stream exists, then swaps adjacent pairs (k+1 before k) -- every
+ * higher-of-pair arrives before its predecessor and gets buffered.
+ *
+ * This proves the WIRING (design 29 Gap 1: that urp_recv_done actually
+ * feeds urp_reorder_insert), verified by the acceptor's
+ * reorder_insertions / rx_frames / reorder_drops counters in the pair
+ * test. The byte-exact in-order delivery guarantee itself is the reorder
+ * buffer's own contract, exhaustively covered by fuzz-reorder + KUnit +
+ * the Rust twin -- not re-proven here.
+ */
+static int mode_reorder(struct test_context *ctx, int nframes)
+{
+	const uint32_t stream_id = 1;	/* odd: initiator-side id */
+	const size_t payln = 32;
+	int base, i;
+
+	if (nframes < 2)
+		nframes = 8;
+	if (nframes > 64)
+		nframes = 64;
+
+	printf("Reorder test: stream %u, %d frames, adjacent pairs swapped\n",
+	       stream_id, nframes);
+
+	/* Payload for frame i is @payln bytes all equal to (uint8_t)i. */
+	memset(ctx->send_buf + URP_FRAME_HEADER_SIZE, 0, payln);
+	if (send_frame(ctx, stream_id, 0, URP_DATA_FLAG_SYN, payln))
+		return 1;
+
+	for (base = 1; base < nframes; base += 2) {
+		if (base + 1 < nframes) {
+			memset(ctx->send_buf + URP_FRAME_HEADER_SIZE,
+			       base + 1, payln);
+			if (send_frame(ctx, stream_id, base + 1, 0, payln))
+				return 1;
+			memset(ctx->send_buf + URP_FRAME_HEADER_SIZE,
+			       base, payln);
+			if (send_frame(ctx, stream_id, base, 0, payln))
+				return 1;
+		} else {
+			memset(ctx->send_buf + URP_FRAME_HEADER_SIZE,
+			       base, payln);
+			if (send_frame(ctx, stream_id, base, 0, payln))
+				return 1;
+		}
+	}
+
+	/* Politely soak up a few echoes so the acceptor's stream TX toward
+	 * us doesn't RNR-storm; contents are not verified here.
+	 */
+	for (i = 0; i < nframes; i++) {
+		struct ibv_wc wc;
+		int spins = 200;
+
+		if (post_recv(ctx))
+			break;
+		while (spins-- > 0) {
+			if (ibv_poll_cq(ctx->cq, 1, &wc) > 0)
+				break;
+			usleep(1000);
+		}
+	}
+
+	printf("REORDER_SENT frames=%d payload=%zu\n", nframes, payln);
+	return 0;
+}
+
 /* ---- Connection setup + dispatch ---- */
 
 static int connect_to_server(struct test_context *ctx, const char *server, int port)
@@ -490,6 +613,7 @@ static void usage(const char *prog)
 	fprintf(stderr, "  %s <ip> <port> echo [message] [count]\n", prog);
 	fprintf(stderr, "  %s <ip> <port> throughput [size_mb]\n", prog);
 	fprintf(stderr, "  %s <ip> <port> latency [count]\n", prog);
+	fprintf(stderr, "  %s <ip> <port> reorder [nframes]\n", prog);
 	fprintf(stderr, "\nLegacy (no mode keyword):\n");
 	fprintf(stderr, "  %s <ip> [port] [message] [count]\n", prog);
 }
@@ -539,6 +663,16 @@ int main(int argc, char *argv[])
 		printf("RDMA connected to %s:%d\n", server, port);
 		int count = argc > 4 ? atoi(argv[4]) : 1000;
 		ret = mode_latency(&ctx, count);
+
+	} else if (argc >= 4 && strcmp(argv[3], "reorder") == 0) {
+		port = atoi(argv[2]);
+		if (connect_to_server(&ctx, server, port)) {
+			cleanup(&ctx);
+			return 1;
+		}
+		printf("RDMA connected to %s:%d\n", server, port);
+		int nframes = argc > 4 ? atoi(argv[4]) : 8;
+		ret = mode_reorder(&ctx, nframes);
 
 	} else {
 		/* Legacy syntax: urp-test-client <ip> [port] [message] [count] */
