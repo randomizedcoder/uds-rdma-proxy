@@ -205,12 +205,12 @@ Two assertion primitives (implemented in `nix/microvms/lib.nix`, Phase 10b):
 | Counter | Scenario that should move it | Status |
 |---|---|---|
 | `tx-frames` / `rx-frames` / `tx-bytes` / `rx-bytes` | echo round-trip + 12-stream burst (Phase 10) | **asserted** (Phase 10b) |
-| `reorder-insertions` / `reorder-drops` | multi-QP (`--num-qps > 1`) with **induced cross-QP reordering** | **pending** — needs the reorder RX wiring (design 29 Gap 1) **and** a reordering scenario; `expect_pending` today |
+| `reorder-insertions` / `reorder-drops` | crafted out-of-order peer (`urp-test-client … reorder`) | **LIVE** — design 29 Gap 1 wired the reorder RX path; Phase 10e asserts `reorder-insertions` moved, all frames delivered, zero drops |
 | `auth-failures` | a connect with a mismatched PSK against a password-protected endpoint | **planned** — §28.8.3 |
 | `credit-stalls` | sustained load that outruns credit replenishment | **planned** — surfaces under the soak/load scenario, not the light echo |
 | `active-streams` | the 12-stream burst (transiently) | observable in diag; assert deferred (races reap) |
 | `buffer-alloc-fails` | pool exhaustion under load | planned (load scenario) |
-| effective `buffer_count` / `buffer_size` | — | **not observable** — nothing exposes the *effective* pool size (design 29 Gap 2); either plumb the config through and expose it, or drop the attrs. No liveness test is possible until then. |
+| effective `buffer_count` / `buffer_size` | add an endpoint with an explicit `--buffer-count`/`--buffer-size` and read it back | **LIVE** — design 29 Gap 2 wired both through the data path; `GET` returns the *effective* geometry and Phase 10f asserts `urp show` reports it and that payloads > the old 4076 ceiling transit byte-exact |
 
 ### 28.8.3 Roadmap for the pending scenarios
 
