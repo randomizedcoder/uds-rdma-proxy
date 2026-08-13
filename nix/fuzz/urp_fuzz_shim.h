@@ -76,13 +76,15 @@ static inline void put_unaligned_le64(u64 v, void *p)
 #include "include/uapi/linux/urp.h"
 
 /*
- * URP_MAX_PAYLOAD is a kernel buffer-sizing constant (URP_BUF_SIZE 4096 -
- * URP_FRAME_HEADER_SIZE) defined in urp.h, which we can't include here.
- * Mirror the value; if the kernel buffer size ever changes this must too
- * (the KUnit test uses the kernel's definition, so a drift shows up there).
+ * URP_MAX_PAYLOAD is the decoder's ABSOLUTE payload ceiling, defined in urp.h
+ * as URP_BUFFER_SIZE_MAX - URP_FRAME_HEADER_SIZE (the biggest slot any endpoint
+ * can have, minus the header). urp.h can't be included here, so mirror the value
+ * from the UAPI constant (included above). Must match urp.h exactly: the same
+ * urp_frame.c decoder is compiled both here and in-kernel, so a drift would make
+ * the fuzzer test a different oversize gate than production.
  */
 #ifndef URP_MAX_PAYLOAD
-#define URP_MAX_PAYLOAD (4096 - URP_FRAME_HEADER_SIZE)
+#define URP_MAX_PAYLOAD (URP_BUFFER_SIZE_MAX - URP_FRAME_HEADER_SIZE)
 #endif
 
 #include "urp_frame.h"

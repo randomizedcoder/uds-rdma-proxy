@@ -259,7 +259,12 @@ in
       # fuzz-netlink-cov (S3 KCOV-guided), fuzz-netlink-race (S3 concurrency),
       # fuzz-wire (S1/S2 hostile peer).
       ++ (with (import ../fuzz { inherit pkgs lib; });
-        [ fuzz-netlink fuzz-netlink-cov fuzz-netlink-race fuzz-wire ]);
+        [ fuzz-netlink fuzz-netlink-cov fuzz-netlink-race fuzz-wire ])
+      # Userspace RDMA test client. Its `reorder` mode sends stream frames out
+      # of sequence to exercise the per-stream reorder buffer (design 29 Gap 1),
+      # and its `bigframe` mode drives the buffer-geometry sweep (Gap 2), both
+      # from the peer VM.
+      ++ [ (import ../urp-test-client.nix { inherit pkgs; }) ];
 
       # Expose the .ko via an env var on root's shell so test scripts
       # can `insmod $URP_KO` without hardcoding store paths.

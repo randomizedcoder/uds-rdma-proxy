@@ -502,14 +502,74 @@ in rec {
         vm_run "$port" "$host" "dmesg | tail -40" 10 \
           > "$RUNDIR/diag/$label.dmesg-post.txt"
       done
-      # urp show after echo: traffic counters should be > 0 on the
-      # initiator if data left the box.
       for label in vm1 vm2; do
         if [ "$label" = vm1 ]; then port=$VM1_VIRTIO host=$VM1_PROC; else port=$VM2_VIRTIO host=$VM2_PROC; fi
         vm_run "$port" "$host" "urp show" 10 \
           > "$RUNDIR/diag/$label.urp-show-post.txt"
       done
       info "diagnostics written to $RUNDIR/diag/"
+      echo ""
+
+      # -----------------------------------------------------------------
+      # Phase 10b — stats liveness assertions (design 28 §28.8).
+      #
+      # Unit tests + fuzzers prove each component works in isolation; they
+      # CANNOT prove the wired-up data path actually drives it. This asserts
+      # that the counters a data round-trip MUST move are non-zero -- the
+      # cheap oracle that catches "feature silently not exercised" (the class
+      # of bug that hid the inert reorder buffer, design 29 Gap 1). A counter
+      # that no scenario can move is a dead-feature smell.
+      # -----------------------------------------------------------------
+      echo "--- Phase 10b: stats liveness ---"
+
+      # statval <stats-file> <key> -> the integer value, or "" if absent.
+      statval() { sed -n "s/^$2://p" "$1" | tail -1; }
+
+      # assert_moved <label> <stats-file> <key>: hard-fail if a counter that a
+      # completed round-trip must have driven is missing or still zero.
+      assert_moved() {
+        local v; v=$(statval "$2" "$3")
+        if [ -z "$v" ]; then fail "$1: stat '$3' not reported by urp stats"; fi
+        if [ "$v" -gt 0 ] 2>/dev/null; then
+          pass "$1: $3 = $v (moved)"
+        else
+          fail "$1: $3 is '$v' -- data path did not drive it"
+        fi
+      }
+
+      # expect_pending <label> <stats-file> <key> <why>: a counter we EXPECT
+      # to be inert today (a documented gap). Never fails; surfaces its value
+      # every run so the gap stays visible, and flags the moment it goes live
+      # so the check can be promoted to assert_moved.
+      expect_pending() {
+        local v; v=$(statval "$2" "$3")
+        if [ "''${v:-0}" -gt 0 ] 2>/dev/null; then
+          pass "$1: $3 = $v (now LIVE -- promote to assert_moved, design 28 §28.8)"
+        else
+          info "$1: $3 = ''${v:-0} (expected inert: $4)"
+        fi
+      }
+
+      for entry in "vm1:$VM1_VIRTIO:$VM1_PROC:pair_acceptor" \
+                   "vm2:$VM2_VIRTIO:$VM2_PROC:pair_initiator"; do
+        IFS=":" read -r label port host ep <<<"$entry"
+        sfile="$RUNDIR/diag/$label.stats.txt"
+        vm_run "$port" "$host" "urp stats $ep | tr -d ' '" 10 \
+          | tr -d '\r' > "$sfile"
+        # A completed echo + 12-stream burst MUST have moved frames and bytes
+        # in both directions on both endpoints.
+        assert_moved "$label" "$sfile" tx-frames
+        assert_moved "$label" "$sfile" rx-frames
+        assert_moved "$label" "$sfile" tx-bytes
+        assert_moved "$label" "$sfile" rx-bytes
+        # The pair traffic above is in-order (single QP, sequential seqs), so
+        # nothing is buffered here and reorder-insertions stays 0. The reorder
+        # buffer IS wired into the RX path (design 29 Gap 1 fix); Phase 10e
+        # proves it fires by sending frames deliberately out of sequence.
+        expect_pending "$label" "$sfile" reorder-insertions \
+          "0 for in-order pair traffic; exercised in Phase 10e"
+      done
+      pass "traffic counters moved on both endpoints"
       echo ""
 
       # -----------------------------------------------------------------
@@ -616,6 +676,164 @@ in rec {
         info "fuzz_acceptor add failed; skipping wire fuzz (check diag)"
       fi
       vm_run "$VM1_VIRTIO" "$VM1_PROC" "pkill -f urp-fuzz-echo.sock 2>/dev/null; rm -f /tmp/urp-fuzz-echo.sock; echo FZC" 5 >/dev/null 2>&1 || true
+      echo ""
+
+      # -----------------------------------------------------------------
+      # Phase 10e — reorder-buffer wiring proof (design 29 Gap 1,
+      # design 28 §28.8.3). A DEDICATED acceptor (reorder_acc, port
+      # 4793, its own echo backend) -- pair_acceptor's single QP slot is
+      # taken by the real initiator. From vm2 the urp-test-client `reorder`
+      # mode opens a stream and sends frames OUT OF SEQUENCE (SYN, then
+      # adjacent pairs swapped), so on the single RC QP they ARRIVE out of
+      # order and the acceptor's per-stream reorder buffer must buffer +
+      # reassemble them before UDS delivery. We then assert the buffer
+      # actually fired (reorder-insertions > 0) and every frame was
+      # delivered with none dropped (rx-frames == nframes, reorder-drops
+      # == 0). This is the scenario Phase 10b's in-order traffic cannot
+      # reach. Byte-exact ordering itself is the reorder buffer's own
+      # contract (fuzz-reorder + KUnit + Rust twin), not re-proven here.
+      # -----------------------------------------------------------------
+      echo "--- Phase 10e: reorder-buffer wiring proof ---"
+      RB_FRAMES=8
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+        "rm -f /tmp/urp-reorder-echo.sock; nohup socat UNIX-LISTEN:/tmp/urp-reorder-echo.sock,fork EXEC:cat </dev/null >/dev/null 2>&1 & sleep 0.3; echo RB_SOCAT_OK" 5 \
+        | grep -q RB_SOCAT_OK \
+        || info "vm1 reorder socat backend may not have started"
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+        "urp add reorder_acc --connect-path /tmp/urp-reorder-echo.sock --bind $VM1_IP:4793" "$T_URP" \
+        > "$RUNDIR/diag/vm1.reorder-add.txt" 2>&1
+      if grep -q "ok:" "$RUNDIR/diag/vm1.reorder-add.txt"; then
+        sleep "$POLL"
+        vm_run "$VM2_VIRTIO" "$VM2_PROC" \
+          "urp-test-client $VM1_IP 4793 reorder $RB_FRAMES 2>&1 | tail -4" 30 \
+          > "$RUNDIR/diag/vm2.reorder-client.txt" 2>&1 || true
+        scan_splat "$RUNDIR/diag/vm2.reorder-client.txt" "reorder client"
+        if grep -q REORDER_SENT "$RUNDIR/diag/vm2.reorder-client.txt" 2>/dev/null; then
+          info "reorder client sent $(grep -o 'frames=[0-9]*' "$RUNDIR/diag/vm2.reorder-client.txt" | tail -1)"
+        else
+          awk '{print "    "$0}' "$RUNDIR/diag/vm2.reorder-client.txt"
+          fail "reorder client did not report REORDER_SENT"
+        fi
+        # Let the acceptor finish delivering the reassembled stream.
+        sleep 1
+        rbfile="$RUNDIR/diag/vm1.reorder-stats.txt"
+        vm_run "$VM1_VIRTIO" "$VM1_PROC" "urp stats reorder_acc | tr -d ' '" 10 \
+          | tr -d '\r' > "$rbfile"
+        # The buffer must have fired -- frames arrived out of order.
+        assert_moved "reorder_acc" "$rbfile" reorder-insertions
+        # And every crafted frame must have been delivered, none dropped.
+        rxf=$(statval "$rbfile" rx-frames)
+        drp=$(statval "$rbfile" reorder-drops)
+        if [ "''${rxf:-0}" -eq "$RB_FRAMES" ] 2>/dev/null; then
+          pass "reorder_acc: rx-frames = $rxf (all $RB_FRAMES delivered)"
+        else
+          fail "reorder_acc: rx-frames = ''${rxf:-0}, expected $RB_FRAMES"
+        fi
+        if [ "''${drp:-0}" -eq 0 ] 2>/dev/null; then
+          pass "reorder_acc: reorder-drops = 0"
+        else
+          fail "reorder_acc: reorder-drops = ''${drp:-0} (frames lost)"
+        fi
+        vm_run "$VM1_VIRTIO" "$VM1_PROC" "urp drain reorder_acc 2>&1; urp remove reorder_acc 2>&1; echo RB_EP_GONE" 15 \
+          > "$RUNDIR/diag/vm1.reorder-teardown.txt" 2>&1 || true
+      else
+        awk '{print "    "$0}' "$RUNDIR/diag/vm1.reorder-add.txt"
+        fail "reorder_acc add failed (see diag/vm1.reorder-add.txt)"
+      fi
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" "pkill -f urp-reorder-echo.sock 2>/dev/null; rm -f /tmp/urp-reorder-echo.sock; echo RBC" 5 >/dev/null 2>&1 || true
+      echo ""
+
+      # -----------------------------------------------------------------
+      # Phase 10f — buffer geometry proof (design 29 Gap 2). buffer_count
+      # and buffer_size are now wired: pool depth, CQ/SRQ/SQ, DMA slot bytes
+      # and the wire max-payload are all sized from the endpoint config. For
+      # each (count,size) we (1) add a dedicated acceptor with that geometry,
+      # (2) assert `urp show` reports the EFFECTIVE count/size (closes the
+      # design 28 observability gap), (3) from vm2 push single DATA frames of
+      # payload > the old fixed 4076 ceiling and verify each echo returns
+      # byte-exact -- only possible if the slot + max-payload were sized from
+      # buffer_size (the old fixed 4096 slot would drop them OVERSIZE / fail
+      # to DMA), and (4) assert the acceptor delivered every frame. Per-frame
+      # RTT and MB/s are logged so the size / latency-vs-throughput tradeoff
+      # is visible. Under the sanitizer kernel this also KASAN-checks the
+      # high-order (>PAGE_SIZE) page_pool allocation.
+      # -----------------------------------------------------------------
+      echo "--- Phase 10f: buffer geometry (buffer_count + buffer_size) ---"
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+        "rm -f /tmp/urp-geom-echo.sock; nohup socat -b 65536 UNIX-LISTEN:/tmp/urp-geom-echo.sock,fork EXEC:cat </dev/null >/dev/null 2>&1 & sleep 0.3; echo GEOM_SOCAT_OK" 5 \
+        | grep -q GEOM_SOCAT_OK \
+        || info "vm1 geom socat backend may not have started"
+      geomtab="$RUNDIR/diag/geom-tradeoff.txt"
+      : > "$geomtab"
+      GEOM_BFRAMES=32
+      gport=4794
+      # count:size:payload -- swept from tiny (256 B, small order-0 slots near
+      # URP_BUFFER_SIZE_MIN) up to 12000 B (order-3 slots > PAGE_SIZE). The
+      # small end is the RDMA/kernel-bypass sweet spot (per-message overhead
+      # dominates -> the msgs/s column is the interesting one); the payload >
+      # 4076 entries prove the slot + max-payload were sized from buffer_size
+      # (not the old fixed 4096). buffer_size is matched to the payload -- the
+      # realistic "size the pool for the workload" config -- so the sweep also
+      # exercises the whole page_pool order range end to end.
+      for spec in 64:512:256 64:1024:512 64:2048:1024 64:4096:2048 32:16384:8000 64:32768:12000; do
+        gc=''${spec%%:*}; grest=''${spec#*:}; gs=''${grest%%:*}; gp=''${grest##*:}
+        vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+          "urp add geom_acc --connect-path /tmp/urp-geom-echo.sock --bind $VM1_IP:$gport --buffer-count $gc --buffer-size $gs" "$T_URP" \
+          > "$RUNDIR/diag/vm1.geom-add-$gs.txt" 2>&1
+        if ! grep -q "ok:" "$RUNDIR/diag/vm1.geom-add-$gs.txt"; then
+          awk '{print "    "$0}' "$RUNDIR/diag/vm1.geom-add-$gs.txt"
+          fail "geom_acc add failed (count=$gc size=$gs)"
+        fi
+        # (2) GET must report the EFFECTIVE geometry.
+        gshow="$RUNDIR/diag/vm1.geom-show-$gs.txt"
+        vm_run "$VM1_VIRTIO" "$VM1_PROC" "urp show geom_acc" 10 | tr -d '\r' > "$gshow"
+        rc=$(sed -n 's/.*buffer-count: *//p' "$gshow" | tail -1)
+        rs=$(sed -n 's/.*buffer-size: *//p' "$gshow" | tail -1)
+        if [ "''${rc:-0}" = "$gc" ] && [ "''${rs:-0}" = "$gs" ]; then
+          pass "geom_acc: show reports buffer-count=$rc buffer-size=$rs (effective)"
+        else
+          fail "geom_acc: show reports count=''${rc:-?}/size=''${rs:-?}, want $gc/$gs"
+        fi
+        # (3) push single frames of this payload; client verifies each echo byte-exact.
+        sleep "$POLL"
+        gcli="$RUNDIR/diag/vm2.geom-client-$gs.txt"
+        vm_run "$VM2_VIRTIO" "$VM2_PROC" \
+          "urp-test-client $VM1_IP $gport bigframe $gp $GEOM_BFRAMES 2>&1 | tail -4" 40 \
+          > "$gcli" 2>&1 || true
+        scan_splat "$gcli" "geom client"
+        if grep -q BIGFRAME_OK "$gcli"; then
+          gline=$(grep BIGFRAME_OK "$gcli" | tail -1)
+          rtt=$(echo "$gline" | sed -n 's/.*rtt_us=\([0-9.]*\).*/\1/p')
+          mbps=$(echo "$gline" | sed -n 's/.*mbps=\([0-9.]*\).*/\1/p')
+          msgs=$(echo "$gline" | sed -n 's/.*msgs_per_s=\([0-9.]*\).*/\1/p')
+          pass "geom_acc size=$gs payload=$gp: $GEOM_BFRAMES frames echoed byte-exact"
+          printf "  %8s %8s %10s %10s %10s\n" "$gs" "$gp" "''${rtt:-?}" "''${mbps:-?}" "''${msgs:-?}" >> "$geomtab"
+        else
+          awk '{print "    "$0}' "$gcli"
+          fail "geom_acc size=$gs payload=$gp: bigframe did not report BIGFRAME_OK"
+        fi
+        # (4) acceptor must have received + delivered every frame.
+        sleep 1
+        gstat="$RUNDIR/diag/vm1.geom-stats-$gs.txt"
+        vm_run "$VM1_VIRTIO" "$VM1_PROC" "urp stats geom_acc | tr -d ' '" 10 | tr -d '\r' > "$gstat"
+        grxf=$(statval "$gstat" rx-frames)
+        grxb=$(statval "$gstat" rx-bytes)
+        want_b=$((gp * GEOM_BFRAMES))
+        if [ "''${grxf:-0}" -ge "$GEOM_BFRAMES" ] 2>/dev/null && [ "''${grxb:-0}" -ge "$want_b" ] 2>/dev/null; then
+          pass "geom_acc size=$gs: rx-frames=$grxf rx-bytes=$grxb (>= $GEOM_BFRAMES / $want_b)"
+        else
+          fail "geom_acc size=$gs: rx-frames=''${grxf:-0} rx-bytes=''${grxb:-0}, want >= $GEOM_BFRAMES / $want_b"
+        fi
+        vm_run "$VM1_VIRTIO" "$VM1_PROC" "urp drain geom_acc 2>/dev/null; urp remove geom_acc 2>/dev/null; echo GEOM_GONE" 15 >/dev/null 2>&1 || true
+        gport=$((gport + 1))
+        sleep "$POLL"
+      done
+      if [ -s "$geomtab" ]; then
+        info "geometry tradeoff (small msgs -> more msgs/s, less MB/s; larger buffer_size -> higher MB/s):"
+        printf "  %8s %8s %10s %10s %10s\n" "bufsize" "payload" "rtt_us" "mbps" "msgs/s"
+        cat "$geomtab"
+      fi
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" "pkill -f urp-geom-echo.sock 2>/dev/null; rm -f /tmp/urp-geom-echo.sock; echo GBC" 5 >/dev/null 2>&1 || true
       echo ""
 
       # -----------------------------------------------------------------
