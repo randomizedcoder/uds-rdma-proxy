@@ -37,6 +37,10 @@ static int urp_tx_thread_fn(void *data)
 		struct kvec iov;
 		int ret;
 		u32 len;
+		/* Per-endpoint slot cap: buf->data is ep->buf_size bytes, so
+		 * header + max_payload fills it exactly.
+		 */
+		u32 max_payload = urp_ep_max_payload(ep->buf_size);
 
 		buf = urp_buf_alloc_send(ep);
 		if (!buf) {
@@ -47,10 +51,10 @@ static int urp_tx_thread_fn(void *data)
 
 		/* Read from UDS into the buffer payload area (after header) */
 		iov.iov_base = buf->data + URP_FRAME_HEADER_SIZE;
-		iov.iov_len = URP_MAX_PAYLOAD;
+		iov.iov_len = max_payload;
 
 		ret = kernel_recvmsg(conn->uds_sock, &msg, &iov, 1,
-				     URP_MAX_PAYLOAD, 0);
+				     max_payload, 0);
 		if (ret <= 0) {
 			urp_buf_free_send(ep, buf);
 			if (ret == 0) {
@@ -211,6 +215,7 @@ static int urp_stream_tx_fn(void *data)
 		u8 flags = 0;
 		int ret;
 		u32 len;
+		u32 max_payload = urp_ep_max_payload(ep->buf_size);
 
 		if (!stream->uds_sock)
 			break;
@@ -222,10 +227,10 @@ static int urp_stream_tx_fn(void *data)
 		}
 
 		iov.iov_base = buf->data + URP_FRAME_HEADER_SIZE;
-		iov.iov_len = URP_MAX_PAYLOAD;
+		iov.iov_len = max_payload;
 
 		ret = kernel_recvmsg(stream->uds_sock, &msg, &iov, 1,
-				     URP_MAX_PAYLOAD, 0);
+				     max_payload, 0);
 		if (ret <= 0) {
 			urp_buf_free_send(ep, buf);
 			if (ret == 0)
