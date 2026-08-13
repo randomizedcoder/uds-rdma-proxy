@@ -168,7 +168,7 @@
 
         checks = {
           inherit (nixChecks)
-            protocol-tests kernel-module-build
+            protocol-tests urp-bench-units kernel-module-build
             urp-ko-6_1 urp-ko-6_6 urp-ko-6_12;
         };
 

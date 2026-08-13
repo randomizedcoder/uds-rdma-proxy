@@ -145,6 +145,35 @@ in
     '';
   };
 
+  # urp-bench pure-core table tests (design 30 B5, C half). The core is
+  # liburing-free by design, so this builds and runs fully inside the
+  # sandbox. Own fileset (not the shared `src` above): tools/ is outside
+  # that filter's directory allowlist, and the kernel/analysis builds
+  # shouldn't grow a tools/ dependency just for this check.
+  urp-bench-units = pkgs.stdenv.mkDerivation {
+    name = "urp-bench-units";
+    src = pkgs.lib.fileset.toSource {
+      root = ../.;
+      fileset = pkgs.lib.fileset.unions [
+        ../tools/urp-bench-core.c
+        ../tools/urp-bench-core.h
+        ../tools/urp-bench-test.c
+      ];
+    };
+    buildPhase = ''
+      $CC -Wall -Wextra -Werror -O2 -I tools \
+        -o urp-bench-test tools/urp-bench-test.c tools/urp-bench-core.c
+    '';
+    doCheck = true;
+    checkPhase = ''
+      ./urp-bench-test
+    '';
+    installPhase = ''
+      mkdir -p $out
+      touch $out/passed
+    '';
+  };
+
   # NOTE: miri requires network access to build its sysroot (fetches cfg-if for std).
   # This is incompatible with Nix's sandbox. Run miri via devshell instead:
   #   nix develop --command cargo miri test -p uds-rdma-protocol
