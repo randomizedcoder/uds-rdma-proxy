@@ -230,6 +230,13 @@ first userland C static analysis via clang-tidy/cppcheck, pair-test Phase 13)
 are all **not started**. Note: design doc 29 remains referenced-but-uncommitted;
 30 was numbered around it.
 
+Progress (2026-08-12): **B1, B2, B5 IMPLEMENTED** — both pure cores landed
+and table-tested (C: 877 checks in the sandboxed `urp-bench-units` check;
+Rust: `crates/urp-bench` workspace member, 15 mirrored table tests in
+`urp-bench-rs-tests`, clippy/fmt clean, miri wired into `run-miri`). The
+cross-language hex test vectors are duplicated verbatim in both suites and
+green on both sides. io_uring shells (B3/B4) are next.
+
 ## Known functional gaps
 
 Found by the 2026-08-11 docs-vs-implementation review (full analysis and

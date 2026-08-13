@@ -14,7 +14,8 @@
   }
 
   run-miri() {
-    cargo miri test -p uds-rdma-protocol "$@"
+    cargo miri test -p uds-rdma-protocol "$@" && \
+      cargo miri test -p urp-bench "$@"
   }
 
   run-fuzz() {

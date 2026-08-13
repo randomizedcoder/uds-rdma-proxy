@@ -22,6 +22,7 @@ let
         baseName == "crates" ||
         baseName == "uds-rdma-protocol" ||
         baseName == "uds-rdma-protocol-ffi" ||
+        baseName == "urp-bench" ||
         baseName == "urp-cli" ||
         baseName == "src" ||
         baseName == "commands"

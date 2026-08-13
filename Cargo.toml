@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/uds-rdma-protocol",
     "crates/uds-rdma-protocol-ffi",
+    "crates/urp-bench",
     "crates/urp-cli",
 ]
 
@@ -13,3 +14,9 @@ panic = "abort"
 lto = true
 opt-level = "z"
 strip = true
+
+# The benchmark must NOT be size-optimized — a -Oz binary would measure
+# the compiler, not io_uring (design 30 §30.10). panic=abort is fine for
+# a bench and cannot be overridden per package anyway.
+[profile.release.package.urp-bench]
+opt-level = 3
