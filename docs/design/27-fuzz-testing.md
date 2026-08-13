@@ -1,6 +1,10 @@
 # 27. Comprehensive Fuzz-Testing Plan
 
-Status: **plan** — drafted 2026-08-09, after the kthread-pinning fix (PR #4).
+Status: **implemented (living document)** — drafted 2026-08-09 as a plan
+(after the kthread-pinning fix, PR #4); tracks F0–F3 were built out and
+merged 2026-08-10/11 (PRs #12–#21). Per-section **IMPLEMENTED** markers
+record what landed; §27.7 lists the few remaining optional items
+(lifecycle/churn fuzz, corpus artifacts, coverage reporting).
 Scope choices (owner-approved): syzkaller **and** userspace harness
 extraction for the kernel C; a Rust-vs-C **differential** fuzzer; wired as
 **Nix targets + nightly CI**.
@@ -15,11 +19,11 @@ rest and keep them found. Surfaces, ordered by hostility:
 
 | # | surface | who controls it | privilege | today |
 |---|---|---|---|---|
-| S1 | **RDMA wire input**: frame header (stream_id/seq/type/flags/credits/payload_len), SYN/FIN/RST state machine, reorder, credit frames, PING/PONG | remote peer — assume compromised | reach port 4791 (+PSK if set) | **none** in kernel C; Rust crate has 4 cargo-fuzz targets |
+| S1 | **RDMA wire input**: frame header (stream_id/seq/type/flags/credits/payload_len), SYN/FIN/RST state machine, reorder, credit frames, PING/PONG | remote peer — assume compromised | reach port 4791 (+PSK if set) | **none** in kernel C at drafting time; Rust crate has 5 cargo-fuzz targets |
 | S2 | **CM `private_data`** (PSK blob, 0–255 B) | remote peer, **pre-auth** | reach port 4791 | none |
 | S3 | **Generic netlink** NEW/DEL/SET/GET_ENDPOINT nested attrs, dumpit, concurrency | local; GET is **unprivileged**, mutate needs CAP_NET_ADMIN | local | none (hand tests only) |
 | S4 | **UDS data plane + lifecycle**: connect storms, half-close orderings, add/remove churn under load | any local user with socket perms | UDS path perms | soak (fixed patterns) |
-| S5 | **Rust FFI** (opt-in reorder backend) | internal (driven by S1) | — | cargo-fuzz ×4 + miri, Rust side only; **default C rbtree backend unfuzzed** |
+| S5 | **Rust FFI** (opt-in reorder backend) | internal (driven by S1) | — | cargo-fuzz ×5 + miri, Rust side only; default C rbtree backend was unfuzzed until `.#fuzz-reorder` (§27.5) |
 
 Key asymmetry: the *optional* Rust reorder backend is fuzzed; the *default* C
 one is not — and S1/S2 are reachable by a remote attacker before any
@@ -250,7 +254,8 @@ paths F0/F1 can't.
    an extension of the soak harness (`nix/soak-1h.nix`) with randomized rather
    than fixed patterns; run under the sanitizer kernel.
 2. **Nix targets**: `nix run .#fuzz-<name>` for every target (F0 Rust, F1 C,
-   F2 syz/wire), plus `.#fuzz-all-smoke` (time-boxed, all targets).
+   F2 syz/wire). (A combined `.#fuzz-all-smoke` wrapper was considered and
+   dropped — CI invokes the individual targets directly.)
 3. **CI wiring** (matches repo philosophy) — **IMPLEMENTED**:
    - **per-push** (`ci.yml`, `fuzz-smoke` job, hosted runner): the hermetic F1
      harnesses `fuzz-classify` + `fuzz-rx-seq` for 45 s each under libFuzzer +
