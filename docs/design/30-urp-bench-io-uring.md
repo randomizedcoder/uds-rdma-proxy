@@ -500,8 +500,8 @@ existing `microvm-pair` job.
 |---|---|---|
 | **B1** | C pure core + header spec (`tools/urp-bench-core.{c,h}`) | **IMPLEMENTED** |
 | **B2** | Rust twin core (`crates/urp-bench` lib) + workspace/nix-filter wiring (§30.10 table) | **IMPLEMENTED** |
-| **B3** | C io_uring shell (`tools/urp-bench.c`) + `nix/urp-bench.nix` (liburing) | *not started* |
-| **B4** | Rust io_uring backend (`uring.rs`, `main.rs`) + `nix/urp-bench-rs.nix` | *not started* |
+| **B3** | C io_uring shell (`tools/urp-bench.c`) + `nix/urp-bench.nix` (liburing) | **IMPLEMENTED** — all modes except `uring-bufring`, which is an explicit `BENCH_SKIP reason=bufring_not_implemented` stub until B8 |
+| **B4** | Rust io_uring backend (`uring.rs`, `main.rs`) + `nix/urp-bench-rs.nix` | **IMPLEMENTED** — same mode set and stub as B3; C↔Rust interop green both ways under `--verify full` (`nix run .#urp-bench-local`); sendzc probe records `eopnotsupp` on AF_UNIX — the §30.1 hypothesis confirmed on 7.1.6 |
 | **B5** | unit-test suites both languages + `urp-bench-units` check + shared hex vectors | **IMPLEMENTED** — C: 877 table checks in the sandboxed `urp-bench-units` check; Rust: 15 mirrored table tests in `urp-bench-rs-tests`, identical hex vectors, miri via `run-miri` |
 | **B6** | fuzz targets + regression dirs + ci/nightly wiring | *not started* |
 | **B7** | `analysis-clang-tidy` + `analysis-cppcheck` | *not started* |

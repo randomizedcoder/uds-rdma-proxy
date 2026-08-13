@@ -77,6 +77,15 @@
 
         urpTestClient = import ./nix/urp-test-client.nix { inherit pkgs; };
 
+        # urp-bench (design 30): io_uring UDS benchmark, C + Rust twins
+        # with identical CLIs, plus the direct-topology smoke runner.
+        urpBenchC = import ./nix/urp-bench.nix { inherit pkgs; };
+        urpBenchRs = import ./nix/urp-bench-rs.nix {
+          inherit pkgs;
+          inherit (packages) rustToolchain;
+        };
+        urpBenchLocal = import ./nix/urp-bench-local.nix { inherit pkgs; };
+
         urpCli = import ./nix/urp-cli.nix {
           inherit pkgs;
           inherit (packages) rustToolchain;
@@ -180,6 +189,10 @@
           inherit (nixChecks) urp-ko-6_1 urp-ko-6_6 urp-ko-6_12;
           urp-cli = urpCli;
           urp-protocol-ffi = urpProtocolFfi;
+          # io_uring UDS benchmark (design 30): `nix run .#urp-bench-local`
+          urp-bench-c = urpBenchC;
+          urp-bench-rs = urpBenchRs;
+          urp-bench-local = urpBenchLocal;
           test-kmod-k0 = testKmodK0;
           soak-1h = soak1h;
           urp-vm = urpVm;
