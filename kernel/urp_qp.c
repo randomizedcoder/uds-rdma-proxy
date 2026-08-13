@@ -2,15 +2,11 @@
 /*
  * UDS-RDMA Proxy (urp) -- per-QP state and selection
  *
- * Phase 3a Step 2: introduces the multi-QP abstraction. The endpoint owns
- * an array of urp_qp entries (one per QP). TX dispatch picks a QP
- * via urp_qp_select_round_robin; RX completion uses urp_qp_index_of to
- * route a completed work request back to the QP that owns it.
- *
- * In this commit num_qps is still capped at 1: urp_rdma_init rejects
- * num_qps > 1 with -EOPNOTSUPP. The scaffold is in place so Step 2b can
- * wire up N parallel rdma_cm_ids and actually allocate N QPs without
- * further restructuring of the data path.
+ * The endpoint owns an array of urp_qp entries (one per QP, one
+ * rdma_cm_id each). TX dispatch picks a QP via
+ * urp_qp_select_round_robin (skipping DRAINING/REMOVED health states);
+ * RX completion uses urp_qp_index_of to route a completed work request
+ * back to the QP that owns it.
  */
 
 #include "urp.h"

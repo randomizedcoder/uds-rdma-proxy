@@ -20,6 +20,35 @@
 #include <linux/timekeeping.h>
 
 /*
+ * DMA-sync and post one framed send buffer (@len bytes including the
+ * header) on @qp. On failure the buffer is returned to the send pool;
+ * the caller must not touch @buf after this call.
+ */
+static int urp_post_frame(struct urp_endpoint *ep, struct ib_qp *qp,
+			  struct urp_buffer *buf, u32 len)
+{
+	struct ib_send_wr wr = {};
+	const struct ib_send_wr *bad_wr;
+	int ret;
+
+	ib_dma_sync_single_for_device(ep->ib_dev, buf->dma_addr, len,
+				      DMA_TO_DEVICE);
+
+	buf->sge.length = len;
+	buf->cqe.done = urp_send_done;
+	wr.wr_cqe = &buf->cqe;
+	wr.sg_list = &buf->sge;
+	wr.num_sge = 1;
+	wr.opcode = IB_WR_SEND;
+	wr.send_flags = IB_SEND_SIGNALED;
+
+	ret = ib_post_send(qp, &wr, &bad_wr);
+	if (ret)
+		urp_buf_free_send(ep, buf);
+	return ret;
+}
+
+/*
  * TX pump kthread.
  *
  * Reads data from the UDS socket, wraps it in a frame header, and posts
@@ -32,7 +61,7 @@ static int urp_tx_thread_fn(void *data)
 
 	while (!kthread_should_stop() && conn->active) {
 		struct urp_buffer *buf;
-		struct urp_qp *qps;
+		struct urp_qp *qp;
 		struct msghdr msg = {};
 		struct kvec iov;
 		int ret;
@@ -90,64 +119,40 @@ static int urp_tx_thread_fn(void *data)
 				 0,		/* credits: not used in k0 */
 				 len);
 
-		/* DMA sync for send */
-		ib_dma_sync_single_for_device(ep->ib_dev,
-					      buf->dma_addr,
-					      URP_FRAME_HEADER_SIZE + len,
-					      DMA_TO_DEVICE);
-
-		/* Select a QP for this frame (round-robin across all
-		 * connected QPs). With num_qps=1 this always picks qps[0];
-		 * the abstraction exists so Step 2b's multi-cm-id work and
-		 * Step 4's per-QP credit gate can plug in here without
-		 * touching the pump.
+		/* Round-robin across all connected QPs (with num_qps=1
+		 * this always picks qps[0]).
 		 */
-		qps = urp_qp_select_round_robin(ep);
-		if (!qps) {
+		qp = urp_qp_select_round_robin(ep);
+		if (!qp) {
 			urp_buf_free_send(ep, buf);
 			schedule_timeout_interruptible(msecs_to_jiffies(1));
 			continue;
 		}
 
 		/*
-		 * Step 4b: per-QP credit consume. Best-effort -- if the
-		 * peer hasn't replenished us yet (no CREDIT frame
-		 * received), bump the stall counter and proceed anyway.
-		 * The RC layer's rnr_retry handles transient overshoot;
-		 * the credit accounting still tracks the imbalance so
-		 * `urp show` reports stalls / send_credits realistically.
+		 * Per-QP credit consume. Best-effort -- if the peer hasn't
+		 * replenished us yet (no CREDIT frame received), bump the
+		 * stall counter and proceed anyway. The RC layer's
+		 * rnr_retry handles transient overshoot; the credit
+		 * accounting still tracks the imbalance so `urp show`
+		 * reports stalls / send_credits realistically.
 		 */
-		if (urp_credit_consume(&qps->credit) == -EAGAIN)
+		if (urp_credit_consume(&qp->credit) == -EAGAIN)
 			atomic64_inc(&ep->stats.credit_stalls);
 
-		/* Post RDMA send */
-		{
-			struct ib_send_wr wr = {};
-			const struct ib_send_wr *bad_wr;
-
-			buf->sge.length = URP_FRAME_HEADER_SIZE + len;
-			buf->cqe.done = urp_send_done;
-
-			wr.wr_cqe = &buf->cqe;
-			wr.sg_list = &buf->sge;
-			wr.num_sge = 1;
-			wr.opcode = IB_WR_SEND;
-			wr.send_flags = IB_SEND_SIGNALED;
-
-			ret = ib_post_send(qps->qp, &wr, &bad_wr);
-			if (ret) {
-				pr_err_ratelimited("ib_post_send failed: %d\n", ret);
-				urp_buf_free_send(ep, buf);
-				conn->active = false;
-				break;
-			}
+		ret = urp_post_frame(ep, qp->qp, buf,
+				     URP_FRAME_HEADER_SIZE + len);
+		if (ret) {
+			pr_err_ratelimited("ib_post_send failed: %d\n", ret);
+			conn->active = false;
+			break;
 		}
 
 		atomic64_add(len, &ep->stats.tx_bytes);
 		atomic64_inc(&ep->stats.tx_frames);
-		/* Step 8: per-QP counters surfaced via GENL */
-		atomic64_add(len, &qps->tx_bytes);
-		atomic64_inc(&qps->tx_frames);
+		/* Per-QP counters surfaced via GENL */
+		atomic64_add(len, &qp->tx_bytes);
+		atomic64_inc(&qp->tx_frames);
 	}
 
 	pr_info("TX pump stopped\n");
@@ -209,7 +214,7 @@ static int urp_stream_tx_fn(void *data)
 
 	while (!kthread_should_stop()) {
 		struct urp_buffer *buf;
-		struct urp_qp *qps;
+		struct urp_qp *qp;
 		struct msghdr msg = {};
 		struct kvec iov;
 		u8 flags = 0;
@@ -260,49 +265,32 @@ static int urp_stream_tx_fn(void *data)
 		urp_frame_encode(buf->data, stream->id, stream->tx_seq++,
 				 URP_FRAME_TYPE_DATA, flags, 0, len);
 
-		ib_dma_sync_single_for_device(ep->ib_dev, buf->dma_addr,
-					      URP_FRAME_HEADER_SIZE + len,
-					      DMA_TO_DEVICE);
-
-		qps = urp_qp_select_round_robin(ep);
-		if (!qps) {
+		qp = urp_qp_select_round_robin(ep);
+		if (!qp) {
 			urp_buf_free_send(ep, buf);
 			schedule_timeout_interruptible(msecs_to_jiffies(1));
 			continue;
 		}
 
-		/* Step 4b: per-stream credit consume (best-effort, same
-		 * rules as the legacy ep->conn pump above).
+		/* Per-stream credit consume (best-effort, same rules as
+		 * the legacy ep->conn pump above).
 		 */
 		if (urp_credit_consume(&stream->credit) == -EAGAIN)
 			atomic64_inc(&ep->stats.credit_stalls);
 
-		{
-			struct ib_send_wr wr = {};
-			const struct ib_send_wr *bad_wr;
-
-			buf->sge.length = URP_FRAME_HEADER_SIZE + len;
-			buf->cqe.done = urp_send_done;
-			wr.wr_cqe = &buf->cqe;
-			wr.sg_list = &buf->sge;
-			wr.num_sge = 1;
-			wr.opcode = IB_WR_SEND;
-			wr.send_flags = IB_SEND_SIGNALED;
-
-			ret = ib_post_send(qps->qp, &wr, &bad_wr);
-			if (ret) {
-				pr_err_ratelimited("stream %u ib_post_send failed: %d\n",
-						   stream->id, ret);
-				urp_buf_free_send(ep, buf);
-				break;
-			}
+		ret = urp_post_frame(ep, qp->qp, buf,
+				     URP_FRAME_HEADER_SIZE + len);
+		if (ret) {
+			pr_err_ratelimited("stream %u ib_post_send failed: %d\n",
+					   stream->id, ret);
+			break;
 		}
 
 		atomic64_add(len, &ep->stats.tx_bytes);
 		atomic64_inc(&ep->stats.tx_frames);
 		atomic64_add(len, &stream->tx_bytes);
-		atomic64_add(len, &qps->tx_bytes);
-		atomic64_inc(&qps->tx_frames);
+		atomic64_add(len, &qp->tx_bytes);
+		atomic64_inc(&qp->tx_frames);
 	}
 
 	pr_debug("stream %u TX pump stopped\n", stream->id);
@@ -358,32 +346,30 @@ void urp_stream_pump_stop(struct urp_stream *stream)
  */
 #define URP_PROBE_INTERVAL_MS	250
 
-static int urp_emit_ping_on(struct urp_endpoint *ep, struct urp_qp *qps)
+static int urp_emit_ping_on(struct urp_endpoint *ep, struct urp_qp *qp)
 {
 	struct urp_buffer *buf;
-	struct ib_send_wr wr = {};
-	const struct ib_send_wr *bad_wr;
 	u64 now_mono, now_real;
 	int ret;
 
-	if (!qps->established || !qps->qp)
+	if (!qp->established || !qp->qp)
 		return 0;
 
-	/* Step 5: miss detection. If the previous PING is still
-	 * outstanding (last_ping_ns != 0), no PONG arrived in time,
-	 * count a miss. On URP_QP_MISS_THRESHOLD consecutive misses
-	 * demote the QP to DRAINING -- urp_qp_select_round_robin
-	 * stops dispatching there until it recovers. PONGs reset
-	 * last_ping_ns and consecutive_misses (see urp_recv_done).
+	/* Miss detection. If the previous PING is still outstanding
+	 * (last_ping_ns != 0), no PONG arrived in time, count a miss.
+	 * On URP_QP_MISS_THRESHOLD consecutive misses demote the QP to
+	 * DRAINING -- urp_qp_select_round_robin stops dispatching there
+	 * until it recovers. PONGs reset last_ping_ns and
+	 * consecutive_misses (see urp_recv_done).
 	 */
-	if (qps->last_ping_ns) {
-		qps->consecutive_misses++;
-		qps->consecutive_pongs = 0;
-		if (qps->consecutive_misses >= URP_QP_MISS_THRESHOLD &&
-		    qps->health == URP_QP_STATE_ACTIVE) {
-			qps->health = URP_QP_STATE_DRAINING;
+	if (qp->last_ping_ns) {
+		qp->consecutive_misses++;
+		qp->consecutive_pongs = 0;
+		if (qp->consecutive_misses >= URP_QP_MISS_THRESHOLD &&
+		    qp->health == URP_QP_STATE_ACTIVE) {
+			qp->health = URP_QP_STATE_DRAINING;
 			pr_warn("QP %u demoted to DRAINING after %u misses\n",
-				qps->index, qps->consecutive_misses);
+				qp->index, qp->consecutive_misses);
 		}
 	}
 
@@ -393,36 +379,21 @@ static int urp_emit_ping_on(struct urp_endpoint *ep, struct urp_qp *qps)
 
 	now_mono = ktime_get_ns();
 	now_real = ktime_get_real_ns();
-	qps->probe_seq++;
-	qps->last_ping_ns = now_mono;
+	qp->probe_seq++;
+	qp->last_ping_ns = now_mono;
 
-	urp_frame_encode(buf->data, 0, qps->probe_seq, URP_FRAME_TYPE_PROBE,
+	urp_frame_encode(buf->data, 0, qp->probe_seq, URP_FRAME_TYPE_PROBE,
 			 0 /* flags == 0 means PING */, 0,
 			 URP_PING_PAYLOAD_SIZE);
-	urp_ping_encode(buf->data + URP_FRAME_HEADER_SIZE, qps->probe_seq,
-			(u16)qps->index, now_mono, now_real);
+	urp_ping_encode(buf->data + URP_FRAME_HEADER_SIZE, qp->probe_seq,
+			(u16)qp->index, now_mono, now_real);
 
-	ib_dma_sync_single_for_device(ep->ib_dev, buf->dma_addr,
-				      URP_FRAME_HEADER_SIZE +
-					      URP_PING_PAYLOAD_SIZE,
-				      DMA_TO_DEVICE);
-
-	buf->sge.length = URP_FRAME_HEADER_SIZE + URP_PING_PAYLOAD_SIZE;
-	buf->cqe.done = urp_send_done;
-	wr.wr_cqe = &buf->cqe;
-	wr.sg_list = &buf->sge;
-	wr.num_sge = 1;
-	wr.opcode = IB_WR_SEND;
-	wr.send_flags = IB_SEND_SIGNALED;
-
-	ret = ib_post_send(qps->qp, &wr, &bad_wr);
-	if (ret) {
+	ret = urp_post_frame(ep, qp->qp, buf,
+			     URP_FRAME_HEADER_SIZE + URP_PING_PAYLOAD_SIZE);
+	if (ret)
 		pr_warn_ratelimited("PING post_send on qp %u failed: %d\n",
-				    qps->index, ret);
-		urp_buf_free_send(ep, buf);
-		return ret;
-	}
-	return 0;
+				    qp->index, ret);
+	return ret;
 }
 
 static void urp_probe_work_fn(struct work_struct *work)
@@ -469,8 +440,6 @@ int urp_emit_pong_on(struct urp_endpoint *ep, struct ib_qp *qp,
 		     const void *ping_payload)
 {
 	struct urp_buffer *buf;
-	struct ib_send_wr wr = {};
-	const struct ib_send_wr *bad_wr;
 	u64 t_recv_real, t_pong_mono, t_pong_real;
 	int ret;
 
@@ -490,37 +459,20 @@ int urp_emit_pong_on(struct urp_endpoint *ep, struct ib_qp *qp,
 	urp_pong_encode(buf->data + URP_FRAME_HEADER_SIZE, ping_payload,
 			t_recv_real, t_pong_mono, t_pong_real);
 
-	ib_dma_sync_single_for_device(ep->ib_dev, buf->dma_addr,
-				      URP_FRAME_HEADER_SIZE +
-					      URP_PONG_PAYLOAD_SIZE,
-				      DMA_TO_DEVICE);
-
-	buf->sge.length = URP_FRAME_HEADER_SIZE + URP_PONG_PAYLOAD_SIZE;
-	buf->cqe.done = urp_send_done;
-	wr.wr_cqe = &buf->cqe;
-	wr.sg_list = &buf->sge;
-	wr.num_sge = 1;
-	wr.opcode = IB_WR_SEND;
-	wr.send_flags = IB_SEND_SIGNALED;
-
-	ret = ib_post_send(qp, &wr, &bad_wr);
-	if (ret) {
+	ret = urp_post_frame(ep, qp, buf,
+			     URP_FRAME_HEADER_SIZE + URP_PONG_PAYLOAD_SIZE);
+	if (ret)
 		pr_warn_ratelimited("PONG post_send failed: %d\n", ret);
-		urp_buf_free_send(ep, buf);
-		return ret;
-	}
-	return 0;
+	return ret;
 }
 
-int urp_emit_credit_frame(struct urp_endpoint *ep, struct urp_qp *qps,
+int urp_emit_credit_frame(struct urp_endpoint *ep, struct urp_qp *qp,
 			  u32 stream_id, u16 grants)
 {
 	struct urp_buffer *buf;
-	struct ib_send_wr wr = {};
-	const struct ib_send_wr *bad_wr;
 	int ret;
 
-	if (!qps || !qps->qp || grants == 0)
+	if (!qp || !qp->qp || grants == 0)
 		return 0;
 
 	buf = urp_buf_alloc_send(ep);
@@ -531,22 +483,9 @@ int urp_emit_credit_frame(struct urp_endpoint *ep, struct urp_qp *qps,
 
 	urp_frame_encode(buf->data, stream_id, 0, URP_FRAME_TYPE_CONTROL,
 			 URP_CTRL_FLAG_CREDIT, grants, 0);
-	ib_dma_sync_single_for_device(ep->ib_dev, buf->dma_addr,
-				      URP_FRAME_HEADER_SIZE, DMA_TO_DEVICE);
 
-	buf->sge.length = URP_FRAME_HEADER_SIZE;
-	buf->cqe.done = urp_send_done;
-	wr.wr_cqe = &buf->cqe;
-	wr.sg_list = &buf->sge;
-	wr.num_sge = 1;
-	wr.opcode = IB_WR_SEND;
-	wr.send_flags = IB_SEND_SIGNALED;
-
-	ret = ib_post_send(qps->qp, &wr, &bad_wr);
-	if (ret) {
+	ret = urp_post_frame(ep, qp->qp, buf, URP_FRAME_HEADER_SIZE);
+	if (ret)
 		pr_warn_ratelimited("CREDIT frame post_send failed: %d\n", ret);
-		urp_buf_free_send(ep, buf);
-		return ret;
-	}
-	return 0;
+	return ret;
 }
