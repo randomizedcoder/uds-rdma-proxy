@@ -55,6 +55,7 @@ implementation and differential-test oracle for the hand-written kernel C.
 | 26 | [Upstream Readiness](design/26-upstream-readiness.md) | Static-analysis tooling in Nix (`nix/analysis/`: sparse-master, smatch, checkpatch --strict, W=1/W=2, coccicheck, clippy, rustfmt — all hermetic, report-only), baseline → post-fix counts, real bugs found (NLA_POLICY_RANGE s16 truncation, 5.9KiB netlink stack frame, QP-slot leak on OOM), intentional checkpatch residual, prioritized maintainer follow-ups (kref lifetime, netns, lock scope, waitqueue pumps, kthread pinning) |
 | 27 | [Comprehensive Fuzz-Testing Plan](design/27-fuzz-testing.md) | Threat model (S1 RDMA wire / S2 pre-auth PSK / S3 netlink / S4 lifecycle / S5 FFI); four tracks (F0 Rust parser+differential, F1 userspace C-harness extraction under libFuzzer+ASAN, F2 syzkaller-on-netlink + hostile-peer wire fuzzer in a KCOV/KASAN VM, F3 lifecycle churn + Nix targets + nightly CI); concrete entry points with file:line; **two seed security bugs found by the planning sweep** (RX stale-DMA info-leak via unchecked payload_len vs wc->byte_len; sleep-in-RCU on the peer-triggered RST path) |
 | 28 | [Testability Review + Table-Driven-Test Plan](design/28-testability.md) | Why the §27.8 bugs lived in untestable code; coverage inventory (now 34 KUnit + ~70 Rust tests); extract-pure-function points — E1 frame classifier and E2 stream SYN/FIN/RST state machine both **done** (dual-compile units + Rust twin), E3 netlink config-build open; standardize a case-array idiom; phased plan; a `nix run .#kunit` target (still **planned**, not yet built) |
+| 29 | [Code Review + Refactor Plan](design/29-code-review-refactor-plan.md) | Product of the 2026-08-11 docs-vs-implementation review: **two functional gaps** (reorder buffer never fed by the RX path; buffer_count/buffer_size accepted but unused) with wiring plans; dead-code inventory with dispositions; prioritized kernel/CLI/nix refactor backlogs (urp_rdma.c + urp.h + microvms/lib.nix splits, dedupe helpers, wire-format single source of truth); newcomer-orientation notes |
 | A | [Glossary](design/appendix-glossary.md) | CQ, CQE, DCQCN, DSCP, ECMP, ECN, MR, PFC, QP, RC, RoCEv2, SQE, SRQ, UDS, WQE, WC, mTLS, PSK, IPsec inline |
 | B | [RoCEv2 Security Practices](design/appendix-rocev2-security.md) | Industry survey (cloud, storage, HPC), common practices (VLANs, isolation), NIC crypto capabilities (ConnectX-6 Dx+), justification for tiered security |
 | | **Implementation** | |
@@ -147,7 +148,7 @@ milestones k0→k2), **not** the original userspace v0–v4 roadmap in
 ```
 
 Current state: Phases 0–4 complete, Phase 5 substantially complete — see
-[status.md](../status.md). Follow-on work is tracked in design docs 24–28.
+[status.md](../status.md). Follow-on work is tracked in design docs 24–29.
 
 ## Frame Wire Format
 
