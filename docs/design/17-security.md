@@ -1,5 +1,13 @@
 # Security Considerations
 
+> **Note (2026-08-11):** Written during the original userspace-proxy design
+> era (2026-05). The protocol and architecture content below still describes
+> the implemented wire behavior, but implementation specifics are
+> userspace-flavored (Rust proxy process, userspace ibverbs) — the shipped
+> implementation is the `urp` **kernel module** (see [DESIGN.md](../DESIGN.md)),
+> and v0–v4 phase references follow the abandoned userspace roadmap (see the
+> phase-numbering note in [KERNEL-MODULE-PLAN.md](../KERNEL-MODULE-PLAN.md)).
+
 ## 17.1 Security Tier Overview
 
 The proxy provides a tiered security model. Operators choose the level appropriate for their deployment:
@@ -52,6 +60,12 @@ A malicious UDS client could exhaust proxy resources:
 - No credential forwarding: the remote application appears to the local kernel as the proxy process. Authentication must happen at the application level.
 
 ## 17.6 Tier 0.5: Shared Password (PSK)
+
+> **Implemented** (in-kernel, Phase 3b): `urp add ... --password` hashes with
+> SHA-256 (`memzero_explicit` on the raw input), the hash rides `rdma_cm`
+> `private_data`, the acceptor rejects mismatches before any QP allocation,
+> and auth failures are counted + multicast as genl events. The TOML snippet
+> below is the historical userspace configuration sketch.
 
 A simple pre-shared key mechanism that protects against **accidental misconfiguration** — the same threat model as VRRP Type 1 authentication (RFC 5798). This is NOT a defense against active attackers; the hash is static and replayable. Its purpose is to prevent two proxies that should not be connected from accidentally forming a tunnel.
 

@@ -1,5 +1,15 @@
 # Testing Strategy
 
+> **Note (2026-08-11):** This strategy document spans both project eras. The
+> soft-RoCE (`rdma_rxe`) foundation, MicroVM pair testing, table-driven-test
+> philosophy, and fuzzing principles all carried over to the implemented
+> **kernel module**; sections describing the userspace Rust proxy (Criterion
+> benches, `uds-rdma-bench`, `cargo test --lib` tiers, Miri/ASAN-on-userspace)
+> are historical. §12.6 describes the **real, current CI**. The implemented
+> test suite is summarized in [DESIGN.md](../DESIGN.md) ("Testing Without
+> Hardware"); the implemented fuzzing program is
+> [27-fuzz-testing.md](27-fuzz-testing.md).
+
 ## 12.1 Software RDMA Setup
 
 Linux provides software RDMA implementations that emulate RDMA hardware over regular Ethernet:
@@ -347,37 +357,41 @@ Results accumulate in `bench-results/` with timestamped directories, enabling hi
 
 ## 12.6 CI Pipeline
 
-```yaml
-# GitHub Actions
-test-unit:
-  # Standard unit tests, no RDMA needed
-  runs-on: ubuntu-latest
-  steps:
-    - cargo test --lib
+*(Rewritten 2026-08-11 to describe the CI that actually runs; the original
+sketch here predated the kernel-module implementation.)*
 
-test-integration:
-  # Requires rdma_rxe
-  runs-on: [self-hosted, rdma-capable]  # OR Docker with --privileged
-  steps:
-    - modprobe rdma_rxe
-    - # setup namespaces and rxe devices
-    - cargo test --test integration
+Two workflows, split by whether the job needs KVM:
 
-benchmark:
-  # Nightly performance regression tests
-  runs-on: [self-hosted, rdma-capable]
-  steps:
-    - cargo bench
-    - # Compare against baseline, flag regressions > 5%
-```
+**`.github/workflows/ci.yml`** — every push + PR, GitHub-hosted
+`ubuntu-latest`, pure Nix (no KVM, no rdma_rxe):
 
-**Docker alternative**: Run integration tests in a privileged container that loads `rdma_rxe`:
+- `nix-checks`: shared-crate unit tests (incl. the `no_std` path), `urp-cli`
+  build + tests, and the kernel-module build matrix (latest mainline +
+  6.1/6.6/6.12 LTS).
+- `fuzz-smoke` (design 27 F3): replays any committed crash reproducers from
+  `fuzz/regressions/`, then runs the hermetic libFuzzer harnesses
+  `fuzz-classify` and `fuzz-rx-seq` for 45 s each under ASAN/UBSan.
 
-```dockerfile
-FROM rust:latest
-RUN apt-get update && apt-get install -y rdma-core libibverbs-dev librdmacm-dev iproute2
-# Tests load rdma_rxe inside the container (requires --privileged)
-```
+**`.github/workflows/nightly.yml`** — nightly schedule + manual dispatch:
+
+- `fuzz-long` (hosted): 10 minutes each of `fuzz-classify`, `fuzz-rx-seq`,
+  `fuzz-reorder`, with crash artifacts uploaded on failure.
+- `microvm-pair` (`[self-hosted, kvm]`): the 2-VM URP-to-URP pair test on
+  soft-RoCE.
+- `microvm-sanitizers` (`[self-hosted, kvm]`): the same pair test under a
+  KASAN + KMEMLEAK + lockdep + KCOV kernel, including the live fuzz phases
+  (netlink blind/coverage-guided fuzzers, concurrent racer, hostile-peer
+  wire fuzzer).
+- `soak` (`[self-hosted, kvm]`): the 1-hour, 16-connection soak with
+  endpoint churn and a slab-leak budget.
+- `cross-build` + `microvm-pair-aarch64`: aarch64/riscv64 module build
+  gates and the emulated aarch64 pair test (QEMU TCG).
+
+Design decisions: hosted jobs build explicit flake attrs rather than
+`nix flake check` (which would also realise the VM closures and the debug
+kernel); KVM-dependent tiers live on a runner labeled `self-hosted` +
+`kvm`; workflow inputs are fixed text (no untrusted interpolation into
+`run:` blocks).
 
 ## 12.7 Lossy Network Simulation (RoCEv2 Flappiness)
 

@@ -38,7 +38,7 @@ urp add <name>
     --bind-address <addr:port>   Local RDMA bind (makes this side the RDMA acceptor)
     --num-qps <n>                Number of QPs (default: 1, max: 32)
     --buffer-count <n>           Buffer pool slots (default: 1024)
-    --buffer-size <n>            Per-buffer size in bytes (default: 4076)
+    --buffer-size <n>            Per-buffer size in bytes (default: 4096)
     --password <secret>          Tier 0.5 PSK (max 16 chars)
 ```
 
@@ -119,7 +119,7 @@ endpoint: peer-b
   peer-address: 10.0.1.2:4791
   num-qps: 8
   buffer-count: 1024
-  buffer-size: 4076
+  buffer-size: 4096
   state: active
   active-streams: 12
   qps:
@@ -221,7 +221,7 @@ All subcommands that produce output support three formats:
     "peer_address": "10.0.1.2:4791",
     "num_qps": 8,
     "buffer_count": 1024,
-    "buffer_size": 4076,
+    "buffer_size": 4096,
     "state": "active",
     "stats": {
       "active_streams": 12,
@@ -461,7 +461,7 @@ enum Commands {
         num_qps: u32,
         #[arg(long, default_value = "1024")]
         buffer_count: u32,
-        #[arg(long, default_value = "4076")]
+        #[arg(long, default_value = "4096")]
         buffer_size: u32,
         #[arg(long)]
         password: Option<String>,

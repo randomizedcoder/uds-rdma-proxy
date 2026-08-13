@@ -156,8 +156,8 @@ enum urp_endpoint_attr {
 | `PEER_ADDR` | optional | immutable | returned | - |
 | `BIND_ADDR` | optional | immutable | returned | - |
 | `NUM_QPS` | optional (default 1) | **mutable** (add QPs) | returned | - |
-| `BUFFER_COUNT` | optional (default 1024) | **mutable** | returned | - |
-| `BUFFER_SIZE` | optional (default 4076) | immutable | returned | - |
+| `BUFFER_COUNT` | optional (default 1024) | **mutable while inactive** | returned (effective) | pool depth |
+| `BUFFER_SIZE` | optional (default 4096) | immutable | returned (effective) | DMA slot = header + max payload |
 | `PASSWORD` | optional | **mutable** | **never returned** | - |
 | `STATE` | - | via `urp drain` | returned | - |
 | `QPS` | - | - | returned | - |
@@ -172,7 +172,18 @@ The `PASSWORD` attribute is **write-only** — it is accepted on `NEW` and `SET`
 - `PEER_ADDR` and `BIND_ADDR` are mutually exclusive (RDMA initiator vs. acceptor)
 - `NAME` must be unique across all endpoints
 - `NUM_QPS` must be 1-32
-- `BUFFER_SIZE` must be >= `FRAME_HEADER_SIZE` (20 bytes) and <= PMTU limit
+- `BUFFER_COUNT` must be in `[URP_BUFFER_COUNT_MIN, URP_BUFFER_COUNT_MAX]` = `[16, 65536]`
+- `BUFFER_SIZE` must be `[URP_BUFFER_SIZE_MIN, URP_BUFFER_SIZE_MAX]` = `[20, 65536]` (header-only slot up to a 64 KiB slot)
+
+**`BUFFER_COUNT` / `BUFFER_SIZE` are wired** (design 29 Gap 2). At activation the endpoint
+resolves `num_bufs`/`buf_size` from these (clamped to the ranges above) and sizes the whole
+data path from them: the page-pool depth and the send/recv split, the DMA slot bytes (the
+page-pool `order` grows for slots larger than a page), each recv `sge.length`, the shared
+CQ / SRQ / SQ depths (each additionally clamped to the device's `max_cqe` / `max_srq_wr` /
+`max_qp_wr`), the per-QP/per-stream credit window, and the wire max-payload
+(`buf_size - header`) the UDS pump reads per frame. `GET` therefore returns the **effective**
+geometry. Both are activation-time parameters: once the endpoint is active they are
+`-EBUSY`-guarded (remove and re-add to change them).
 
 ### 22.3.3 QP Attributes (read-only)
 
@@ -249,8 +260,8 @@ static const struct nla_policy urp_endpoint_policy[URP_ENDPOINT_A_MAX + 1] = {
     [URP_ENDPOINT_A_PEER_ADDR]    = NLA_POLICY_EXACT_LEN(sizeof(struct sockaddr_in6)),
     [URP_ENDPOINT_A_BIND_ADDR]    = NLA_POLICY_EXACT_LEN(sizeof(struct sockaddr_in6)),
     [URP_ENDPOINT_A_NUM_QPS]      = NLA_POLICY_RANGE(NLA_U32, 1, 32),
-    [URP_ENDPOINT_A_BUFFER_COUNT] = NLA_POLICY_MIN(NLA_U32, 16),
-    [URP_ENDPOINT_A_BUFFER_SIZE]  = NLA_POLICY_RANGE(NLA_U32, 20, 65536),
+    [URP_ENDPOINT_A_BUFFER_COUNT] = NLA_POLICY_FULL_RANGE(NLA_U32, &urp_buffer_count_range), /* 16..65536 */
+    [URP_ENDPOINT_A_BUFFER_SIZE]  = NLA_POLICY_FULL_RANGE(NLA_U32, &urp_buffer_size_range),  /* 20..65536 */
     [URP_ENDPOINT_A_PASSWORD]     = { .type = NLA_NUL_STRING, .len = 16 },
     [URP_ENDPOINT_A_STATE]        = { .type = NLA_U8 },
     [URP_ENDPOINT_A_QPS]          = NLA_POLICY_NESTED(urp_qp_policy),

@@ -7,7 +7,8 @@
  * Initiator: rdma_resolve_addr() -> rdma_connect() to peer.
  * Acceptor:  rdma_listen() -> rdma_accept() from peer.
  *
- * Buffer pool: URP_NUM_BUFS pages, DMA-mapped, split into send and recv pools.
+ * Buffer pool: ep->num_bufs pages (from buffer_count), DMA-mapped, split into
+ * send and recv pools.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -66,8 +67,16 @@ static int urp_bufs_init(struct urp_endpoint *ep, struct ib_device *dev)
 {
 	struct page_pool_params pp = {
 		.flags		= 0,	/* no DMA mapping -- see comment above */
-		.order		= 0,
-		.pool_size	= URP_NUM_BUFS,
+		/*
+		 * order covers the whole slot: for the default 4096-byte slot on
+		 * a 4K-page host this is 0 (one page, unchanged); a larger
+		 * buffer_size raises it so each slot is one physically-contiguous
+		 * compound page. A high-order allocation can fail under memory
+		 * fragmentation -- page_pool returns NULL and activation fails
+		 * cleanly rather than corrupting anything.
+		 */
+		.order		= get_order(ep->buf_size),
+		.pool_size	= ep->num_bufs,
 		/*
 		 * Phase 4 Step 2: NUMA-aware allocation. When the
 		 * underlying NIC has a real PCI parent we can read its
@@ -81,7 +90,7 @@ static int urp_bufs_init(struct urp_endpoint *ep, struct ib_device *dev)
 				   : NUMA_NO_NODE),
 		.dev		= NULL,
 		.dma_dir	= DMA_BIDIRECTIONAL,
-		.max_len	= URP_BUF_SIZE,
+		.max_len	= ep->buf_size,
 		.offset		= 0,
 	};
 	int i;
@@ -91,16 +100,23 @@ static int urp_bufs_init(struct urp_endpoint *ep, struct ib_device *dev)
 	spin_lock_init(&ep->send_lock);
 	spin_lock_init(&ep->recv_lock);
 
+	/* ep->num_bufs is resolved (and bounds-clamped) in urp_endpoint_activate */
+	ep->bufs = kcalloc(ep->num_bufs, sizeof(*ep->bufs), GFP_KERNEL);
+	if (!ep->bufs)
+		return -ENOMEM;
+
 	ep->page_pool = page_pool_create(&pp);
 	if (IS_ERR(ep->page_pool)) {
 		int ret = PTR_ERR(ep->page_pool);
 
 		ep->page_pool = NULL;
+		kfree(ep->bufs);
+		ep->bufs = NULL;
 		pr_err("page_pool_create failed: %d\n", ret);
 		return ret;
 	}
 
-	for (i = 0; i < URP_NUM_BUFS; i++) {
+	for (i = 0; i < ep->num_bufs; i++) {
 		struct urp_buffer *buf = &ep->bufs[i];
 
 		buf->index = i;
@@ -112,7 +128,7 @@ static int urp_bufs_init(struct urp_endpoint *ep, struct ib_device *dev)
 
 		buf->data = page_address(buf->page);
 		buf->dma_addr = ib_dma_map_page(dev, buf->page, 0,
-						URP_BUF_SIZE, DMA_BIDIRECTIONAL);
+						ep->buf_size, DMA_BIDIRECTIONAL);
 		if (ib_dma_mapping_error(dev, buf->dma_addr)) {
 			pr_err("ib_dma_map_page failed for buf %d\n", i);
 			page_pool_put_page(ep->page_pool, buf->page, -1, false);
@@ -121,13 +137,13 @@ static int urp_bufs_init(struct urp_endpoint *ep, struct ib_device *dev)
 		}
 
 		buf->sge.addr = buf->dma_addr;
-		buf->sge.length = URP_BUF_SIZE;
+		buf->sge.length = ep->buf_size;
 		/* lkey set after PD creation */
 
 		INIT_LIST_HEAD(&buf->list);
 
 		/* Split: first half send, second half recv */
-		if (i < URP_NUM_BUFS / 2)
+		if (i < ep->num_bufs / 2)
 			list_add_tail(&buf->list, &ep->send_free);
 		else
 			list_add_tail(&buf->list, &ep->recv_free);
@@ -140,7 +156,7 @@ err:
 		struct urp_buffer *buf = &ep->bufs[i];
 
 		if (buf->page) {
-			ib_dma_unmap_page(dev, buf->dma_addr, URP_BUF_SIZE,
+			ib_dma_unmap_page(dev, buf->dma_addr, ep->buf_size,
 					  DMA_BIDIRECTIONAL);
 			page_pool_put_page(ep->page_pool, buf->page, -1, false);
 			buf->page = NULL;
@@ -148,6 +164,8 @@ err:
 	}
 	page_pool_destroy(ep->page_pool);
 	ep->page_pool = NULL;
+	kfree(ep->bufs);
+	ep->bufs = NULL;
 	return -ENOMEM;
 }
 
@@ -158,13 +176,13 @@ static void urp_bufs_cleanup(struct urp_endpoint *ep, struct ib_device *dev)
 	if (!ep->page_pool)
 		return;
 
-	for (i = 0; i < URP_NUM_BUFS; i++) {
+	for (i = 0; i < ep->num_bufs; i++) {
 		struct urp_buffer *buf = &ep->bufs[i];
 
 		if (!buf->page)
 			continue;
 
-		ib_dma_unmap_page(dev, buf->dma_addr, URP_BUF_SIZE,
+		ib_dma_unmap_page(dev, buf->dma_addr, ep->buf_size,
 				  DMA_BIDIRECTIONAL);
 		page_pool_put_page(ep->page_pool, buf->page, -1, false);
 		buf->page = NULL;
@@ -172,6 +190,8 @@ static void urp_bufs_cleanup(struct urp_endpoint *ep, struct ib_device *dev)
 
 	page_pool_destroy(ep->page_pool);
 	ep->page_pool = NULL;
+	kfree(ep->bufs);
+	ep->bufs = NULL;
 }
 
 struct urp_buffer *urp_buf_alloc_send(struct urp_endpoint *ep)
@@ -233,7 +253,7 @@ int urp_post_recv(struct urp_endpoint *ep, struct ib_qp *qp,
 	struct ib_recv_wr wr = {};
 	const struct ib_recv_wr *bad_wr;
 
-	buf->sge.length = URP_BUF_SIZE;
+	buf->sge.length = ep->buf_size;
 	buf->cqe.done = urp_recv_done;
 
 	wr.wr_cqe = &buf->cqe;
@@ -340,15 +360,17 @@ static int urp_endpoint_setup_shared(struct urp_endpoint *ep,
 	if (ret)
 		goto err_pd;
 
-	for (i = 0; i < URP_NUM_BUFS; i++)
+	for (i = 0; i < ep->num_bufs; i++)
 		ep->bufs[i].sge.lkey = ep->pd->local_dma_lkey;
 
 	/*
 	 * Shared CQs sized so completions don't back up under N QPs of
-	 * sustained traffic. URP_CQ_ENTRIES (URP_NUM_BUFS * 2) is the
-	 * single-QP figure that worked in k0; scale it by num_qps.
+	 * sustained traffic. num_bufs*2 (send + recv halves) is the single-QP
+	 * figure; scale it by num_qps. Clamp to the device's max_cqe so a large
+	 * buffer_count x num_qps product can't push ib_alloc_cq past HW limits.
 	 */
-	cq_entries = URP_CQ_ENTRIES * ep->num_qps;
+	cq_entries = min_t(u32, (u32)ep->num_bufs * 2 * ep->num_qps,
+			   (u32)dev->attrs.max_cqe);
 
 	ep->send_cq = ib_alloc_cq(dev, ep, cq_entries, 0, IB_POLL_WORKQUEUE);
 	if (IS_ERR(ep->send_cq)) {
@@ -402,7 +424,9 @@ static int urp_qp_create_on_cm_id(struct urp_endpoint *ep,
 	attr.send_cq = ep->send_cq;
 	attr.recv_cq = ep->recv_cq;
 	attr.srq = ep->srq;			/* Step 3: shared RQ */
-	attr.cap.max_send_wr = URP_SQ_DEPTH;
+	/* SQ deep enough for the send half of the pool; never past HW limit. */
+	attr.cap.max_send_wr = min_t(u32, ep->num_bufs,
+				     (u32)ep->ib_dev->attrs.max_qp_wr);
 	attr.cap.max_recv_wr = 0;		/* recvs flow through SRQ */
 	attr.cap.max_send_sge = 1;
 	attr.cap.max_recv_sge = 1;
@@ -445,14 +469,97 @@ void urp_send_done(struct ib_cq *cq, struct ib_wc *wc)
  * compiled into the userspace fuzz harness as well as the module.
  */
 
+/*
+ * Deliver @len payload bytes at @data to the UDS socket @uds and account
+ * the delivered frame. @s is the owning stream (NULL for the legacy k0
+ * connection). Runs in the serialized recv-CQ workqueue context, so
+ * kernel_sendmsg may sleep. Returns 0 or the sendmsg error.
+ */
+static int urp_rx_send_uds(struct urp_endpoint *ep, struct urp_stream *s,
+			   struct socket *uds, const void *data, u32 len)
+{
+	struct msghdr msg = {};
+	struct kvec iov;
+	int ret;
+
+	if (len == 0)
+		return 0;	/* nothing to deliver (e.g. a bare FIN frame) */
+
+	iov.iov_base = (void *)data;
+	iov.iov_len = len;
+	iov_iter_kvec(&msg.msg_iter, ITER_SOURCE, &iov, 1, len);
+
+	ret = kernel_sendmsg(uds, &msg, &iov, 1, len);
+	if (ret < 0) {
+		pr_err_ratelimited("kernel_sendmsg failed: %d\n", ret);
+		return ret;
+	}
+
+	atomic64_add(len, &ep->stats.rx_bytes);
+	atomic64_inc(&ep->stats.rx_frames);
+	if (s)
+		atomic64_add(len, &s->rx_bytes);
+	return 0;
+}
+
+/*
+ * Stream delivery through the per-stream reorder buffer (design 29 Gap 1
+ * fix). Multi-QP arrival skew means frames can complete out of sequence;
+ * feeding them through s->reorder keyed by @seq and draining the in-order
+ * prefix restores the byte stream before it reaches the UDS socket. On a
+ * single QP the frame is always the next expected, so this reduces to
+ * insert-then-immediately-drain (one buffer copy, no reordering).
+ *
+ * @scratch is an ep->buf_size staging buffer supplied by the caller (the
+ * recv buffer itself, already copied out of by the insert). The reorder
+ * buffer never yields more than this endpoint's max payload
+ * (buf_size - header) < buf_size, so drain never reports -ENOBUFS.
+ *
+ * Serialization: the recv CQ is IB_POLL_WORKQUEUE, so completions for an
+ * endpoint run one at a time -- the same invariant that lets the caller
+ * touch @s without a per-stream ref. s->reorder is thus accessed by a
+ * single context here, matching the reorder buffer's "external
+ * serialization required" contract.
+ */
+static void urp_rx_deliver_stream(struct urp_endpoint *ep, struct urp_stream *s,
+				  struct socket *uds, u64 seq,
+				  const u8 *payload, u32 payload_len,
+				  u8 *scratch)
+{
+	u64 expected = urp_reorder_next_expected(s->reorder);
+	int ret = urp_reorder_insert(s->reorder, seq, payload, payload_len);
+
+	if (ret == 0) {
+		/* A frame that is not the next expected got buffered: real
+		 * out-of-order arrival. In-order frames (seq == expected)
+		 * drain immediately and are not counted as reorderings.
+		 */
+		if (seq != expected)
+			atomic64_inc(&ep->stats.reorder_insertions);
+	} else {
+		/* -EEXIST (duplicate/retransmit), -ENOBUFS (window full), or
+		 * -ENOMEM: this frame is dropped. Whatever is already in order
+		 * still drains below.
+		 */
+		atomic64_inc(&ep->stats.reorder_drops);
+	}
+
+	for (;;) {
+		u64 dseq;
+		size_t dlen = ep->buf_size;
+
+		if (urp_reorder_drain_next(s->reorder, &dseq, scratch, &dlen))
+			break;	/* -ENOENT: no more in-order frames ready */
+		urp_rx_send_uds(ep, s, uds, scratch, (u32)dlen);
+	}
+}
+
 static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 {
 	struct urp_buffer *buf = container_of(wc->wr_cqe, struct urp_buffer, cqe);
 	struct urp_endpoint *ep = cq->cq_context;
 	struct socket *uds = NULL;
 	struct urp_stream *rx_stream = NULL;
-	struct msghdr msg = {};
-	struct kvec iov;
 	struct urp_rx_decoded dec;
 	enum urp_rx_action action;
 	u32 payload_len;
@@ -596,58 +703,51 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 		goto repost;
 	}
 
-	/* Forward payload to UDS socket */
-	iov.iov_base = buf->data + URP_FRAME_HEADER_SIZE;
-	iov.iov_len = payload_len;
-	iov_iter_kvec(&msg.msg_iter, ITER_SOURCE, &iov, 1, payload_len);
+	/*
+	 * Deliver the payload to the UDS socket. Stream frames pass through
+	 * the per-stream reorder buffer (design 29 Gap 1) so multi-QP arrival
+	 * skew is corrected before delivery; the legacy k0 path is a single
+	 * in-order QP and delivers directly. The recv buffer doubles as the
+	 * reorder drain staging area -- safe because insert copies the payload
+	 * out before we drain back into it.
+	 */
+	if (rx_stream)
+		urp_rx_deliver_stream(ep, rx_stream, uds,
+				      urp_frame_decode_seq(buf->data),
+				      buf->data + URP_FRAME_HEADER_SIZE,
+				      payload_len, buf->data);
+	else
+		urp_rx_send_uds(ep, NULL, uds,
+				buf->data + URP_FRAME_HEADER_SIZE, payload_len);
 
-	ret = kernel_sendmsg(uds, &msg, &iov, 1, payload_len);
-	if (ret < 0) {
-		pr_err_ratelimited("kernel_sendmsg failed: %d\n", ret);
-	} else {
-		int qp_idx;
+	/*
+	 * Per-QP RX accounting + credit for the frame received on wc->qp,
+	 * independent of how many frames the reorder buffer released. Peer
+	 * sends DATA -> we count a pending grant; once accumulated grants
+	 * reach the threshold (initial_credits / 4) we emit a CONTROL/CREDIT
+	 * frame back. Non-URP peers (the userspace test client) ignore it;
+	 * URP peers consume it via the URP_RX_CREDIT branch above.
+	 */
+	{
+		int qp_idx = urp_qp_index_of(ep, wc->qp);
 
-		atomic64_add(payload_len, &ep->stats.rx_bytes);
-		atomic64_inc(&ep->stats.rx_frames);
-		if (rx_stream)
-			atomic64_add(payload_len, &rx_stream->rx_bytes);
-		/* Step 8: per-QP RX counters. wc->qp identifies the source
-		 * QP; linear scan is fine for the supported num_qps range.
-		 */
-		qp_idx = urp_qp_index_of(ep, wc->qp);
 		if (qp_idx >= 0) {
-			struct urp_qp *qps = &ep->qps[qp_idx];
+			struct urp_qp *qp = &ep->qps[qp_idx];
 
-			atomic64_add(payload_len, &qps->rx_bytes);
-			atomic64_inc(&qps->rx_frames);
-
+			atomic64_add(payload_len, &qp->rx_bytes);
+			atomic64_inc(&qp->rx_frames);
+			urp_credit_record_recv(&qp->credit);
 			/*
-			 * Step 4b: record_recv + threshold-driven CREDIT
-			 * frame emission. Peer sends DATA -> we count a
-			 * pending grant; once accumulated grants reach
-			 * threshold (initial_credits / 4) we emit a
-			 * CONTROL/CREDIT frame back to peer carrying the
-			 * granted count. Peers that don't speak credit
-			 * (the userspace test client) ignore the CREDIT
-			 * frame; URP-to-URP peers consume it via the
-			 * URP_FRAME_TYPE_CONTROL branch above.
-			 */
-			urp_credit_record_recv(&qps->credit);
-			/*
-			 * Only emit CREDIT frames toward peers that speak
-			 * the multi-stream protocol (non-zero stream_id).
-			 * Legacy stream_id == 0 traffic (userspace
-			 * urp-test-client and other non-URP peers) doesn't
-			 * expect them and posts only as many recv WRs as
-			 * its echo logic needs; an unsolicited CREDIT frame
-			 * there causes RNR on the peer.
+			 * Only grant toward multi-stream peers (non-zero
+			 * stream_id). Legacy stream_id == 0 traffic posts only
+			 * as many recv WRs as its echo logic needs; an
+			 * unsolicited CREDIT frame there causes RNR.
 			 */
 			if (stream_id != 0 &&
-			    urp_credit_should_grant(&qps->credit)) {
-				u16 grants = urp_credit_take_grants(&qps->credit);
+			    urp_credit_should_grant(&qp->credit)) {
+				u16 grants = urp_credit_take_grants(&qp->credit);
 
-				urp_emit_credit_frame(ep, qps, stream_id,
-						      grants);
+				urp_emit_credit_frame(ep, qp, stream_id, grants);
 			}
 		}
 	}

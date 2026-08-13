@@ -1,16 +1,22 @@
 # Project Status
 
-_Last updated: 2026-08-09_
+_Last updated: 2026-08-11_
 
 ## Current branch
 
-`main` carries PR #2 (Redpanda **Stage A** metadata round-trip over UDS-over-RDMA
-+ netns/provisioning design docs 24/25). Follow-up on `redpanda-produce-consume`
-(`74df057`, not yet merged): initiator **multi-stream** (Phase 3a Step 7d) +
-**full Kafka produce/consume over RDMA**, KASAN/KMEMLEAK/lockdep validated.
-On top of that (uncommitted): **static-analysis tooling** (`nix/analysis/`) +
-the first kernel-maintainer hygiene pass -- see the Static analysis section
-below and `docs/design/26-upstream-readiness.md`.
+`main` is current through PR #21. Highlights of the merged run of PRs:
+
+- **Redpanda over UDS-over-RDMA** (PRs #1–#2 + follow-ups): metadata round-trip
+  AND full Kafka produce/consume over the RDMA tunnel, KASAN/KMEMLEAK/lockdep
+  validated. Initiator multi-stream (Phase 3a Step 7d) landed as part of this.
+- **Static analysis / maintainer hygiene** (see section below +
+  `docs/design/26-upstream-readiness.md`): hermetic `nix/analysis/` tooling,
+  three real bugs fixed, checkpatch 79 → 24.
+- **Comprehensive fuzzing program** (PRs #12–#21, design doc 27 — see the
+  Fuzzing section below): every attack surface fuzzed, three memory-safety
+  bugs found or closed (SET num_qps OOB teardown; endpoint lookup-vs-DEL UAF,
+  fixed via kref; verbose-GET-vs-DEL sub-object UAF), per-push + nightly CI
+  wired.
 
 ## Where we are
 
@@ -19,9 +25,9 @@ below and `docs/design/26-upstream-readiness.md`.
 | **0** — Skeleton | `docs/KERNEL-MODULE-PLAN.md` §0 | ✅ Committed (`3a32ffc`) |
 | **1 — k0** RDMA echo data path | `docs/KERNEL-MODULE-PLAN.md` §1 | ✅ Committed (`d440794`, `a986fe7`, `a600b17`) |
 | **2** — GENL control plane | `docs/KERNEL-MODULE-IMPLEMENTATION.md` §Phase 2 | ✅ Committed (`067829e`) |
-| **3a** — k1 data path | `~/.claude/profiles/siden/plans/floofy-stirring-donut.md` + `~/.claude/profiles/runpod/plans/this-repo-has-a-abundant-fern.md` | ✅ **Phase 3a complete -- Steps 1-10 + 2b, 4b, 5b, 7b, 7c done (`c2eea2e` through `b7caab2`); 23/23 `test-kmod-k0` PASS. Sub-step 7d (initiator multi-stream + concurrent-connection integration) **DONE (`74df057`; KASAN-clean 12-stream burst) -- see Redpanda section**. 5b's objtool-on-IBT follow-up remains pending.** |
+| **3a** — k1 data path | `docs/KERNEL-MODULE-PLAN.md` §3 + `KERNEL-MODULE-IMPLEMENTATION.md` §Phase 3a | ✅ **Phase 3a complete -- Steps 1-10 + 2b, 4b, 5b, 7b, 7c done (`c2eea2e` through `b7caab2`); 23/23 `test-kmod-k0` PASS. Sub-step 7d (initiator multi-stream + concurrent-connection integration) **DONE (`74df057`; KASAN-clean 12-stream burst) -- see Redpanda section**. 5b's objtool-on-IBT follow-up remains pending.** |
 | **3b** — probes / PSK | `docs/KERNEL-MODULE-PLAN.md` §3.6-§3.7 + `KERNEL-MODULE-IMPLEMENTATION.md` §Phase 3b | ✅ **Complete. Steps 1-10 done (`0d5c077` through `dd6bab0`). Probes (PING/PONG/RTT EWMA/state machine), PSK SHA-256 + rdma_cm `private_data` validation, auth-failure observability all wired. Test-kmod-k0 23/23 PASS. Sub-steps 8b (initiator-validates-acceptor) + 3b/test (URP-to-URP harness) pending.** |
-| 3c — KUnit hardening + soak | (deferred) | not started |
+| 3c — KUnit hardening + soak | (deferred) | largely superseded: KUnit suites landed via 3a Step 9 + design 28 extractions (34 cases in `kernel/urp_test.c`); the 1-hour soak landed in Phase 4 |
 | **4** — k2 optimized | `docs/KERNEL-MODULE-PLAN.md` §4 + `KERNEL-MODULE-IMPLEMENTATION.md` §Phase 4 | ✅ **rxe-testable scope complete + 1-hour soak PASS. Steps: 1 page_pool (`ded84a7`), 2 NUMA-aware (`78967e5`), 3 tracker (`c535c7a`), 4-5 soak harness + reconnect-leak fix (`c41bd61`). 23/23 `test-kmod-k0` + 1240 cycles + 120 churn add/remove with 0 errors, 1828 kB slab leak (budget 2048). §4.2 zero-copy / §4.3 adaptive CQ / §4.4 kthread NUMA bind / §4.5 hardware benchmarks deferred to a hardware-validation pass.** |
 | **5** — MicroVM integration | `docs/KERNEL-MODULE-PLAN.md` §5 + `KERNEL-MODULE-IMPLEMENTATION.md` §Phase 5 | 🟢 **Substantially complete (6/8 deliverables done, +1 partial, 1 blocked). Steps 1-9 x86_64 harness/sanitizer PASS. Step 10 kernel-version matrix (6.1.180/6.6.148/6.12.101/7.1.6 build via 4 LTS compat shims). Step 11 nixpkgs+microvm bump (latest kernel 7.1.6). Step 12 CI (`ci.yml` every-push + `nightly.yml` self-hosted KVM). Steps 13-14 cross-arch harness (localSystem/crossSystem, xdp2-aligned). Step 15 aarch64 emulated pair test FULL PASS under TCG. riscv64: urp.ko build gate (boot via same harness, not run). Redpanda: **metadata AND full produce/consume round-trip over RDMA PASS** (Stage 0 unblocked -- broker built hermetically via the redpanda fork's Nix flake; see below).** |
 | 6 | per `docs/KERNEL-MODULE-PLAN.md` | not started |
@@ -88,10 +94,6 @@ e2e runnable on its own with `num_qps > 1` — Step 2b lifts the
 `-EOPNOTSUPP` guard). The current `phase3a-k1-data-path` branch's HEAD
 (Step 2) still passes the full 19/19 `test-kmod-k0` suite because every
 existing test uses the default `num_qps = 1`.
-
-The full step-by-step file-level plan remains at
-`~/.claude/profiles/siden/plans/floofy-stirring-donut.md`; the active
-session plan is `~/.claude/profiles/runpod/plans/this-repo-has-a-abundant-fern.md`.
 
 ## Redpanda over UDS-over-RDMA
 
@@ -171,16 +173,67 @@ frame in `urp_new_endpoint_doit` (whole `struct urp_endpoint` as stack
 scratch), and a QP-slot leak on the `urp_cm_accept_one` OOM path. Plus the
 mechanical hygiene sweep (pr_fmt, ratelimited printks, SPDX on
 Kbuild/Makefile, urp-y, `__noreturn`, `# Safety` docs on the FFI, cargo
-fmt, checkpatch style). Deeper maintainer items (kref lifetime, netns,
-lock scope, waitqueue pumps, kthread pinning) are catalogued as follow-ups
-in design doc 26. All regression gates re-verified green: urp-ko (7.1.6 +
-6.1/6.6/6.12), urp-cli (incl. the uapi mirror test), protocol-tests.
+fmt, checkpatch style). Deeper maintainer items were catalogued as
+follow-ups in design doc 26; of those, **kref endpoint lifetime** (incl.
+the sub-object GET-vs-DEL UAF) and **kthread task_struct pinning** have
+since been FIXED (see design 26 §26.6); netns, lock scope, and
+waitqueue-driven pumps remain open. All regression gates re-verified
+green: urp-ko (7.1.6 + 6.1/6.6/6.12), urp-cli (incl. the uapi mirror
+test), protocol-tests.
+
+## Fuzzing program (2026-08-10/11, design doc 27 — COMPLETE)
+
+Tracks F0–F3 all implemented and automated:
+
+- **F0/F1 hermetic harnesses** (libFuzzer + ASAN/UBSan, compile the REAL
+  kernel C): `nix run .#fuzz-classify` (RX frame classifier),
+  `.#fuzz-rx-seq` (classify → dispatch → stream state machine over frame
+  sequences; uses the extracted dual-compile `kernel/urp_stream_sm.c`),
+  `.#fuzz-reorder` (default C rbtree reorder backend against a spec-model
+  differential, linked with the kernel's own `tools/lib/rbtree.c` from the
+  nixpkgs-pinned kernel source). Plus 5 cargo-fuzz targets on the shared
+  Rust crate (`fuzz/fuzz_targets/`).
+- **F2 live-VM fuzzers**, run as phases of the sanitizer microVM pair test
+  (KASAN + KMEMLEAK + lockdep + KCOV kernel): blind + KCOV coverage-guided
+  netlink fuzzers (with `KCOV_TRACE_CMP` operand-dictionary feedback), a
+  multi-threaded netlink racer (NEW/DEL/SET/GET churn), and a hostile-peer
+  RDMA **wire** fuzzer (librdmacm RC client speaking malformed frames at a
+  dedicated acceptor). Each fuzz phase is followed by an inline dmesg
+  `scan_splat` oracle so a wedged VM cannot mask a KASAN splat.
+- **F3 CI**: every push runs `fuzz-smoke` (45 s classify + rx-seq +
+  regression-reproducer replay); nightly runs `fuzz-long` (10 min each of
+  the three hermetic harnesses) and the sanitizer pair test with all F2
+  fuzz phases. Crash reproducers are committed under `fuzz/regressions/`.
+
+Real bugs found or closed by the program: (1) `SET_ENDPOINT`
+num_qps/buffer_count OOB teardown — found live by the coverage-guided
+netlink fuzzer, fixed with `-EBUSY` on active endpoints; (2) endpoint
+lookup-vs-DEL use-after-free — closed by the kref + release-via-RCU
+refactor; (3) verbose-GET-vs-DEL sub-object UAF (`ep->qps[]`/streams read
+unlocked during drain) — closed by holding `ep->lock` across the verbose
+fill. Remaining optional items are listed in design 27 (lifecycle/churn
+soak fuzz, corpus artifact management, coverage reporting).
+
+## Known functional gaps
+
+Found by the 2026-08-11 docs-vs-implementation review (full analysis and
+wiring plans land in `docs/design/29-code-review-refactor-plan.md`):
+
+1. **Per-stream reorder buffer is not wired into the RX path.** Both backends
+   (C rbtree default, optional Rust FFI) are implemented, KUnit-tested, and
+   fuzzed — but `urp_recv_done` delivers frames in completion order and never
+   calls `urp_reorder_insert`/`urp_reorder_drain_next`; the per-stream buffer
+   is allocated and freed unused, and `stats.reorder_insertions`/`reorder_drops`
+   are exported but never incremented. Invisible on single-QP and rxe-loopback
+   paths; matters for real multi-QP/ECMP deployments.
+2. **`buffer_count` / `buffer_size` endpoint config is accepted but unused.**
+   Parsed, validated, reported, and change-guarded — but the buffer pool is
+   sized by compile-time `URP_NUM_BUFS`/`URP_BUF_SIZE`.
 
 ## Working-tree hygiene notes
 
-The following files are in the working tree but should NOT be committed:
-- `result-dev`, `result-local`, `result-vm` — Nix build output symlinks
-- `.claude/scheduled_tasks.lock` — Claude Code session state
-- `fuzz/Cargo.lock` — generated lockfile for the fuzz target
-
-These will be skipped at commit time.
+- `result*` Nix build-output symlinks are gitignored (`result`, `result-*`)
+  and must not be committed.
+- `.claude/` — Claude Code session state; not committed.
+- `fuzz/Cargo.lock` **is committed intentionally** (reproducible fuzz-target
+  builds, same rationale as the workspace `Cargo.lock`).

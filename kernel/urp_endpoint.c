@@ -229,6 +229,17 @@ int urp_endpoint_activate(struct urp_endpoint *ep)
 		goto unlock;
 	}
 
+	/*
+	 * Resolve the live pool geometry from the (mutable-while-inactive)
+	 * buffer_count / buffer_size config. The netlink policy already bounds
+	 * both to their ranges; the resolvers clamp defensively so num_bufs and
+	 * buf_size are trustworthy for every downstream sizing (pool depth, CQ,
+	 * SRQ, SQ depth, credit window; DMA slot bytes, sge lengths, wire
+	 * max-payload) even if a value arrived by some other path.
+	 */
+	ep->num_bufs = urp_resolve_num_bufs(ep->buffer_count);
+	ep->buf_size = urp_resolve_buf_size(ep->buffer_size);
+
 	if (ep->is_initiator) {
 		ret = urp_endpoint_extract_v4(&ep->peer_addr, ip_buf,
 					      sizeof(ip_buf), &peer_port);

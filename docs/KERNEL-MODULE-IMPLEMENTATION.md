@@ -2,7 +2,7 @@
 
 Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.md).
 
-**Last updated**: 2026-05-24 (Phase 5 Step 1-9 done; HEAD `1bbbf1e` on `phase5-vm-pair`. Smoke test PASS in ~38 s; debug variant PASSes under KASAN_GENERIC + DEBUG_KMEMLEAK with zero sanitizer reports.)
+**Last updated**: 2026-08-11 (Phase 5 substantially complete on `main`: Steps 1-15 done, aarch64 TCG pair PASS, Redpanda produce/consume PASS. Post-Phase-5 hardening merged on `main`: static analysis (design 26) + the comprehensive fuzzing program (design 27) incl. the endpoint kref refactor — see `status.md`.)
 
 ---
 
@@ -15,9 +15,9 @@ Progress tracker for the [Kernel Module Implementation Plan](KERNEL-MODULE-PLAN.
 | 2 | [urp CLI + GENL](#phase-2-urp-cli--genl-interface) | Complete (`067829e`) | 8/9 |
 | 3a | [k1 Data Path](#phase-3a-k1-data-path) | Complete | 9/9 main + sub-steps; 7d initiator multi-stream done (`74df057`) — KASAN-clean 12-stream burst, full Redpanda produce/consume over RDMA |
 | 3b | [Probes + PSK Auth](#phase-3b-probes--psk-auth) | Complete (`dd6bab0`) | 10/10 |
-| 3 | [k1 -- Functional](#phase-3-k1----functional) | In Progress (via 3a) | 0/14 |
+| 3 | [k1 -- Functional](#phase-3-k1----functional) | Complete via 3a + 3b (the k1 deliverables were tracked/landed under those sub-phases) | — |
 | 4 | [k2 -- Optimized](#phase-4-k2----optimized) | rxe-testable scope complete (`c41bd61`) + 1-hour soak PASS | 2/8 main + 3 deferred-hardware; soak harness + on-reconnect-leak fix added |
-| 5 | [MicroVM Integration](#phase-5-microvm-integration) | In Progress (`1bbbf1e`) | 2/8 (x86_64 pair PASS in ~38 s, sanitizer PASS clean) |
+| 5 | [MicroVM Integration](#phase-5-microvm-integration) | Substantially complete | 7/8 done + 1 partial (riscv64 = build gate only); x86_64 pair ~38 s, sanitizer clean, aarch64 TCG pair PASS, Redpanda produce/consume PASS |
 
 ---
 
@@ -446,7 +446,7 @@ Deferred to **Phase 3c**: 1-hour soak with KASAN / KMEMLEAK / KCSAN
 
 ## Phase 3b: Probes + PSK Auth
 
-**Status**: In Progress -- on branch `phase3b-probes-psk` (cut from Phase 3a HEAD `22f98fa`). Scope: §3.6 QP health probes (PING/PONG, RTT EWMA, qualifying/draining state machine) + §3.7 Tier 0.5 PSK auth (SHA-256 in `rdma_cm` `private_data`).
+**Status**: Complete (`dd6bab0`; steps below). Scope: §3.6 QP health probes (PING/PONG, RTT EWMA, qualifying/draining state machine) + §3.7 Tier 0.5 PSK auth (SHA-256 in `rdma_cm` `private_data`). Sub-steps 8b + 3b/test remain deferred (see table at the end of this section).
 
 ### Step Status
 
@@ -488,7 +488,14 @@ Deferred to Phase 3c (unchanged): 1-hour soak with KASAN / KMEMLEAK / KCSAN.
 
 ## Phase 3: k1 -- Functional
 
-**Status**: In Progress (tracked under Phase 3a above for the data-path subset)
+**Status**: Superseded as a tracking unit — the k1 deliverables below were
+delivered through Phases 3a (data path) and 3b (probes/PSK); see those
+sections for per-step commits. The checklist below is retained unticked as
+the original plan-level view. One honest gap: the per-stream **reorder
+buffer is built and tested (both backends) but not yet wired into the RX
+delivery path** — frames are currently delivered in completion order, which
+soft-RoCE loopback and single-QP paths do not distinguish. Tracked in
+`status.md` as a known follow-up.
 
 ### Deliverables
 
@@ -632,11 +639,12 @@ Drain + rmmod freed 128 kB of slab beyond the in-loop measurement -- that's the 
 
 ## Phase 5: MicroVM Integration
 
-**Status**: Substantially complete (Steps 1-15 on `phase5-vm-pair`; 6/8
-deliverables done + 1 partial + 1 blocked). x86_64 pair + sanitizer PASS;
-kernel-version matrix (6.1/6.6/6.12/7.1.6) builds green; CI pipeline authored;
-**aarch64 emulated pair test FULL PASS under TCG**; riscv64 build gate;
-Redpanda blocked on hermetic broker sourcing (spec corrected, design ready).
+**Status**: Substantially complete (Steps 1-15; 7/8 deliverables done + 1
+partial). x86_64 pair + sanitizer PASS; kernel-version matrix
+(6.1/6.6/6.12/7.1.6) builds green; CI pipeline live; **aarch64 emulated pair
+test FULL PASS under TCG**; riscv64 build gate; **Redpanda unblocked and
+PASSING** (broker built hermetically from the redpanda fork's Nix flake —
+metadata AND full produce/consume over RDMA, see `status.md`).
 
 ### Deliverables
 
@@ -647,7 +655,7 @@ Redpanda blocked on hermetic broker sourcing (spec corrected, design ready).
 - [x] CI pipeline runs on every push (shared crate + CLI + kernel-module matrix) -- `.github/workflows/ci.yml` builds `protocol-tests`, `urp-cli`, and the full kernel-module matrix on GitHub-hosted `ubuntu-latest` (pure Nix, no KVM)
 - [x] Nightly CI runs MicroVM tests + soak test -- `.github/workflows/nightly.yml` runs `urp-microvm-pair-test`, `urp-microvm-pair-test-debug`, and `soak-1h` on a `[self-hosted, kvm]` runner
 - [x] Kernel version matrix: module builds on 6.1, 6.6, 6.12, latest -- `nix build .#checks.x86_64-linux.urp-ko-6_1|6_6|6_12` + `kernel-module-build`; all green on 6.1.180 / 6.6.148 / 6.12.101 / 7.1.6 via the `urp_sockaddr_t` / `urp_strscpy` / page_pool `__has_include` / `urp_genlmsg_iput` compat shims
-- [blocked] **Redpanda cluster test**: spec corrected (see below) + staged design ready, but **Stage 0 (broker packaging) is blocked on hermetic broker distribution**. Findings (2026-08-04):
+- [x] **Redpanda test: PASS** — unblocked by pinning the `redpanda` flake input to the fork (`randomizedcoder/redpanda@d4b4462`, native Kafka UDS listener). Stage A metadata round-trip 9/9 (`nix run .#test-redpanda-uds`) and full produce/consume 11/11 (`nix run .#test-redpanda-produce-consume`) — Kafka bytes byte-verified over the RDMA tunnel. Historical blocked-state findings kept below for the record (2026-08-04):
   - `redpanda-client` (= `rpk`) is in nixpkgs (unfree) but is the CLI only, not the broker.
   - GitHub releases (`redpanda-data/redpanda` v26.2.1) publish **only `rpk`** binaries -- no broker tarball/DEB.
   - The broker ships **only** via the Docker image (`docker.redpanda.com/redpandadata/redpanda`, which proxies to Docker Hub and **rate-limits unauthenticated pulls** -- verified `toomanyrequests`) and the token-gated `dl.redpanda.com` apt/yum repos. Neither is a clean, unauthenticated, hermetic `fetchurl`/`pullImage` source.
@@ -668,7 +676,7 @@ Redpanda blocked on hermetic broker sourcing (spec corrected, design ready).
 | 9 | `1bbbf1e` | Sanitizer regex tightening (was matching its own echoed command). Smoke test under KASAN + KMEMLEAK now PASSES clean. |
 | 10 | (this branch) | Kernel-version matrix + LTS build compat shims. `buildUrpKo` against `linuxPackages_6_1/6_6/6_12` exposed as `checks`/`packages` (`urp-ko-6_1` ...). Four independent API drifts vs mainline back-shimmed in `kernel/`: `urp_sockaddr_t` (7.0 unsized-sockaddr), `urp_strscpy` (6.8 sized_strscpy), page_pool header `__has_include`, `urp_genlmsg_iput` (6.9 wrapper, backport-safe). All four kernels build green. |
 | 11 | (this branch) | Bump nixpkgs 2026-04-30 -> 2026-08-04 + microvm.nix 4fe5ab5 -> e615e23. Latest kernel 7.0.3 -> 7.1.6; LTS pins -> 6.1.180 / 6.6.148 / 6.12.101. microvm bump required because new nixpkgs dropped `stdenv.hostPlatform.linux-kernel`. Pair test + matrix + protocol-tests + urp-cli all re-verified green post-bump. |
-| 12 | (this branch) | CI pipeline. `.github/workflows/ci.yml` (every push, hosted, pure Nix): protocol-tests, urp-cli, kernel-module matrix. `.github/workflows/nightly.yml` (`[self-hosted, kvm]`, scheduled + dispatch): pair test, sanitizer variant, soak. |
+| 12 | (this branch) | CI pipeline. `.github/workflows/ci.yml` (every push, hosted, pure Nix): protocol-tests, urp-cli, kernel-module matrix; a `fuzz-smoke` job (45 s hermetic fuzz + reproducer replay) was added later by design 27 F3. `.github/workflows/nightly.yml` (`[self-hosted, kvm]`, scheduled + dispatch): pair test, sanitizer variant (incl. the live fuzz phases), soak, cross-arch gates, plus a hosted `fuzz-long` job (10 min per hermetic harness). |
 
 ### Variations from Plan
 
@@ -733,8 +741,6 @@ Redpanda blocked on hermetic broker sourcing (spec corrected, design ready).
      family/cmd from our own family global. Key lesson: prefer wrapping the
      stable primitive over version-gating a redefinition of a helper that
      stable trees may backport.
-
-### Cross-Architecture Results
 
 ### Cross-Architecture Results
 
