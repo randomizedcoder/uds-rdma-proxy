@@ -160,7 +160,7 @@ int urp_stream_create(struct urp_endpoint *ep, u32 stream_id,
 	atomic64_set(&s->rx_bytes, 0);
 	s->tx_done = false;
 	mutex_init(&s->lock);
-	urp_credit_init(&s->credit, URP_NUM_BUFS / 2);
+	urp_credit_init(&s->credit, ep->num_bufs / 2);
 
 	/* Reorder buffer is per-stream because each stream has its own
 	 * sequence space (design 09 section 9.6). Capped at 256 -- well above

@@ -33,12 +33,15 @@ an *outline* to remember what to build; it is not yet a full design.
 3. **Redpanda wiring**
    - `kafka_api` entry with `unix_path` pointing **into the shared volume** (plus a
      TCP entry, since UDS is non-advertisable).
-   - **Open data-plane item:** rpk/franz uses UDS only for the *initial metadata
-     fetch*; produce/consume follows the advertised **TCP** endpoint. Full
-     produce/consume over the fast path therefore needs the advertised port bridged
-     too (see the "full produce/consume" follow-up in the personal plan / harness
-     notes). Cross-broker **RPC** (Seastar `rpc_server`) is a separate bridge and
-     an open question for the mesh case.
+   - **Data-plane bridging — SOLVED in the test harness:** rpk/franz uses UDS
+     only for the *initial metadata fetch*; produce/consume follows the
+     advertised **TCP** endpoint, so the advertised port must be bridged back
+     into the tunnel. `nix/test-redpanda-produce-consume.nix` does exactly
+     this (broker advertises a client-local `socat` bridge that funnels into
+     the UDS tunnel) and passes 11/11 with byte-verified payloads; the
+     provisioning layer needs the productionized equivalent of that bridge.
+     Cross-broker **RPC** (Seastar `rpc_server`) is a separate bridge and
+     still an open question for the mesh case.
 
 4. **Kubernetes integration**
    - DaemonSet: module load + `urp-agent` + rxe/device setup (privileged /
@@ -54,8 +57,9 @@ an *outline* to remember what to build; it is not yet a full design.
 - Map `urp show` / `/proc/urp/<name>/stats` to per-tenant metrics.
 
 ## 25.3 Open questions (carry forward)
-- Full **produce/consume over RDMA** (advertised TCP data-plane bridging) — the
-  metadata-only limitation is a real gap for a data-plane speedup.
+- ~~Full **produce/consume over RDMA**~~ — **proven** in the test harness
+  (`test-redpanda-produce-consume`, socat advertised-address bridge, 11/11
+  PASS); what carries forward is productionizing that bridge in `urp-agent`.
 - **Inter-broker RPC** over the fast path (mesh) — bridging `rpc_server`.
 - Peer/bind **addressing scheme** across nodes and how the agent discovers it.
 - Lifecycle/GC coupling to pod lifetimes (who removes an endpoint when a pod dies).

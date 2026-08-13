@@ -35,6 +35,16 @@ static const struct netlink_range_validation urp_buffer_size_range = {
 	.max = URP_BUFFER_SIZE_MAX,
 };
 
+/*
+ * buffer_count also needs FULL_RANGE: the pool is allocated up front from
+ * this value (kcalloc of num_bufs urp_buffer slots + one page each), so an
+ * unbounded max would let an admin request an arbitrarily large allocation.
+ */
+static const struct netlink_range_validation urp_buffer_count_range = {
+	.min = URP_BUFFER_COUNT_MIN,
+	.max = URP_BUFFER_COUNT_MAX,
+};
+
 /* Endpoint nested policy: validates URP_A_ENDPOINT contents */
 static const struct nla_policy urp_endpoint_policy[URP_ENDPOINT_A_MAX + 1] = {
 	[URP_ENDPOINT_A_NAME]		= { .type = NLA_NUL_STRING,
@@ -49,7 +59,8 @@ static const struct nla_policy urp_endpoint_policy[URP_ENDPOINT_A_MAX + 1] = {
 	[URP_ENDPOINT_A_BIND_ADDR]	= NLA_POLICY_EXACT_LEN(sizeof(struct sockaddr_in6)),
 	[URP_ENDPOINT_A_NUM_QPS]	= NLA_POLICY_RANGE(NLA_U32, URP_NUM_QPS_MIN,
 							   URP_NUM_QPS_MAX),
-	[URP_ENDPOINT_A_BUFFER_COUNT]	= NLA_POLICY_MIN(NLA_U32, URP_BUFFER_COUNT_MIN),
+	[URP_ENDPOINT_A_BUFFER_COUNT]	= NLA_POLICY_FULL_RANGE(NLA_U32,
+							&urp_buffer_count_range),
 	[URP_ENDPOINT_A_BUFFER_SIZE]	= NLA_POLICY_FULL_RANGE(NLA_U32,
 								&urp_buffer_size_range),
 	[URP_ENDPOINT_A_PASSWORD]	= { .type = NLA_NUL_STRING,

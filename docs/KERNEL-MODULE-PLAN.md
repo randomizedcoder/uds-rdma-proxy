@@ -34,6 +34,27 @@ The kernel module eliminates 2 of the 4 memory copies in the userspace proxy by 
 | 4 | [k2 -- Optimized](#phase-4-k2----optimized) | page_pool, zero-copy send, adaptive CQ polling, NUMA-aware allocation |
 | 5 | [MicroVM Integration](#phase-5-microvm-integration) | Cross-architecture VM pair tests, Redpanda cluster compatibility, CI pipeline |
 
+### Phase-numbering note (how the axes relate)
+
+Several numbering schemes appear across the docs; they are views of the same
+work, reconciled here so nothing needs renumbering:
+
+- **Phases 0–5** (this document) is the canonical implementation axis.
+- **k0/k1/k2** (design 21) are *data-path capability milestones*: k0 = Phase 1,
+  k1 = Phase 3, k2 = Phase 4.
+- **Phase 3a / 3b / 3c** (status.md, IMPLEMENTATION.md) are execution
+  sub-phases of Phase 3 introduced during implementation: 3a = k1 data path,
+  3b = probes + PSK, 3c = deferred hardening (largely superseded — KUnit
+  suites landed via 3a Step 9 + design 28, the soak via Phase 4).
+- **"Phase 6"** in status.md is a placeholder for post-plan work; it has no
+  section here. In practice that slot was filled by the design 26–28
+  programs (static analysis, fuzzing, testability) tracked in status.md.
+- **"Phase 7"** (design 24) is the deferred untrusted-tenant network-namespace
+  design — intentionally numbered beyond this plan.
+- **v0–v4** (design 03) was the *original userspace proxy* roadmap; it was
+  abandoned when the kernel-module approach (design 21) was chosen, and is
+  retained only as history.
+
 ---
 
 ## Development Strategy
@@ -627,7 +648,7 @@ NAPI-inspired adaptive polling:
 
 ### 5.2 MicroVM Test Suites
 
-**VM pair test** (`nix run .#microvms.test-kmod-x86_64`):
+**VM pair test** (shipped as `nix run .#urp-microvm-pair-test`):
 
 ```
 Phase 1: Boot acceptor VM, configure rdma_rxe, load urp.ko

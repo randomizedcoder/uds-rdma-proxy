@@ -34,8 +34,16 @@
 #define URP_FRAME_HEADER_SIZE	20
 #define URP_FRAME_TYPE_DATA	0x00
 #define URP_DEFAULT_PORT	4791
-#define BUF_SIZE		4096
+/*
+ * Registered buffers span the largest slot an endpoint can have
+ * (URP_BUFFER_SIZE_MAX 65536) so the `bigframe` mode can prove that an endpoint
+ * created with a large buffer_size actually carries a single >4076-byte payload
+ * (design 29 Gap 2). Small-frame modes (echo/latency/reorder) are unaffected.
+ */
+#define BUF_SIZE		65536
 #define MAX_PAYLOAD		(BUF_SIZE - URP_FRAME_HEADER_SIZE)
+/* Chunk that fits a default (4096-slot) endpoint, for the throughput mode. */
+#define DEFAULT_CHUNK		(4096 - URP_FRAME_HEADER_SIZE)
 
 struct test_context {
 	struct rdma_cm_id	*id;
@@ -311,7 +319,7 @@ static int mode_echo(struct test_context *ctx, const char *message, int count)
 static int mode_throughput(struct test_context *ctx, int size_mb)
 {
 	size_t total = (size_t)size_mb * 1024 * 1024;
-	size_t chunk = MAX_PAYLOAD;
+	size_t chunk = DEFAULT_CHUNK;	/* stay within a default 4096-slot endpoint */
 	size_t sent = 0;
 	uint64_t seq = 0;
 	struct timespec start, end;
@@ -424,6 +432,129 @@ static int mode_latency(struct test_context *ctx, int count)
 	return 0;
 }
 
+/* ---- Mode: reorder (design 29 Gap 1 / design 28 §28.8.3) ---- */
+
+#ifndef URP_DATA_FLAG_SYN
+#define URP_DATA_FLAG_SYN	(1 << 0)
+#endif
+
+/*
+ * Send one framed stream message and reap its send completion. A stray
+ * early echo (RECV) can also land on the shared CQ; skip it and re-post a
+ * recv -- echoes are drained politely later. Bounded so a stuck QP fails
+ * rather than spins forever.
+ */
+static int send_frame(struct test_context *ctx, uint32_t stream_id,
+		      uint64_t seq, uint8_t flags, size_t payload_len)
+{
+	struct ibv_wc wc;
+	int spins = 5000;	/* ~5 s at 1 ms */
+
+	urp_frame_encode(ctx->send_buf, stream_id, seq, URP_FRAME_TYPE_DATA,
+			 flags, 0, payload_len);
+	if (post_send(ctx, URP_FRAME_HEADER_SIZE + payload_len)) {
+		perror("post_send");
+		return -1;
+	}
+
+	while (spins-- > 0) {
+		int n = ibv_poll_cq(ctx->cq, 1, &wc);
+
+		if (n < 0) {
+			perror("ibv_poll_cq");
+			return -1;
+		}
+		if (n == 0) {
+			usleep(1000);
+			continue;
+		}
+		if (wc.opcode == IBV_WC_SEND) {
+			if (wc.status != IBV_WC_SUCCESS) {
+				fprintf(stderr, "send failed: %s\n",
+					ibv_wc_status_str(wc.status));
+				return -1;
+			}
+			return 0;
+		}
+		/* RECV (early echo): re-post and keep waiting for the send. */
+		post_recv(ctx);
+	}
+	fprintf(stderr, "send_frame: no completion for seq %lu\n",
+		(unsigned long)seq);
+	return -1;
+}
+
+/*
+ * Open a stream and deliberately send frames OUT OF SEQUENCE so the
+ * acceptor's per-stream reorder buffer must restore order before it
+ * delivers to the backend UDS socket. Sends SYN (seq 0) first so the
+ * stream exists, then swaps adjacent pairs (k+1 before k) -- every
+ * higher-of-pair arrives before its predecessor and gets buffered.
+ *
+ * This proves the WIRING (design 29 Gap 1: that urp_recv_done actually
+ * feeds urp_reorder_insert), verified by the acceptor's
+ * reorder_insertions / rx_frames / reorder_drops counters in the pair
+ * test. The byte-exact in-order delivery guarantee itself is the reorder
+ * buffer's own contract, exhaustively covered by fuzz-reorder + KUnit +
+ * the Rust twin -- not re-proven here.
+ */
+static int mode_reorder(struct test_context *ctx, int nframes)
+{
+	const uint32_t stream_id = 1;	/* odd: initiator-side id */
+	const size_t payln = 32;
+	int base, i;
+
+	if (nframes < 2)
+		nframes = 8;
+	if (nframes > 64)
+		nframes = 64;
+
+	printf("Reorder test: stream %u, %d frames, adjacent pairs swapped\n",
+	       stream_id, nframes);
+
+	/* Payload for frame i is @payln bytes all equal to (uint8_t)i. */
+	memset(ctx->send_buf + URP_FRAME_HEADER_SIZE, 0, payln);
+	if (send_frame(ctx, stream_id, 0, URP_DATA_FLAG_SYN, payln))
+		return 1;
+
+	for (base = 1; base < nframes; base += 2) {
+		if (base + 1 < nframes) {
+			memset(ctx->send_buf + URP_FRAME_HEADER_SIZE,
+			       base + 1, payln);
+			if (send_frame(ctx, stream_id, base + 1, 0, payln))
+				return 1;
+			memset(ctx->send_buf + URP_FRAME_HEADER_SIZE,
+			       base, payln);
+			if (send_frame(ctx, stream_id, base, 0, payln))
+				return 1;
+		} else {
+			memset(ctx->send_buf + URP_FRAME_HEADER_SIZE,
+			       base, payln);
+			if (send_frame(ctx, stream_id, base, 0, payln))
+				return 1;
+		}
+	}
+
+	/* Politely soak up a few echoes so the acceptor's stream TX toward
+	 * us doesn't RNR-storm; contents are not verified here.
+	 */
+	for (i = 0; i < nframes; i++) {
+		struct ibv_wc wc;
+		int spins = 200;
+
+		if (post_recv(ctx))
+			break;
+		while (spins-- > 0) {
+			if (ibv_poll_cq(ctx->cq, 1, &wc) > 0)
+				break;
+			usleep(1000);
+		}
+	}
+
+	printf("REORDER_SENT frames=%d payload=%zu\n", nframes, payln);
+	return 0;
+}
+
 /* ---- Connection setup + dispatch ---- */
 
 static int connect_to_server(struct test_context *ctx, const char *server, int port)
@@ -484,12 +615,83 @@ static int connect_to_server(struct test_context *ctx, const char *server, int p
 	return 0;
 }
 
+/* ---- Mode: bigframe ----
+ *
+ * Sends `count` single DATA frames of `payload_len` bytes each on the legacy
+ * stream and verifies every echo comes back byte-for-byte. This is the
+ * discriminating proof that a large buffer_size is actually wired (design 29
+ * Gap 2): a payload_len > the default 4076 only survives if the target
+ * endpoint's slot (buffer_size) and wire max-payload were sized from its
+ * config -- with the old fixed 4096 slot the frame would be dropped OVERSIZE /
+ * fail to DMA. It also reports per-frame RTT (latency) and aggregate MB/s
+ * (throughput) so the buffer-size / latency-vs-throughput tradeoff is visible.
+ */
+static int mode_bigframe(struct test_context *ctx, size_t payload_len, int count)
+{
+	struct timespec start, end;
+	double elapsed, us_per_frame, mbps, msgs_per_s;
+	int i;
+
+	if (payload_len > MAX_PAYLOAD) {
+		fprintf(stderr, "bigframe payload %zu exceeds client max %d\n",
+			payload_len, MAX_PAYLOAD);
+		return 1;
+	}
+	/* Distinct byte pattern so a truncated / stale echo is caught. */
+	for (i = 0; i < (int)payload_len; i++)
+		ctx->send_buf[URP_FRAME_HEADER_SIZE + i] = (char)('A' + (i & 31));
+
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	for (i = 0; i < count; i++) {
+		uint32_t rlen;
+
+		/* do_echo consumes one pre-posted recv; replenish each iteration. */
+		if (post_recv(ctx)) {
+			perror("post_recv");
+			return 1;
+		}
+		if (do_echo(ctx, (uint64_t)i,
+			    ctx->send_buf + URP_FRAME_HEADER_SIZE, payload_len)) {
+			fprintf(stderr, "bigframe echo failed at frame %d\n", i);
+			return 1;
+		}
+		rlen = urp_frame_decode_payload_len(ctx->recv_buf);
+		if (rlen != payload_len) {
+			printf("BIGFRAME_FAIL frame=%d rx_payload=%u want=%zu\n",
+			       i, rlen, payload_len);
+			return 1;
+		}
+		if (memcmp(ctx->recv_buf + URP_FRAME_HEADER_SIZE,
+			   ctx->send_buf + URP_FRAME_HEADER_SIZE, payload_len)) {
+			printf("BIGFRAME_FAIL frame=%d payload mismatch\n", i);
+			return 1;
+		}
+	}
+	clock_gettime(CLOCK_MONOTONIC, &end);
+
+	elapsed = (double)timespec_diff_ns(&start, &end) / 1e9;
+	us_per_frame = elapsed * 1e6 / (count > 0 ? count : 1);
+	mbps = (double)(payload_len * (size_t)count) / (1024.0 * 1024.0) /
+	       (elapsed > 0 ? elapsed : 1e-9);
+	/* messages/sec is the meaningful metric for small messages, where
+	 * per-message overhead (headers, round-trip) dominates the byte rate.
+	 */
+	msgs_per_s = (double)count / (elapsed > 0 ? elapsed : 1e-9);
+
+	/* Single machine-parseable line for the pair-test oracle. */
+	printf("BIGFRAME_OK payload=%zu frames=%d rtt_us=%.1f mbps=%.1f msgs_per_s=%.0f\n",
+	       payload_len, count, us_per_frame, mbps, msgs_per_s);
+	return 0;
+}
+
 static void usage(const char *prog)
 {
 	fprintf(stderr, "Usage:\n");
 	fprintf(stderr, "  %s <ip> <port> echo [message] [count]\n", prog);
 	fprintf(stderr, "  %s <ip> <port> throughput [size_mb]\n", prog);
 	fprintf(stderr, "  %s <ip> <port> latency [count]\n", prog);
+	fprintf(stderr, "  %s <ip> <port> reorder [nframes]\n", prog);
+	fprintf(stderr, "  %s <ip> <port> bigframe [payload_bytes] [count]\n", prog);
 	fprintf(stderr, "\nLegacy (no mode keyword):\n");
 	fprintf(stderr, "  %s <ip> [port] [message] [count]\n", prog);
 }
@@ -539,6 +741,27 @@ int main(int argc, char *argv[])
 		printf("RDMA connected to %s:%d\n", server, port);
 		int count = argc > 4 ? atoi(argv[4]) : 1000;
 		ret = mode_latency(&ctx, count);
+
+	} else if (argc >= 4 && strcmp(argv[3], "bigframe") == 0) {
+		port = atoi(argv[2]);
+		if (connect_to_server(&ctx, server, port)) {
+			cleanup(&ctx);
+			return 1;
+		}
+		printf("RDMA connected to %s:%d\n", server, port);
+		size_t payload = argc > 4 ? (size_t)strtoul(argv[4], NULL, 10) : 8000;
+		int count = argc > 5 ? atoi(argv[5]) : 4;
+		ret = mode_bigframe(&ctx, payload, count);
+
+	} else if (argc >= 4 && strcmp(argv[3], "reorder") == 0) {
+		port = atoi(argv[2]);
+		if (connect_to_server(&ctx, server, port)) {
+			cleanup(&ctx);
+			return 1;
+		}
+		printf("RDMA connected to %s:%d\n", server, port);
+		int nframes = argc > 4 ? atoi(argv[4]) : 8;
+		ret = mode_reorder(&ctx, nframes);
 
 	} else {
 		/* Legacy syntax: urp-test-client <ip> [port] [message] [count] */

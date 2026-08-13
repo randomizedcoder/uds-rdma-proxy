@@ -1,5 +1,13 @@
 # QP Health Probes & Latency Measurement
 
+> **Note (2026-08-11):** Written during the original userspace-proxy design
+> era (2026-05). The protocol and architecture content below still describes
+> the implemented wire behavior, but implementation specifics are
+> userspace-flavored (Rust proxy process, userspace ibverbs) — the shipped
+> implementation is the `urp` **kernel module** (see [DESIGN.md](../DESIGN.md)),
+> and v0–v4 phase references follow the abandoned userspace roadmap (see the
+> phase-numbering note in [KERNEL-MODULE-PLAN.md](../KERNEL-MODULE-PLAN.md)).
+
 ## 8a.1 Motivation and Prior Art
 
 Each QP maps to a different ECMP path via its unique source port hash. Before sending data traffic, the proxy must verify that the path actually works and establish a latency baseline. During operation, continuous probing detects path degradation before it causes data loss or reorder buffer timeouts.

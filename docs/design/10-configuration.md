@@ -1,5 +1,13 @@
 # Configuration
 
+> **Status: historical (userspace-proxy era, 2026-05).** This document
+> describes the original *userspace Rust proxy* design, which was superseded:
+> the project was implemented as a **Linux kernel module** instead — see
+> [DESIGN.md](../DESIGN.md) and [21-kernel-module.md](21-kernel-module.md).
+> Retained for design rationale and history. Details below (crates, io_uring,
+> tokio, TOML config, Prometheus, the v0–v4 roadmap) do not match the
+> implementation.
+
 ## 10.1 CLI Interface
 
 ```

@@ -31,7 +31,7 @@ int urp_qps_init(struct urp_endpoint *ep)
 		 * upper bound (peer can grant up to its SRQ population),
 		 * so use that. Step 4b wires the gate.
 		 */
-		urp_credit_init(&ep->qps[i].credit, URP_NUM_BUFS / 2);
+		urp_credit_init(&ep->qps[i].credit, ep->num_bufs / 2);
 		/* Step 5: start in QUALIFYING; RDMA_CM_EVENT_ESTABLISHED
 		 * promotes to ACTIVE (probe-driven Qualifying lands later).
 		 */

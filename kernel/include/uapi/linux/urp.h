@@ -55,13 +55,14 @@
 #define URP_NUM_QPS_MAX		32
 #define URP_NUM_QPS_MIN		1
 #define URP_BUFFER_COUNT_MIN	16
+#define URP_BUFFER_COUNT_MAX	65536	/* hard cap: bounds the pool allocation */
 #define URP_BUFFER_SIZE_MIN	URP_FRAME_HEADER_SIZE
 #define URP_BUFFER_SIZE_MAX	65536
 
 /* Defaults applied when attribute absent in NEW_ENDPOINT */
 #define URP_NUM_QPS_DEFAULT	1
 #define URP_BUFFER_COUNT_DEFAULT 1024
-#define URP_BUFFER_SIZE_DEFAULT	4076
+#define URP_BUFFER_SIZE_DEFAULT	4096	/* slot = header + 4076 payload */
 
 /*
  * GENL commands

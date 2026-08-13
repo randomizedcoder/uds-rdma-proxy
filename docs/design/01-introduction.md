@@ -1,5 +1,13 @@
 # Introduction
 
+> **Note (2026-08-11):** Written during the original userspace-proxy design
+> era (2026-05). The protocol and architecture content below still describes
+> the implemented wire behavior, but implementation specifics are
+> userspace-flavored (Rust proxy process, userspace ibverbs) — the shipped
+> implementation is the `urp` **kernel module** (see [DESIGN.md](../DESIGN.md)),
+> and v0–v4 phase references follow the abandoned userspace roadmap (see the
+> phase-numbering note in [KERNEL-MODULE-PLAN.md](../KERNEL-MODULE-PLAN.md)).
+
 ## 1.1 Problem Statement
 
 Many high-performance applications use Unix Domain Sockets (UDS) for local inter-process communication. Databases (PostgreSQL, Redis, Redpanda/Kafka), container runtimes, gRPC services, and monitoring agents all support UDS for same-host IPC. UDS avoids the overhead of the kernel TCP/IP stack -- no routing, no congestion control, no checksum computation -- resulting in lower latency and higher throughput for local communication.

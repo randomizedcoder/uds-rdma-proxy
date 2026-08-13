@@ -1,5 +1,13 @@
 # Multi-QP Transport & ECMP Path Diversity
 
+> **Note (2026-08-11):** Written during the original userspace-proxy design
+> era (2026-05). The protocol and architecture content below still describes
+> the implemented wire behavior, but implementation specifics are
+> userspace-flavored (Rust proxy process, userspace ibverbs) — the shipped
+> implementation is the `urp` **kernel module** (see [DESIGN.md](../DESIGN.md)),
+> and v0–v4 phase references follow the abandoned userspace roadmap (see the
+> phase-numbering note in [KERNEL-MODULE-PLAN.md](../KERNEL-MODULE-PLAN.md)).
+
 ## 8.1 Motivation
 
 Modern data center networks use ECMP (Equal-Cost Multi-Path) routing to spread traffic across multiple physical paths. ECMP hashes on the 5-tuple (src IP, dst IP, src port, dst port, protocol) to determine which path a flow takes. A single RDMA QP maps to a single 5-tuple, so all its traffic follows a single ECMP path.

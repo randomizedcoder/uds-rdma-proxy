@@ -693,6 +693,83 @@ static void test_classify_frame(struct kunit *test)
 #undef PONGSZ
 }
 
+/* ---- Buffer-geometry resolver tests (design 29 Gap 2) ---- */
+
+/*
+ * urp_resolve_num_bufs / urp_resolve_buf_size clamp the (admin-supplied,
+ * mutable-while-inactive) buffer_count / buffer_size into their valid ranges,
+ * and urp_ep_max_payload derives the wire payload ceiling from the slot. These
+ * feed every downstream sizing (pool depth, CQ/SRQ/SQ depth, DMA slot bytes,
+ * recv sge.length, UDS read cap), so pin every boundary here -- a clamp that
+ * silently lets a 0 or an over-max value through would size the pool wrong or,
+ * for buf_size, underflow the payload subtraction.
+ */
+static void test_resolve_num_bufs(struct kunit *test)
+{
+	const struct { u32 in; u32 want; } cases[] = {
+		{ 0,				URP_BUFFER_COUNT_MIN },	/* unset -> MIN */
+		{ 1,				URP_BUFFER_COUNT_MIN },	/* below MIN */
+		{ URP_BUFFER_COUNT_MIN - 1,	URP_BUFFER_COUNT_MIN },
+		{ URP_BUFFER_COUNT_MIN,		URP_BUFFER_COUNT_MIN },	/* at MIN */
+		{ 64,				64 },			/* mid (old fixed size) */
+		{ URP_BUFFER_COUNT_DEFAULT,	URP_BUFFER_COUNT_DEFAULT },
+		{ URP_BUFFER_COUNT_MAX,		URP_BUFFER_COUNT_MAX },	/* at MAX */
+		{ URP_BUFFER_COUNT_MAX + 1,	URP_BUFFER_COUNT_MAX },	/* above MAX */
+		{ 0xffffffffu,			URP_BUFFER_COUNT_MAX },	/* saturated */
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++)
+		KUNIT_EXPECT_EQ_MSG(test, urp_resolve_num_bufs(cases[i].in),
+				    cases[i].want, "num_bufs case %d (in=%u)",
+				    i, cases[i].in);
+}
+
+static void test_resolve_buf_size(struct kunit *test)
+{
+	const struct { u32 in; u32 want; } cases[] = {
+		{ 0,				URP_BUFFER_SIZE_MIN },	/* unset -> MIN */
+		{ 1,				URP_BUFFER_SIZE_MIN },	/* below MIN */
+		{ URP_BUFFER_SIZE_MIN - 1,	URP_BUFFER_SIZE_MIN },
+		{ URP_BUFFER_SIZE_MIN,		URP_BUFFER_SIZE_MIN },	/* at MIN (= header) */
+		{ URP_BUFFER_SIZE_DEFAULT,	URP_BUFFER_SIZE_DEFAULT },
+		{ URP_BUF_SIZE,			URP_BUF_SIZE },		/* default slot */
+		{ URP_BUFFER_SIZE_MAX,		URP_BUFFER_SIZE_MAX },	/* at MAX */
+		{ URP_BUFFER_SIZE_MAX + 1,	URP_BUFFER_SIZE_MAX },	/* above MAX */
+		{ 0xffffffffu,			URP_BUFFER_SIZE_MAX },	/* saturated */
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++)
+		KUNIT_EXPECT_EQ_MSG(test, urp_resolve_buf_size(cases[i].in),
+				    cases[i].want, "buf_size case %d (in=%u)",
+				    i, cases[i].in);
+}
+
+static void test_ep_max_payload(struct kunit *test)
+{
+	/* payload = slot - header; the resolver guarantees slot >= header so
+	 * this never underflows. Pair each slot with its expected payload.
+	 */
+	const struct { u32 slot; u32 want; } cases[] = {
+		{ URP_BUFFER_SIZE_MIN, 0 },				/* header-only: 0 payload */
+		{ URP_BUFFER_SIZE_MIN + 1, 1 },
+		{ URP_BUF_SIZE, URP_BUF_SIZE - URP_FRAME_HEADER_SIZE },	/* 4096 -> 4076 */
+		{ URP_BUFFER_SIZE_DEFAULT, 4076 },
+		{ URP_BUFFER_SIZE_MAX, URP_MAX_PAYLOAD },		/* MAX slot -> absolute ceiling */
+	};
+	int i;
+
+	/* The decoder's absolute ceiling must equal the max slot's payload. */
+	KUNIT_EXPECT_EQ(test, URP_MAX_PAYLOAD,
+			URP_BUFFER_SIZE_MAX - URP_FRAME_HEADER_SIZE);
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++)
+		KUNIT_EXPECT_EQ_MSG(test, urp_ep_max_payload(cases[i].slot),
+				    cases[i].want, "payload case %d (slot=%u)",
+				    i, cases[i].slot);
+}
+
 /* ---- Test suite registration ---- */
 
 static struct kunit_case urp_test_cases[] = {
@@ -734,6 +811,9 @@ static struct kunit_case urp_test_cases[] = {
 	KUNIT_CASE(test_stream_next_state),
 	/* design 28 E1: RX frame classifier */
 	KUNIT_CASE(test_classify_frame),
+	KUNIT_CASE(test_resolve_num_bufs),
+	KUNIT_CASE(test_resolve_buf_size),
+	KUNIT_CASE(test_ep_max_payload),
 	{}
 };
 
