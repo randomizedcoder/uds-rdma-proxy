@@ -1,6 +1,6 @@
 # Project Status
 
-_Last updated: 2026-08-11_
+_Last updated: 2026-08-12_
 
 ## Current branch
 
@@ -213,6 +213,22 @@ refactor; (3) verbose-GET-vs-DEL sub-object UAF (`ep->qps[]`/streams read
 unlocked during drain) — closed by holding `ep->lock` across the verbose
 fill. Remaining optional items are listed in design 27 (lifecycle/churn
 soak fuzz, corpus artifact management, coverage reporting).
+
+## io_uring UDS benchmark design (2026-08-12, design doc 30 — DESIGNED)
+
+`docs/design/30-urp-bench-io-uring.md` designs `urp-bench`: a symmetric
+userland benchmark pair (C + liburing and Rust + the `io-uring` crate, same
+CLI and wire framing) that drives the UDS side with io_uring and sweeps
+message size × batch size × io_uring mode (blocking control, batched
+send/recv, registered buffers, provided-buffer rings + multishot recv,
+SQPOLL, and a SEND_ZC evidence probe). It answers design 20 §20.1's open
+question — the honest hypothesis is that AF_UNIX has no zero-copy path, so
+the copy stays and syscall batching is the measurable win. Work items B1–B8
+(pure table-tested cores in both languages, io_uring shells, `urp-bench-units`
+check, `fuzz-bench-deframe` + cargo-fuzz + C↔Rust differential targets,
+first userland C static analysis via clang-tidy/cppcheck, pair-test Phase 13)
+are all **not started**. Note: design doc 29 remains referenced-but-uncommitted;
+30 was numbered around it.
 
 ## Known functional gaps
 
