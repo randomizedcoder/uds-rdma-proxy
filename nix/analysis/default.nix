@@ -27,6 +27,7 @@ let
   checkpatch = import ./checkpatch.nix { inherit pkgs src kernelPackages; };
   cocci = import ./coccicheck.nix { inherit pkgs mkKbuildReport kernelPackages; };
   rustLints = import ./rust-lints.nix { inherit pkgs src rustToolchain; };
+  userlandC = import ./userland-c.nix { inherit pkgs; };
 
   all = pkgs.runCommand "urp-analysis-all" { } ''
     mkdir -p $out
@@ -37,9 +38,11 @@ let
     ln -s ${cocci.report} $out/coccicheck
     ln -s ${rustLints.clippy} $out/clippy
     ln -s ${rustLints.rustfmt-check} $out/rustfmt
+    ln -s ${userlandC.clang-tidy} $out/clang-tidy
+    ln -s ${userlandC.cppcheck} $out/cppcheck
     {
       echo "=== urp static analysis (kernel ${kernelPackages.kernel.version}) ==="
-      for t in sparse smatch checkpatch gcc-w1 coccicheck clippy rustfmt; do
+      for t in sparse smatch checkpatch gcc-w1 coccicheck clippy rustfmt clang-tidy cppcheck; do
         printf '%-12s %s findings\n' "$t:" "$(cat $out/$t/count.txt)"
       done
     } > $out/summary.txt
@@ -55,5 +58,7 @@ in
   analysis-coccicheck = cocci.report;
   analysis-clippy = rustLints.clippy;
   analysis-rustfmt = rustLints.rustfmt-check;
+  analysis-clang-tidy = userlandC.clang-tidy;
+  analysis-cppcheck = userlandC.cppcheck;
   analysis-all = all;
 }

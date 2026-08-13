@@ -264,7 +264,19 @@ in
       # of sequence to exercise the per-stream reorder buffer (design 29 Gap 1),
       # and its `bigframe` mode drives the buffer-geometry sweep (Gap 2), both
       # from the peer VM.
-      ++ [ (import ../urp-test-client.nix { inherit pkgs; }) ];
+      ++ [ (import ../urp-test-client.nix { inherit pkgs; }) ]
+      # urp-bench (design 30): the io_uring UDS benchmark, driven as
+      # pair-test Phase 10g through the tunnel. Both binaries install as
+      # `urp-bench`, so the Rust twin ships under a wrapper name for the
+      # tunneled C<->Rust interop cell. Rust wrapper is native-x86_64
+      # only — the Rust cross toolchain isn't wired for the
+      # aarch64/riscv64 VM variants, and Phase 10g skips the interop
+      # cell when urp-bench-rs is absent.
+      ++ [ (import ../urp-bench.nix { inherit pkgs; }) ]
+      ++ lib.optionals pkgs.stdenv.hostPlatform.isx86_64 [
+        (pkgs.writeShellScriptBin "urp-bench-rs"
+          ''exec ${import ../urp-bench-rs.nix { inherit pkgs; }}/bin/urp-bench "$@"'')
+      ];
 
       # Expose the .ko via an env var on root's shell so test scripts
       # can `insmod $URP_KO` without hardcoding store paths.

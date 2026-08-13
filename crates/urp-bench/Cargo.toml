@@ -5,8 +5,14 @@ edition = "2021"
 description = "io_uring UDS benchmark (design 30) — Rust twin of tools/urp-bench-core.c"
 license = "GPL-2.0-or-later"
 
-# The pure core only (design 30 B2): frame/deframe/tracker/stats/batch/
-# config/report, all safe Rust, miri-clean. The io_uring backend (B4,
-# uring.rs + main.rs + the `io-uring` dependency) lands separately so this
-# crate stays dependency-free and sandbox-testable until then.
+# The pure core (design 30 B2) — lib modules — remains dependency-free
+# and miri-clean; only the binary (B4: main.rs + uring.rs) uses io-uring
+# and libc. The `io-uring` crate is the tokio-rs low-level binding chosen
+# in §30.10: raw SQE/CQE parity with liburing, no runtime in between.
 [dependencies]
+io-uring = "0.7"
+libc = "0.2"
+
+[[bin]]
+name = "urp-bench"
+path = "src/main.rs"

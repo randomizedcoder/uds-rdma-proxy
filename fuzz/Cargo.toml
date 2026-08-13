@@ -13,6 +13,14 @@ libfuzzer-sys = "0.4"
 [dependencies.uds-rdma-protocol]
 path = "../crates/uds-rdma-protocol"
 
+# urp-bench framing (design 30 §30.12): decode/roundtrip target plus the
+# C-vs-Rust differential (build.rs cc-compiles tools/urp-bench-core.c).
+[dependencies.urp-bench]
+path = "../crates/urp-bench"
+
+[build-dependencies]
+cc = "1"
+
 [[bin]]
 name = "frame_decode"
 path = "fuzz_targets/frame_decode.rs"
@@ -36,6 +44,16 @@ doc = false
 [[bin]]
 name = "credit_state_machine"
 path = "fuzz_targets/credit_state_machine.rs"
+doc = false
+
+[[bin]]
+name = "bench_frame_decode"
+path = "fuzz_targets/bench_frame_decode.rs"
+doc = false
+
+[[bin]]
+name = "bench_differential"
+path = "fuzz_targets/bench_differential.rs"
 doc = false
 
 [workspace]

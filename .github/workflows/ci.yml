@@ -81,7 +81,7 @@ jobs:
       # rbtree, a ~140 MB pull) runs in the nightly long-fuzz job instead.
       - name: Replay committed crash reproducers
         run: |
-          for t in classify rx-seq; do
+          for t in classify rx-seq bench-deframe; do
             for f in "fuzz/regressions/$t"/*; do
               [ -e "$f" ] || continue   # empty dir (only .gitkeep) -> skip
               # A reproduced crash exits non-zero -> fails the job (set -e).
@@ -92,3 +92,5 @@ jobs:
         run: nix run .#fuzz-classify -- -max_total_time=45 -print_final_stats=1
       - name: Fuzz rx-seq (RX state-machine pipeline, 45s)
         run: nix run .#fuzz-rx-seq -- -max_total_time=45 -print_final_stats=1
+      - name: Fuzz bench-deframe (urp-bench deframer, design 30, 45s)
+        run: nix run .#fuzz-bench-deframe -- -max_total_time=45 -print_final_stats=1

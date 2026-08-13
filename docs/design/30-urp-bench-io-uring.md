@@ -1,6 +1,11 @@
 # 30. urp-bench: io_uring UDS Benchmark — Copy Cost vs Syscall Batching (C + Rust)
 
-Status: **design / not started** — 2026-08-12.
+Status: **implemented** — designed and built 2026-08-12 (PRs #30–#33).
+All work items B1–B8 landed; the one open remnant is the `uring-bufring`
+mode (provided-buffer rings + multishot recv), which is an explicit
+`BENCH_SKIP reason=bufring_not_implemented` stub — see §30.15. Initial
+results and two matrix-caught implementation bugs are recorded in
+[BENCHMARKING.md](../BENCHMARKING.md).
 
 A symmetric userland benchmark app pair (`urp-bench`, implemented twice: C +
 liburing, Rust + the `io-uring` crate) that drives the UDS side of the tunnel
@@ -444,10 +449,15 @@ sandbox-safe (§30.14).
 | `bench_frame_decode` | cargo-fuzz | arbitrary bytes → `frame.rs` decode; plus encode→decode roundtrip property | `fuzz/regressions/bench-frame/` |
 | `bench_differential` | cargo-fuzz, `cc`-compiled C core linked in (the F0 differential pattern, [design 27 §27.4](27-fuzz-testing.md)) | byte-for-byte: C `bench_hdr_decode` vs Rust decode must agree on accept/reject and every field | shared with above |
 
-Wiring: three new attrs in `nix/fuzz/default.nix` (the `fuzzSrc` filter
-already admits all `tools/*.c`), `inherit` lines in `flake.nix`, regression
-dirs with `.gitkeep`, `fuzz-bench-deframe` added to the ci.yml `fuzz-smoke`
-replay+run loop, and all three to the nightly.yml `fuzz-long` matrix.
+Wiring (amended at implementation time): `fuzz-bench-deframe` is a nix
+attr (`mkCFuzzer` gained an `extraFlags` param for `-I tools`) and joins
+the ci.yml `fuzz-smoke` replay+run loop and the nightly.yml `fuzz-long`
+matrix. The two cargo-fuzz targets are runnable as a flake target —
+`nix run .#fuzz-rust -- bench_differential 60` (a
+`writeShellApplication` wrapper that replays
+`fuzz/regressions/bench-frame/` first, then fuzzes; impure by nature, so
+an app rather than a check) — or via the devshell `run-fuzz` function.
+They are not in CI (nothing runs cargo-fuzz in CI today).
 
 ## 30.13 Static analysis extension
 
@@ -472,11 +482,12 @@ nothing: workspace membership puts `crates/urp-bench` under the existing
 
 | Target | What it runs | Oracle |
 |---|---|---|
-| `nix build .#checks.…urp-bench-units` | C table tests + `cargo test -p urp-bench` (sandboxed, no io_uring) | exit 0; sentinel `$out/passed` |
-| `nix run .#urp-bench-local` | host-run direct-topology smoke: C↔C, Rust↔Rust, and **C↔Rust interop both ways**, smoke cells, `--verify full` | every cell `BENCH_OK … verify=full`; interop cells present |
-| `nix run .#urp-bench-matrix` | full direct-topology sweep, both languages + memcpy baseline; writes the matrix + C-vs-Rust delta tables | all cells OK/SKIP; delta table printed |
-| pair test **Phase 13** (`nix run .#urp-microvm-pair-test`) | tunneled smoke cells through RDMA, urp-bench replacing socat on a dedicated socket pair | expect scrapes `BENCH_OK` lines; existing `scan_splat` dmesg oracle stays armed |
-| `URP_BENCH_FULL=1 nix run .#urp-microvm-pair-test` | full tunneled matrix (nightly/manual, trimmed mode set §30.7) | same |
+| `nix build .#checks.…urp-bench-units` / `…urp-bench-rs-tests` | C table tests / `cargo test -p urp-bench` (sandboxed, no io_uring) | exit 0; sentinel `$out/passed` |
+| `nix run .#urp-bench-local` | host-run direct-topology smoke: C↔C, Rust↔Rust, and **C↔Rust interop both ways**, smoke cells, `--verify full`, + the sendzc evidence probe | every cell `BENCH_OK … verify=full`; `URP_BENCH_LOCAL_OK` |
+| `nix run .#urp-bench-matrix` (`URP_BENCH_MATRIX_QUICK=1` for the smoke subset) | full direct-topology sweep, both languages + memcpy baseline; prints the matrix + C-vs-Rust delta table | all cells OK/SKIP; delta ~0; `URP_BENCH_MATRIX_DONE` |
+| `nix run .#fuzz-bench-deframe` / `nix run .#fuzz-rust -- <target> <secs>` | libFuzzer on the C deframer / cargo-fuzz decode + C↔Rust differential | no crashes; regressions replayed first |
+| pair test **Phase 10g** (`nix run .#urp-microvm-pair-test`) — amended: Phases 11–12 are teardown, so the bench phase slots after 10f, not as a "Phase 13" | tunneled smoke cells through RDMA, **including a tunneled C↔Rust interop cell** (C echoes on vm1, Rust generates on vm2; skipped on cross-arch images without `urp-bench-rs`). Amended: the bench rides the *existing pair endpoints* (urp-bench replaces socat as the `/tmp/urp-pair-echo.sock` backend) — a dedicated second initiator endpoint never starts its CM machinery, a module gap this phase discovered (status.md known gap 3) | expect scrapes `BENCH_OK` lines; `scan_splat` dmesg oracle stays armed after every run; per-cell retry ×3 absorbs stream-setup races |
+| `URP_BENCH_FULL=1 nix run .#urp-microvm-pair-test` | extended tunneled cell set (nightly/manual, trimmed mode set §30.7) | same |
 
 **Sandbox decision, stated explicitly:** io_uring inside the nix build
 sandbox is not guaranteed — `kernel.io_uring_disabled` may be set on the
@@ -500,12 +511,12 @@ existing `microvm-pair` job.
 |---|---|---|
 | **B1** | C pure core + header spec (`tools/urp-bench-core.{c,h}`) | **IMPLEMENTED** |
 | **B2** | Rust twin core (`crates/urp-bench` lib) + workspace/nix-filter wiring (§30.10 table) | **IMPLEMENTED** |
-| **B3** | C io_uring shell (`tools/urp-bench.c`) + `nix/urp-bench.nix` (liburing) | *not started* |
-| **B4** | Rust io_uring backend (`uring.rs`, `main.rs`) + `nix/urp-bench-rs.nix` | *not started* |
+| **B3** | C io_uring shell (`tools/urp-bench.c`) + `nix/urp-bench.nix` (liburing) | **IMPLEMENTED** — all modes except `uring-bufring`, which is an explicit `BENCH_SKIP reason=bufring_not_implemented` stub until B8 |
+| **B4** | Rust io_uring backend (`uring.rs`, `main.rs`) + `nix/urp-bench-rs.nix` | **IMPLEMENTED** — same mode set and stub as B3; C↔Rust interop green both ways under `--verify full` (`nix run .#urp-bench-local`); sendzc probe records `eopnotsupp` on AF_UNIX — the §30.1 hypothesis confirmed on 7.1.6 |
 | **B5** | unit-test suites both languages + `urp-bench-units` check + shared hex vectors | **IMPLEMENTED** — C: 877 table checks in the sandboxed `urp-bench-units` check; Rust: 15 mirrored table tests in `urp-bench-rs-tests`, identical hex vectors, miri via `run-miri` |
-| **B6** | fuzz targets + regression dirs + ci/nightly wiring | *not started* |
-| **B7** | `analysis-clang-tidy` + `analysis-cppcheck` | *not started* |
-| **B8** | `.#urp-bench-local` / `.#urp-bench-matrix` apps, pair-test Phase 13, results section in BENCHMARKING.md | *not started* |
+| **B6** | fuzz targets + regression dirs + ci/nightly wiring | **IMPLEMENTED** — `fuzz-bench-deframe` (nix, CI); `bench_frame_decode` + `bench_differential` (cargo-fuzz, devshell; the differential ran 10.7 M comparisons clean at landing) |
+| **B7** | `analysis-clang-tidy` + `analysis-cppcheck` | **IMPLEMENTED** — `nix/analysis/userland-c.nix`, report-only house contract; first landing: clang-tidy 57 findings (stylistic cert/bugprone), cppcheck 0 |
+| **B8** | `.#urp-bench-local` / `.#urp-bench-matrix` apps, pair-test Phase 10g, results section in BENCHMARKING.md | **IMPLEMENTED** — `uring-bufring` remains a `BENCH_SKIP` stub (future work); initial results + 2 matrix-caught bugs recorded in [BENCHMARKING.md](../BENCHMARKING.md) |
 
 Sequencing: **B1 → B5(C half) first** — the core is table-tested before any
 io_uring code exists. Then B2, B3, B6, B7 in parallel; B4 after B2; B8 last.

@@ -147,6 +147,7 @@ in rec {
       T_URP=${if sanitizer then "30" else toString (t.urpReady * mult)}
       T_CM=${toString (t.cmEstablished * mult)}
       T_ECHO=${if sanitizer then "20" else toString (t.echo * mult)}
+      T_BENCH=${if sanitizer then "300" else toString (120 * mult)}
       T_SHUTDOWN=${if sanitizer then "60" else toString (t.shutdown * mult)}
 
       RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; NC=$'\033[0m'
@@ -834,6 +835,118 @@ in rec {
         cat "$geomtab"
       fi
       vm_run "$VM1_VIRTIO" "$VM1_PROC" "pkill -f urp-geom-echo.sock 2>/dev/null; rm -f /tmp/urp-geom-echo.sock; echo GBC" 5 >/dev/null 2>&1 || true
+      echo ""
+
+      # -----------------------------------------------------------------
+      # Phase 10g — urp-bench through the tunnel (design 30 §30.14).
+      # vm1 runs `urp-bench --listen` as the tunnel backend (replacing
+      # socat's role for a dedicated endpoint pair on port 4795); vm2's
+      # bench connects to urp's listen_path. Both sides generate AND echo
+      # (full duplex), every payload byte verified (--verify full). Smoke
+      # cells by default; URP_BENCH_FULL=1 adds the bigger cell set.
+      # -----------------------------------------------------------------
+      echo "--- Phase 10g: urp-bench io_uring benchmark through the tunnel ---"
+      benchtab="$RUNDIR/diag/bench-results.txt"
+      : > "$benchtab"
+      # The bench rides the EXISTING pair endpoints: urp-bench --listen
+      # takes over socat's echo-backend role on /tmp/urp-pair-echo.sock,
+      # and each bench client connection to /tmp/urp-pair.sock is a new
+      # stream on the already-ESTABLISHED session (the Phase 10 12-stream
+      # burst proves that path). A dedicated endpoint pair does NOT work:
+      # a second concurrent initiator endpoint never starts its CM
+      # machinery (module gap found by this phase — see status.md).
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+        "pkill -f 'urp-pair-echo.sock' 2>/dev/null; sleep 0.3; echo SOCAT_GONE" 10 \
+        >/dev/null 2>&1 || true
+      # State snapshot for post-mortems (captured, never parsed).
+      vm_run "$VM2_VIRTIO" "$VM2_PROC" "urp show; urp stats pair_initiator; dmesg | tail -15" 10 \
+        > "$RUNDIR/diag/vm2.bench-state-pre.txt" 2>&1 || true
+      BENCH_CELLS="blocking:4076:8 uring-rw:4076:8 uring-fixed:4076:8"
+      if [ -n "''${URP_BENCH_FULL:-}" ]; then
+        BENCH_CELLS="$BENCH_CELLS uring-rw:1024:64 uring-rw:65516:4 uring-fixed:16384:32"
+      fi
+      for cell in $BENCH_CELLS; do
+        bm=''${cell%%:*}; brest=''${cell#*:}; bs=''${brest%%:*}; bb=''${brest##*:}
+        bcli="$RUNDIR/diag/vm2.bench-$bm-$bs-$bb.txt"
+        blst="$RUNDIR/diag/vm1.bench-$bm-$bs-$bb.txt"
+        bench_cell_ok=0
+        for attempt in 1 2 3; do
+          # fresh listener per attempt (it exits after its FIN handshake)
+          vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+            "pkill -f 'urp-bench --listen' 2>/dev/null; rm -f /tmp/urp-pair-echo.sock; nohup urp-bench --listen /tmp/urp-pair-echo.sock --id 2 --mode $bm --msg-size $bs --batch $bb --count 300 --verify full >/tmp/urp-bench-l.out 2>&1 & sleep 0.3; echo BENCH_L_UP" 10 \
+            >/dev/null 2>&1 || true
+          vm_run "$VM2_VIRTIO" "$VM2_PROC" \
+            "urp-bench --connect /tmp/urp-pair.sock --id 1 --mode $bm --msg-size $bs --batch $bb --count 300 --verify full 2>&1" "$T_BENCH" \
+            > "$bcli" 2>&1 || true
+          scan_splat "$bcli" "bench client ($bm)"
+          vm_run "$VM1_VIRTIO" "$VM1_PROC" "cat /tmp/urp-bench-l.out" 10 > "$blst" 2>&1 || true
+          scan_splat "$blst" "bench listener ($bm)"
+          if grep -q BENCH_OK "$bcli" && grep -q BENCH_OK "$blst"; then
+            bench_cell_ok=1
+            break
+          fi
+          if grep -q BENCH_SKIP "$bcli" || grep -q BENCH_SKIP "$blst"; then
+            bench_cell_ok=2
+            break
+          fi
+          info "bench $bm msg=$bs batch=$bb: attempt $attempt failed (RDMA session may still be settling); retrying"
+          sleep 2
+        done
+        case "$bench_cell_ok" in
+          1)
+            pass "bench $bm msg=$bs batch=$bb: BENCH_OK both sides (verify=full)"
+            grep -h BENCH_OK "$bcli" "$blst" >> "$benchtab"
+            ;;
+          2)
+            info "bench $bm msg=$bs batch=$bb: $(grep -m1 -ho 'reason=[a-z_]*' "$bcli" "$blst" || echo skipped)"
+            ;;
+          *)
+            awk '{print "    "$0}' "$bcli"
+            awk '{print "    "$0}' "$blst"
+            vm_run "$VM1_VIRTIO" "$VM1_PROC" "urp show; urp stats pair_acceptor; dmesg | tail -25" 10 \
+              > "$RUNDIR/diag/vm1.bench-state-fail.txt" 2>&1 || true
+            vm_run "$VM2_VIRTIO" "$VM2_PROC" "urp show; urp stats pair_initiator; dmesg | tail -25" 10 \
+              > "$RUNDIR/diag/vm2.bench-state-fail.txt" 2>&1 || true
+            fail "bench $bm msg=$bs batch=$bb: no BENCH_OK after 3 attempts"
+            ;;
+        esac
+      done
+      # C<->Rust interop THROUGH the tunnel: vm1 echoes with the C shell,
+      # vm2 generates with the Rust shell — the live cross-language
+      # differential (§30.14), now over RDMA. Skipped on VM images
+      # without the Rust twin (cross-arch variants).
+      if vm_run "$VM2_VIRTIO" "$VM2_PROC" "command -v urp-bench-rs >/dev/null && echo HAVE_RS" 5 | grep -q HAVE_RS; then
+        vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+          "rm -f /tmp/urp-pair-echo.sock; nohup urp-bench --listen /tmp/urp-pair-echo.sock --id 2 --mode uring-rw --msg-size 4076 --batch 8 --count 300 --verify full >/tmp/urp-bench-l.out 2>&1 & sleep 0.3; echo BENCH_L_UP" 10 \
+          | grep -q BENCH_L_UP || fail "vm1 bench listener (interop) did not start"
+        bcli="$RUNDIR/diag/vm2.bench-interop.txt"
+        vm_run "$VM2_VIRTIO" "$VM2_PROC" \
+          "urp-bench-rs --connect /tmp/urp-pair.sock --id 1 --mode uring-rw --msg-size 4076 --batch 8 --count 300 --verify full 2>&1" "$T_BENCH" \
+          > "$bcli" 2>&1 || true
+        scan_splat "$bcli" "bench interop client"
+        blst="$RUNDIR/diag/vm1.bench-interop.txt"
+        vm_run "$VM1_VIRTIO" "$VM1_PROC" "cat /tmp/urp-bench-l.out" 10 > "$blst" 2>&1 || true
+        scan_splat "$blst" "bench interop listener"
+        if grep -q "BENCH_OK lang=rust" "$bcli" && grep -q "BENCH_OK lang=c" "$blst"; then
+          pass "bench C<->Rust interop through the tunnel (verify=full)"
+          grep -h BENCH_OK "$bcli" "$blst" >> "$benchtab"
+        else
+          awk '{print "    "$0}' "$bcli"
+          awk '{print "    "$0}' "$blst"
+          fail "bench C<->Rust interop: no BENCH_OK pair"
+        fi
+      else
+        info "urp-bench-rs not in VM image (cross-arch build); tunneled interop cell skipped"
+      fi
+      if [ -s "$benchtab" ]; then
+        info "tunneled urp-bench results (emulated rxe — correctness gate, not perf):"
+        awk '{print "  "$0}' "$benchtab"
+      fi
+      # No endpoints to remove — the bench rode the pair endpoints. Just
+      # stop the last listener; Phase 11 tears the pair down as usual.
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+        "pkill -f 'urp-bench --listen' 2>/dev/null; rm -f /tmp/urp-bench-l.out; echo BENCH_GONE" 15 >/dev/null 2>&1 || true
+      pass "urp-bench listener stopped"
       echo ""
 
       # -----------------------------------------------------------------

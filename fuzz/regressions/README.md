@@ -9,7 +9,10 @@ fuzz/regressions/<target>/<reproducer-file>
 ```
 
 `<target>` is the fuzz name without the `fuzz-` prefix, matching the CI replay
-step — e.g. `fuzz/regressions/classify/`, `.../rx-seq/`, `.../reorder/`.
+step — e.g. `fuzz/regressions/classify/`, `.../rx-seq/`, `.../reorder/`,
+`.../bench-deframe/` (design 30). `bench-frame/` holds reproducers for the
+cargo-fuzz targets `bench_frame_decode` / `bench_differential` (devshell
+`run-fuzz`, not CI).
 
 Replay locally:
 
@@ -17,8 +20,8 @@ Replay locally:
 nix run .#fuzz-<target> -- fuzz/regressions/<target>/*
 ```
 
-- Per-push (`ci.yml`, `fuzz-smoke`): replays `classify` + `rx-seq` reproducers,
-  then runs each hermetic harness for 45 s.
+- Per-push (`ci.yml`, `fuzz-smoke`): replays `classify` + `rx-seq` +
+  `bench-deframe` reproducers, then runs each hermetic harness for 45 s.
 - Nightly (`nightly.yml`, `fuzz-long`): replays all reproducers, then runs each
   harness (incl. `reorder`) for 10 min; crash artifacts are uploaded.
 

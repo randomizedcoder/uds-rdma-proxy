@@ -17,6 +17,9 @@ in
 
   buildInputs = [
     pkgs.linuxHeaders
+    # urp-bench io_uring shell (design 30 B3) — also lets the devshell
+    # compile tools/urp-bench.c by hand.
+    pkgs.liburing
   ];
 
   devTools = [

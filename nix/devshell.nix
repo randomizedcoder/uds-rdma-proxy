@@ -17,6 +17,8 @@ pkgs.mkShell {
     echo "  load-kmod        - insmod urp.ko"
     echo "  unload-kmod      - rmmod urp"
     echo "  nix run .#urp-vm - test VM (start/ssh/stop/console/status)"
+    echo "  nix run .#urp-bench-local - io_uring UDS bench smoke (C+Rust, design 30)"
+    echo "  nix run .#fuzz-rust [t] [s] - cargo-fuzz via nix (default: bench_differential 60s)"
     echo "  nix build .#analysis-all -L - static analysis (sparse/smatch/checkpatch/W=1/cocci/clippy)"
   '';
 }
