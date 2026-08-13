@@ -21,6 +21,7 @@ let
         baseName == "crates" ||
         baseName == "uds-rdma-protocol" ||
         baseName == "uds-rdma-protocol-ffi" ||
+        baseName == "urp-bench" ||
         baseName == "urp-cli" ||
         baseName == "src" ||
         baseName == "commands"
@@ -136,6 +137,28 @@ in
     preCheck = ''
       cargo test -p uds-rdma-protocol --no-default-features --offline
     '';
+
+    installPhase = ''
+      runHook preInstall
+      mkdir -p $out
+      touch $out/passed
+      runHook postInstall
+    '';
+  };
+
+  # urp-bench Rust twin tests (design 30 B5, Rust half). Same sentinel
+  # pattern as protocol-tests; the crate is dependency-free until the
+  # io_uring backend (B4) lands, so this runs fully sandboxed.
+  urp-bench-rs-tests = pkgs.rustPlatform.buildRustPackage {
+    pname = "urp-bench-rs-tests";
+    version = "0.1.0";
+    inherit src;
+
+    cargoLock.lockFile = ../Cargo.lock;
+    nativeBuildInputs = [ rustToolchain ];
+
+    cargoBuildFlags = [ "-p" "urp-bench" ];
+    cargoTestFlags  = [ "-p" "urp-bench" ];
 
     installPhase = ''
       runHook preInstall

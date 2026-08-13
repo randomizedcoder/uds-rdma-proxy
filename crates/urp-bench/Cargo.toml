@@ -1,0 +1,12 @@
+[package]
+name = "urp-bench"
+version = "0.1.0"
+edition = "2021"
+description = "io_uring UDS benchmark (design 30) — Rust twin of tools/urp-bench-core.c"
+license = "GPL-2.0-or-later"
+
+# The pure core only (design 30 B2): frame/deframe/tracker/stats/batch/
+# config/report, all safe Rust, miri-clean. The io_uring backend (B4,
+# uring.rs + main.rs + the `io-uring` dependency) lands separately so this
+# crate stays dependency-free and sandbox-testable until then.
+[dependencies]

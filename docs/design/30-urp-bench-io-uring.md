@@ -499,10 +499,10 @@ existing `microvm-pair` job.
 | Item | Deliverable | Status |
 |---|---|---|
 | **B1** | C pure core + header spec (`tools/urp-bench-core.{c,h}`) | **IMPLEMENTED** |
-| **B2** | Rust twin core (`crates/urp-bench` lib) + workspace/nix-filter wiring (§30.10 table) | *not started* |
+| **B2** | Rust twin core (`crates/urp-bench` lib) + workspace/nix-filter wiring (§30.10 table) | **IMPLEMENTED** |
 | **B3** | C io_uring shell (`tools/urp-bench.c`) + `nix/urp-bench.nix` (liburing) | *not started* |
 | **B4** | Rust io_uring backend (`uring.rs`, `main.rs`) + `nix/urp-bench-rs.nix` | *not started* |
-| **B5** | unit-test suites both languages + `urp-bench-units` check + shared hex vectors | **C half IMPLEMENTED** (877 table checks in the sandboxed `urp-bench-units` check); Rust half with B2 |
+| **B5** | unit-test suites both languages + `urp-bench-units` check + shared hex vectors | **IMPLEMENTED** — C: 877 table checks in the sandboxed `urp-bench-units` check; Rust: 15 mirrored table tests in `urp-bench-rs-tests`, identical hex vectors, miri via `run-miri` |
 | **B6** | fuzz targets + regression dirs + ci/nightly wiring | *not started* |
 | **B7** | `analysis-clang-tidy` + `analysis-cppcheck` | *not started* |
 | **B8** | `.#urp-bench-local` / `.#urp-bench-matrix` apps, pair-test Phase 13, results section in BENCHMARKING.md | *not started* |
