@@ -8,7 +8,7 @@ use std::io;
 use std::mem::{size_of, MaybeUninit};
 use std::os::raw::c_void;
 
-use crate::attr::{payload_str, payload_u16, AttrBuf, AttrIter};
+use crate::attr::{align4, payload_str, payload_u16, AttrBuf, AttrIter};
 use crate::error::UrpError;
 use crate::uapi::{
     CTRL_ATTR_FAMILY_ID, CTRL_ATTR_FAMILY_NAME, CTRL_ATTR_MCAST_GROUPS, CTRL_ATTR_MCAST_GRP_ID,
@@ -19,11 +19,6 @@ use crate::uapi::{
 const NETLINK_GENERIC: c_int = 16;
 const NLMSG_HDR_LEN: usize = 16;
 const GENL_HDR_LEN: usize = 4;
-
-#[inline]
-fn align4(n: usize) -> usize {
-    (n + 3) & !3
-}
 
 #[allow(dead_code)]
 #[repr(C)]

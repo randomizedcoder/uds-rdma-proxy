@@ -1,10 +1,9 @@
 use clap::Args;
 
-use crate::attr::AttrBuf;
+use crate::commands::fetch_endpoints;
 use crate::error::UrpError;
 use crate::format::Endpoint;
 use crate::netlink::UrpSocket;
-use crate::uapi::{UrpAttr, UrpCmd, UrpEndpointAttr};
 
 #[derive(Args, Debug)]
 pub struct StatsArgs {
@@ -18,20 +17,7 @@ pub struct StatsArgs {
 
 pub fn run(args: StatsArgs) -> Result<(), UrpError> {
     let mut sock = UrpSocket::connect()?;
-    let endpoints: Vec<Endpoint> = if let Some(name) = &args.name {
-        let mut top = AttrBuf::new();
-        top.nest(UrpAttr::Endpoint as u16, |ep| {
-            ep.put_string(UrpEndpointAttr::Name as u16, name);
-        });
-        let reply = sock.send_request(UrpCmd::GetEndpoint as u8, &top.into_bytes())?;
-        Endpoint::parse_top(&reply).into_iter().collect()
-    } else {
-        let payload = AttrBuf::new().into_bytes();
-        sock.dump(UrpCmd::GetEndpoint as u8, &payload)?
-            .iter()
-            .filter_map(|r| Endpoint::parse_top(r))
-            .collect()
-    };
+    let endpoints: Vec<Endpoint> = fetch_endpoints(&mut sock, args.name.as_deref())?;
 
     if args.json {
         let arr: Vec<_> = endpoints
