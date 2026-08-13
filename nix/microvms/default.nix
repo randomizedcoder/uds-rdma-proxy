@@ -83,13 +83,7 @@ let
     (mkCrossArch "riscv64" "riscv64");
 
 in {
-  inherit constants;
-  inherit vm1 vm2 vm1Debug vm2Debug;
-  inherit (microvmLib)
-    fullPairTest status forceKill
-    vm1Serial vm1Virtio vm2Serial vm2Virtio;
-
-  # Flat package set the flake can splice into packages.*
+  # The flake consumes `.packages` only; everything is exposed there.
   packages = {
     microvm-vm1                = vm1;
     microvm-vm2                = vm2;

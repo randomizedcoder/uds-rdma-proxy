@@ -56,7 +56,4 @@ in
   analysis-clippy = rustLints.clippy;
   analysis-rustfmt = rustLints.rustfmt-check;
   analysis-all = all;
-
-  # Exposed for devshell / manual `make C=2 CHECK=sparse` use.
-  inherit (sparse) sparseMaster;
 }

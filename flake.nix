@@ -192,9 +192,10 @@
             analysis-clippy analysis-rustfmt analysis-all;
           # Userspace C fuzzers (manual): nix run .#fuzz-classify
           # Live-kernel fuzzers (baked into the pair-test rootfs; exposed here
-          # so they build standalone): netlinkFuzz (S3), wireFuzz (S1/S2).
+          # so they build standalone): fuzz-netlink[-cov|-race] (S3),
+          # fuzz-wire (S1/S2).
           inherit (fuzz) fuzz-classify fuzz-rx-seq fuzz-reorder
-            netlinkFuzz covFuzz raceFuzz wireFuzz;
+            fuzz-netlink fuzz-netlink-cov fuzz-netlink-race fuzz-wire;
         } // microvms.packages // redpandaUdsTest;
 
         # `nix run .#test-redpanda-uds` (Linux only). Needs root at runtime.

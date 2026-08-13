@@ -26,7 +26,6 @@ let
 
   vmAttr1 = "microvm-vm1${pairLabel}";
   vmAttr2 = "microvm-vm2${pairLabel}";
-  diagDir = "/tmp/urp-microvm-pair${pairLabel}/diag";
 
   # Common runtime closure for orchestrator scripts.
   orchTools = with pkgs; [
@@ -148,8 +147,6 @@ in rec {
       T_URP=${if sanitizer then "30" else toString (t.urpReady * mult)}
       T_CM=${toString (t.cmEstablished * mult)}
       T_ECHO=${if sanitizer then "20" else toString (t.echo * mult)}
-      # shellcheck disable=SC2034  # used inline by per-step timeout
-      T_DRAIN=${if sanitizer then "30" else toString (t.drainRemove * mult)}
       T_SHUTDOWN=${if sanitizer then "60" else toString (t.shutdown * mult)}
 
       RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; NC=$'\033[0m'
@@ -585,7 +582,7 @@ in rec {
       echo "--- Phase 10c: netlink fuzz (vm1, live module) ---"
       NLFUZZ_SECS=${if sanitizer then "25" else "8"}
       vm_run "$VM1_VIRTIO" "$VM1_PROC" \
-        "netlink_fuzz $NLFUZZ_SECS 1 2>&1 | tail -3" $((NLFUZZ_SECS + 25)) \
+        "fuzz-netlink $NLFUZZ_SECS 1 2>&1 | tail -3" $((NLFUZZ_SECS + 25)) \
         > "$RUNDIR/diag/vm1.netlink-fuzz.txt" 2>&1 || true
       scan_splat "$RUNDIR/diag/vm1.netlink-fuzz.txt" "netlink fuzz"
       if grep -q NETLINK_FUZZ_DONE "$RUNDIR/diag/vm1.netlink-fuzz.txt" 2>/dev/null; then
@@ -606,7 +603,7 @@ in rec {
       echo "--- Phase 10c2: coverage-guided netlink fuzz (vm1, KCOV) ---"
       COVFUZZ_SECS=${if sanitizer then "25" else "8"}
       vm_run "$VM1_VIRTIO" "$VM1_PROC" \
-        "netlink_cov_fuzz $COVFUZZ_SECS 1 2>&1 | tail -4" $((COVFUZZ_SECS + 25)) \
+        "fuzz-netlink-cov $COVFUZZ_SECS 1 2>&1 | tail -4" $((COVFUZZ_SECS + 25)) \
         > "$RUNDIR/diag/vm1.cov-fuzz.txt" 2>&1 || true
       scan_splat "$RUNDIR/diag/vm1.cov-fuzz.txt" "coverage-guided netlink fuzz"
       if grep -q COV_FUZZ_DONE "$RUNDIR/diag/vm1.cov-fuzz.txt" 2>/dev/null; then
@@ -627,7 +624,7 @@ in rec {
       echo "--- Phase 10c3: concurrent netlink race (vm1, ${if sanitizer then "KASAN" else "smoke"}) ---"
       RACE_SECS=${if sanitizer then "25" else "6"}
       vm_run "$VM1_VIRTIO" "$VM1_PROC" \
-        "netlink_race $RACE_SECS $VM1_IP 1 8 2>&1 | tail -4" $((RACE_SECS + 25)) \
+        "fuzz-netlink-race $RACE_SECS $VM1_IP 1 8 2>&1 | tail -4" $((RACE_SECS + 25)) \
         > "$RUNDIR/diag/vm1.race-fuzz.txt" 2>&1 || true
       scan_splat "$RUNDIR/diag/vm1.race-fuzz.txt" "concurrent netlink race"
       if grep -q RACE_DONE "$RUNDIR/diag/vm1.race-fuzz.txt" 2>/dev/null; then
@@ -664,7 +661,7 @@ in rec {
         # rxe listener needs a beat to be routable before the peer resolves it.
         sleep "$POLL"
         vm_run "$VM2_VIRTIO" "$VM2_PROC" \
-          "wire_fuzz $VM1_IP 4792 $WIREFUZZ_SECS 1 2>&1 | tail -4" $((WIREFUZZ_SECS + 25)) \
+          "fuzz-wire $VM1_IP 4792 $WIREFUZZ_SECS 1 2>&1 | tail -4" $((WIREFUZZ_SECS + 25)) \
           > "$RUNDIR/diag/vm2.wire-fuzz.txt" 2>&1 || true
         scan_splat "$RUNDIR/diag/vm2.wire-fuzz.txt" "wire fuzz"
         if grep -q WIRE_FUZZ_DONE "$RUNDIR/diag/vm2.wire-fuzz.txt" 2>/dev/null; then

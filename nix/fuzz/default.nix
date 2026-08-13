@@ -53,6 +53,33 @@ let
       meta.mainProgram = name;
     };
 
+  # A plain standalone C binary (NOT libFuzzer) for the live-kernel/live-wire
+  # fuzzers. These drive the loaded module or a real RDMA peer from inside the
+  # sanitizer microVM, so they build as ordinary binaries and get baked into
+  # the VM rootfs (nix/microvms/mkVm.nix). @libs are extra `-l` link flags;
+  # @buildInputs are propagated headers/libs (e.g. rdma-core).
+  mkPlainCTool = { name, source, libs ? [ ], buildInputs ? [ ] }:
+    pkgs.stdenv.mkDerivation {
+      pname = "urp-${name}";
+      version = "0.1.0";
+      src = fuzzSrc;
+      nativeBuildInputs = [ pkgs.clang ];
+      inherit buildInputs;
+      buildPhase = ''
+        runHook preBuild
+        clang -O1 -std=gnu11 -Wall -Wextra \
+          nix/fuzz/${source} -o ${name} ${lib.concatStringsSep " " libs}
+        runHook postBuild
+      '';
+      installPhase = ''
+        runHook preInstall
+        mkdir -p $out/bin
+        cp ${name} $out/bin/
+        runHook postInstall
+      '';
+      meta.mainProgram = name;
+    };
+
   # Default C reorder backend fuzzer (design 27 F1.2 / F0.3). Compiles the REAL
   # kernel/urp_reorder.c against the kernel's OWN userspace rbtree
   # (tools/lib/rbtree.c), extracted at build time from the nixpkgs-pinned kernel
@@ -89,102 +116,25 @@ let
     '';
     meta.mainProgram = "fuzz-reorder";
   };
-  # Live-kernel netlink fuzzer (design 27 F2, S3). A plain standalone
-  # binary -- not libFuzzer -- meant to run INSIDE a sanitizer VM against
-  # the loaded urp module, hammering the genl control plane. Built here so
-  # it can be baked into the microVM rootfs (see nix/microvms/mkVm.nix).
-  netlinkFuzz = pkgs.stdenv.mkDerivation {
-    pname = "urp-netlink-fuzz";
-    version = "0.1.0";
-    src = fuzzSrc;
-    nativeBuildInputs = [ pkgs.clang ];
-    buildPhase = ''
-      runHook preBuild
-      clang -O1 -std=gnu11 -Wall -Wextra \
-        nix/fuzz/netlink_fuzz.c -o netlink_fuzz
-      runHook postBuild
-    '';
-    installPhase = ''
-      runHook preInstall
-      mkdir -p $out/bin
-      cp netlink_fuzz $out/bin/
-      runHook postInstall
-    '';
-    meta.mainProgram = "netlink_fuzz";
-  };
-  # KCOV coverage-guided netlink fuzzer (design 27 F2, S3). Same libc-only
-  # build as netlinkFuzz, but drives inputs by KCOV coverage feedback; needs a
-  # CONFIG_KCOV kernel (the sanitizer VM). Baked into the microVM rootfs.
-  covFuzz = pkgs.stdenv.mkDerivation {
-    pname = "urp-netlink-cov-fuzz";
-    version = "0.1.0";
-    src = fuzzSrc;
-    nativeBuildInputs = [ pkgs.clang ];
-    buildPhase = ''
-      runHook preBuild
-      clang -O1 -std=gnu11 -Wall -Wextra \
-        nix/fuzz/netlink_cov_fuzz.c -o netlink_cov_fuzz
-      runHook postBuild
-    '';
-    installPhase = ''
-      runHook preInstall
-      mkdir -p $out/bin
-      cp netlink_cov_fuzz $out/bin/
-      runHook postInstall
-    '';
-    meta.mainProgram = "netlink_cov_fuzz";
-  };
-  # Concurrent netlink racer (design 27 F2, S3 concurrency). Multi-threaded
-  # NEW/DEL/SET/GET churn on a shared name pool to shake out the endpoint
-  # lifecycle races (deref-after-rcu-unlock UAF; no kref, design 26). Baked
-  # into the microVM rootfs; run in the sanitizer VM.
-  raceFuzz = pkgs.stdenv.mkDerivation {
-    pname = "urp-netlink-race";
-    version = "0.1.0";
-    src = fuzzSrc;
-    nativeBuildInputs = [ pkgs.clang ];
-    buildPhase = ''
-      runHook preBuild
-      clang -O1 -std=gnu11 -Wall -Wextra \
-        nix/fuzz/netlink_race.c -o netlink_race -lpthread
-      runHook postBuild
-    '';
-    installPhase = ''
-      runHook preInstall
-      mkdir -p $out/bin
-      cp netlink_race $out/bin/
-      runHook postInstall
-    '';
-    meta.mainProgram = "netlink_race";
-  };
-  # Hostile-peer RDMA wire fuzzer (design 27 F2, S1/S2). A standalone
-  # librdmacm/libibverbs RC peer that connects to a urp acceptor and injects
-  # malformed frames into the RX path (urp_recv_done). Baked into the microVM
-  # rootfs and run from the peer VM against the acceptor under KASAN. Links
-  # rdma-core exactly like tools/urp-test-client.c.
-  wireFuzz = pkgs.stdenv.mkDerivation {
-    pname = "urp-wire-fuzz";
-    version = "0.1.0";
-    src = fuzzSrc;
-    nativeBuildInputs = [ pkgs.clang ];
-    buildInputs = [ pkgs.rdma-core ];
-    buildPhase = ''
-      runHook preBuild
-      clang -O1 -std=gnu11 -Wall -Wextra \
-        nix/fuzz/wire_fuzz.c -o wire_fuzz \
-        -lrdmacm -libverbs
-      runHook postBuild
-    '';
-    installPhase = ''
-      runHook preInstall
-      mkdir -p $out/bin
-      cp wire_fuzz $out/bin/
-      runHook postInstall
-    '';
-    meta.mainProgram = "wire_fuzz";
+  # Live-kernel + live-wire fuzzers (design 27 F2). Plain standalone binaries
+  # baked into the sanitizer microVM rootfs (see nix/microvms/mkVm.nix).
+  liveFuzzers = {
+    # Blind netlink fuzzer (S3): hammers the genl control plane.
+    fuzz-netlink = mkPlainCTool { name = "fuzz-netlink"; source = "netlink_fuzz.c"; };
+    # KCOV coverage-guided netlink fuzzer (S3); needs the CONFIG_KCOV kernel.
+    fuzz-netlink-cov = mkPlainCTool { name = "fuzz-netlink-cov"; source = "netlink_cov_fuzz.c"; };
+    # Concurrent NEW/DEL/SET/GET racer (S3) for endpoint-lifecycle UAF (design 26).
+    fuzz-netlink-race = mkPlainCTool { name = "fuzz-netlink-race"; source = "netlink_race.c"; libs = [ "-lpthread" ]; };
+    # Hostile-peer RDMA wire fuzzer (S1/S2): malformed frames into urp_recv_done.
+    fuzz-wire = mkPlainCTool {
+      name = "fuzz-wire";
+      source = "wire_fuzz.c";
+      libs = [ "-lrdmacm" "-libverbs" ];
+      buildInputs = [ pkgs.rdma-core ];
+    };
   };
 in
-{
+liveFuzzers // {
   # RX frame classifier -- the 27.8 disclosure surface.
   fuzz-classify = mkCFuzzer {
     name = "fuzz-classify";
@@ -204,15 +154,6 @@ in
   # Default C reorder backend + spec-model differential (real rbtree bundled).
   inherit fuzz-reorder;
 
-  # Live-kernel netlink fuzzer binary (for the microVM rootfs).
-  inherit netlinkFuzz;
-
-  # KCOV coverage-guided netlink fuzzer binary (for the microVM rootfs).
-  inherit covFuzz;
-
-  # Concurrent netlink racer binary (for the microVM rootfs).
-  inherit raceFuzz;
-
-  # Hostile-peer RDMA wire fuzzer binary (for the microVM rootfs).
-  inherit wireFuzz;
+  # The live-kernel / live-wire fuzzer binaries (fuzz-netlink[-cov|-race],
+  # fuzz-wire) are spliced in from liveFuzzers above.
 }

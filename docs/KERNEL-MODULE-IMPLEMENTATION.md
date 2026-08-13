@@ -213,7 +213,10 @@ dmesg.
       `__must_be_cstr`; pointer-typed `const char *path` parameters fail
       the check, so the relevant call sites drop down to the underlying
       `sized_strscpy()`.
-    `kmod-local.nix` still uses the running system kernel (unchanged).
+    (The since-removed `kmod-local.nix` `--impure` helper built against the
+    running system kernel; it was never wired into the flake and was
+    deleted in the 2026-08 nix cleanup -- use `nix build .#urp-ko` or the
+    `buildUrpKo` lib recipe in `flake.nix` instead.)
 13. **Streams attribute returns single-entry array** reflecting the k0
     connection; real multi-stream emission lands in Phase 3 alongside the
     actual stream mux.
@@ -271,7 +274,10 @@ dmesg.
     - `strscpy()` enforces a compile-time cstring check on both args via
       `__must_be_cstr`; pointer-typed `const char *path` parameters fail
       the check, so we drop down to the underlying `sized_strscpy()`.
-    `kmod-local.nix` still uses the running system kernel (unchanged).
+    (The since-removed `kmod-local.nix` `--impure` helper built against the
+    running system kernel; it was never wired into the flake and was
+    deleted in the 2026-08 nix cleanup -- use `nix build .#urp-ko` or the
+    `buildUrpKo` lib recipe in `flake.nix` instead.)
 13. **Streams attribute returns single-entry array** reflecting k0 connection;
     real multi-stream emission lands in Phase 3 alongside actual stream mux.
 14. **`URP_ENDPOINT_A_PASSWORD` is stored raw, not hashed**, and no auth is
