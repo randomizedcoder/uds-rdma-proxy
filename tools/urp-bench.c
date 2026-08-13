@@ -52,11 +52,17 @@
 #define UD_KIND(ud)	((int)((ud) >> 56))
 #define UD_IDX(ud)	((uint32_t)((ud) & 0xffffffffu))
 
+/*
+ * SOCK_STREAM invariant: exactly ONE recv SQE is outstanding at a time —
+ * concurrent recvs on a stream socket complete in arbitrary order and
+ * would permute the byte stream. The pool exists only so a buffer whose
+ * in-place echoes are still in flight can be parked while another one
+ * takes over receiving.
+ */
 struct recv_buf {
 	uint8_t *data;
 	int pending_echoes;	/* in-place echo sends referencing us */
-	int in_recv;		/* a recv SQE is outstanding */
-	int want_rearm;		/* processed, waiting for echoes to drain */
+	int in_recv;		/* the (single) recv SQE targets us */
 };
 
 struct send_op {
@@ -115,6 +121,7 @@ struct run {
 	uint64_t zc_copied;
 	uint64_t zc_sends;
 
+	int recv_wanted;	/* no recv armed: every buffer had echoes */
 	int64_t rc;		/* first fatal error */
 };
 
@@ -322,7 +329,25 @@ static void prep_recv(struct run *r, uint32_t rb_idx)
 	sqe->flags |= IOSQE_FIXED_FILE;
 	io_uring_sqe_set_data64(sqe, UD(UD_KIND_RECV, rb_idx));
 	rb->in_recv = 1;
-	rb->want_rearm = 0;
+}
+
+/* Arm the single next recv: reuse the drained buffer if its echoes are
+ * gone, else any echo-free buffer, else wait for release_send. */
+static void arm_next_recv(struct run *r, uint32_t prefer)
+{
+	uint32_t i;
+
+	if (r->rbufs[prefer].pending_echoes == 0) {
+		prep_recv(r, prefer);
+		return;
+	}
+	for (i = 0; i < r->n_rbufs; i++) {
+		if (!r->rbufs[i].in_recv && r->rbufs[i].pending_echoes == 0) {
+			prep_recv(r, i);
+			return;
+		}
+	}
+	r->recv_wanted = 1;
 }
 
 static void queue_echo_uring(struct run *r, struct msg_ctx *mc,
@@ -383,25 +408,35 @@ static void queue_echo_uring(struct run *r, struct msg_ctx *mc,
 	prep_send(r, op_idx);
 }
 
-static void queue_original_uring(struct run *r, int fin)
+/*
+ * Queue one original (or the FIN). Returns 0 on success, 1 for
+ * "back off": the tracker slot for next_seq is still occupied by
+ * next_seq - window (echoes completed out of order) — not an error,
+ * just stop topping up until that echo lands.
+ */
+static int queue_original_uring(struct run *r, int fin)
 {
 	uint32_t slot;
-	int op_idx = alloc_send_op(r);
+	int op_idx;
 	struct send_op *op;
 	struct bench_hdr h;
 	uint8_t *buf;
 	uint64_t t = now_ns();
 
+	if (bench_track_sent(&r->tracker, (uint32_t)r->next_seq, t) < 0)
+		return 1;	/* oldest window slot still in flight */
+
+	op_idx = alloc_send_op(r);
 	if (op_idx < 0) {
 		r->rc = -BENCH_EFULL;
-		return;
+		return 0;
 	}
 	for (slot = 0; slot < r->cfg->batch; slot++)
 		if (r->slot_free[slot])
 			break;
 	if (slot == r->cfg->batch) {
 		r->rc = -BENCH_EFULL;	/* planner said there was room */
-		return;
+		return 0;
 	}
 	r->slot_free[slot] = 0;
 	buf = r->send_slots + (size_t)slot * r->cfg->msg_size;
@@ -424,10 +459,6 @@ static void queue_original_uring(struct run *r, int fin)
 		bench_fill_payload(buf + BENCH_HDR_SIZE, h.payload_len,
 				   h.origin_id, h.seq);
 
-	if (bench_track_sent(&r->tracker, h.seq, t) < 0) {
-		r->rc = -BENCH_EFULL;
-		return;
-	}
 	if (fin) {
 		r->own_fin_sent = 1;
 		r->own_fin_seq = h.seq;
@@ -445,6 +476,7 @@ static void queue_original_uring(struct run *r, int fin)
 	op->ptr = buf;
 	op->remaining = fin ? BENCH_HDR_SIZE : r->cfg->msg_size;
 	prep_send(r, op_idx);
+	return 0;
 }
 
 static void release_send(struct run *r, struct send_op *op)
@@ -453,8 +485,10 @@ static void release_send(struct run *r, struct send_op *op)
 		struct recv_buf *rb = &r->rbufs[op->recv_idx];
 
 		rb->pending_echoes--;
-		if (rb->pending_echoes == 0 && rb->want_rearm)
+		if (rb->pending_echoes == 0 && r->recv_wanted) {
+			r->recv_wanted = 0;
 			prep_recv(r, (uint32_t)op->recv_idx);
+		}
 	}
 	if (op->scratch >= 0)
 		r->scratch_busy[op->scratch] = 0;
@@ -530,10 +564,7 @@ static void handle_recv_cqe(struct run *r, struct io_uring_cqe *cqe)
 		return;
 	}
 	/* §30.5 invariant: re-arm the receive before new writes queue. */
-	if (rb->pending_echoes == 0)
-		prep_recv(r, rb_idx);
-	else
-		rb->want_rearm = 1;
+	arm_next_recv(r, rb_idx);
 }
 
 static int run_done(const struct run *r)
@@ -567,7 +598,8 @@ static void top_up(struct run *r)
 			    r->goal - r->sent_originals : 0;
 	n = bench_batch_plan(&b, r->tracker.inflight_count, remaining);
 	while (n-- && r->rc >= 0)
-		queue_original_uring(r, 0);
+		if (queue_original_uring(r, 0))
+			return;	/* slot backpressure: retry next loop */
 	/* All originals sent (or deadline hit): append the FIN. */
 	if (remaining == 0 &&
 	    r->tracker.inflight_count < r->cfg->batch)
@@ -649,8 +681,7 @@ static int run_uring(struct run *r)
 	}
 
 	r->use_uring = 1;
-	for (i = 0; i < r->n_rbufs; i++)
-		prep_recv(r, i);
+	prep_recv(r, 0);	/* ONE outstanding recv (stream ordering) */
 
 	hard_deadline = now_ns() +
 			(FIN_TIMEOUT_S +
@@ -772,12 +803,16 @@ static void queue_echo_blocking(struct run *r, struct msg_ctx *mc,
 		r->rc = ret;
 }
 
-static void queue_original_blocking(struct run *r, int fin)
+/* Same 0/1 (success / slot-backpressure) contract as the uring twin. */
+static int queue_original_blocking(struct run *r, int fin)
 {
 	uint8_t buf[BENCH_HDR_SIZE];
 	struct bench_hdr h;
 	uint64_t t = now_ns();
 	int ret;
+
+	if (bench_track_sent(&r->tracker, (uint32_t)r->next_seq, t) < 0)
+		return 1;	/* oldest window slot still in flight */
 
 	h.magic = BENCH_MAGIC;
 	h.version = BENCH_VERSION;
@@ -787,10 +822,6 @@ static void queue_original_blocking(struct run *r, int fin)
 	h.seq = (uint32_t)r->next_seq;
 	h.t_send_ns = t;
 	bench_hdr_encode(&h, buf);
-	if (bench_track_sent(&r->tracker, h.seq, t) < 0) {
-		r->rc = -BENCH_EFULL;
-		return;
-	}
 	if (fin) {
 		r->own_fin_sent = 1;
 		r->own_fin_seq = h.seq;
@@ -809,6 +840,7 @@ static void queue_original_blocking(struct run *r, int fin)
 	}
 	if (ret < 0)
 		r->rc = ret;
+	return 0;
 }
 
 static int run_blocking(struct run *r)
@@ -837,7 +869,8 @@ static int run_blocking(struct run *r)
 			n = bench_batch_plan(&b, r->tracker.inflight_count,
 					     remaining);
 			while (n-- && r->rc >= 0)
-				queue_original_blocking(r, 0);
+				if (queue_original_blocking(r, 0))
+					break;	/* slot backpressure */
 			if (remaining == 0 &&
 			    r->tracker.inflight_count < r->cfg->batch)
 				queue_original_blocking(r, 1);

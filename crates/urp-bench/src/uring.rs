@@ -17,10 +17,14 @@ const UD_KIND_RECV: u64 = 1 << 56;
 const UD_KIND_SEND: u64 = 2 << 56;
 const NOTIF_ZC_COPIED: u32 = 1 << 31; // IORING_NOTIF_USAGE_ZC_COPIED
 
+/// SOCK_STREAM invariant: exactly ONE recv SQE outstanding at a time —
+/// concurrent recvs on a stream socket complete in arbitrary order and
+/// would permute the byte stream. The pool only parks buffers whose
+/// in-place echoes are still in flight.
 struct RecvBuf {
     data: Vec<u8>,
     pending_echoes: u32,
-    want_rearm: bool,
+    in_recv: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -79,6 +83,8 @@ struct Bufs {
     scratch: Vec<Vec<u8>>,
     scratch_busy: Vec<bool>,
     sends: Vec<SendOp>,
+    /// No recv armed: every buffer had echoes in flight.
+    recv_wanted: bool,
 }
 
 fn alloc_send_op(bufs: &Bufs) -> Option<usize> {
@@ -126,8 +132,30 @@ fn prep_recv(
     } else {
         opcode::Recv::new(fd, ptr, RECV_BUF_SZ as u32).build()
     };
-    bufs.rbufs[rb_idx].want_rearm = false;
+    bufs.rbufs[rb_idx].in_recv = true;
     ring.push(&entry.user_data(UD_KIND_RECV | rb_idx as u64), shell)
+}
+
+/// Arm the single next recv: reuse the drained buffer if its echoes are
+/// gone, else any echo-free buffer, else wait for release_send.
+fn arm_next_recv(
+    ring: &mut Ring,
+    shell: &mut Shell,
+    bufs: &mut Bufs,
+    prefer: usize,
+) -> Result<(), Error> {
+    if bufs.rbufs[prefer].pending_echoes == 0 {
+        return prep_recv(ring, shell, bufs, prefer);
+    }
+    if let Some(i) = bufs
+        .rbufs
+        .iter()
+        .position(|rb| !rb.in_recv && rb.pending_echoes == 0)
+    {
+        return prep_recv(ring, shell, bufs, i);
+    }
+    bufs.recv_wanted = true;
+    Ok(())
 }
 
 fn release_send(
@@ -140,7 +168,8 @@ fn release_send(
     if op.recv_idx >= 0 {
         let rb_idx = op.recv_idx as usize;
         bufs.rbufs[rb_idx].pending_echoes -= 1;
-        if bufs.rbufs[rb_idx].pending_echoes == 0 && bufs.rbufs[rb_idx].want_rearm {
+        if bufs.rbufs[rb_idx].pending_echoes == 0 && bufs.recv_wanted {
+            bufs.recv_wanted = false;
             prep_recv(ring, shell, bufs, rb_idx)?;
         }
     }
@@ -154,13 +183,16 @@ fn release_send(
     Ok(())
 }
 
+/// `Ok(false)` = slot backpressure (the tracker slot for next_seq is
+/// still occupied by next_seq − window after out-of-order echoes): stop
+/// topping up this iteration — not an error.
 fn queue_original(
     ring: &mut Ring,
     shell: &mut Shell,
     bufs: &mut Bufs,
     n_rbufs: usize,
     fin: bool,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     let op_idx = alloc_send_op(bufs).ok_or(Error::Full)?;
     let slot = bufs.slot_free.iter().position(|f| *f).ok_or(Error::Full)?;
     bufs.slot_free[slot] = false;
@@ -168,7 +200,14 @@ fn queue_original(
     let msg_size = shell.cfg.msg_size as usize;
     let h = {
         let buf = &mut bufs.send_slots[slot];
-        shell.next_original(buf, fin).ok_or(Error::Full)?
+        shell.next_original(buf, fin)
+    };
+    let h = match h {
+        Some(h) => h,
+        None => {
+            bufs.slot_free[slot] = true;
+            return Ok(false);
+        }
     };
     let total = if fin { HDR_SIZE } else { msg_size };
     let use_fixed = ring.use_fixed;
@@ -187,7 +226,8 @@ fn queue_original(
         in_use: true,
     };
     let _ = h;
-    prep_send(ring, shell, bufs, op_idx)
+    prep_send(ring, shell, bufs, op_idx)?;
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)] // mirrors the C shell's signature 1:1
@@ -307,7 +347,7 @@ pub fn run(shell: &mut Shell, fd: RawFd) -> Result<u64, i32> {
             .map(|_| RecvBuf {
                 data: vec![0; RECV_BUF_SZ],
                 pending_echoes: 0,
-                want_rearm: false,
+                in_recv: false,
             })
             .collect(),
         send_slots: (0..cfg.batch).map(|_| vec![0x5a; msg_size]).collect(),
@@ -315,6 +355,7 @@ pub fn run(shell: &mut Shell, fd: RawFd) -> Result<u64, i32> {
         scratch: (0..n_scratch).map(|_| vec![0; msg_size]).collect(),
         scratch_busy: vec![false; n_scratch],
         sends: vec![SendOp::FREE; (2 * cfg.batch) as usize + n_rbufs + n_scratch + 8],
+        recv_wanted: false,
     };
 
     if cfg.mode == Mode::UringFixed {
@@ -346,10 +387,9 @@ pub fn run(shell: &mut Shell, fd: RawFd) -> Result<u64, i32> {
     }
 
     let mut deframer = Deframer::new(msg_size, cfg.msg_size - HDR_SIZE as u32);
-    for i in 0..n_rbufs {
-        if prep_recv(&mut ring, shell, &mut bufs, i).is_err() {
-            fail(&cfg, "prep_recv", 0);
-        }
+    // ONE outstanding recv (stream ordering — see RecvBuf).
+    if prep_recv(&mut ring, shell, &mut bufs, 0).is_err() {
+        fail(&cfg, "prep_recv", 0);
     }
 
     let hard_deadline = shell.hard_deadline();
@@ -360,8 +400,10 @@ pub fn run(shell: &mut Shell, fd: RawFd) -> Result<u64, i32> {
         // top-up
         let (mut n, fin) = shell.plan();
         while n > 0 {
-            if queue_original(&mut ring, shell, &mut bufs, n_rbufs, false).is_err() {
-                return Err(-(Error::Full as i32));
+            match queue_original(&mut ring, shell, &mut bufs, n_rbufs, false) {
+                Err(_) => return Err(-(Error::Full as i32)),
+                Ok(false) => break, // slot backpressure: retry next loop
+                Ok(true) => {}
             }
             n -= 1;
         }
@@ -391,6 +433,7 @@ pub fn run(shell: &mut Shell, fd: RawFd) -> Result<u64, i32> {
                 if res < 0 {
                     return Err(res);
                 }
+                bufs.rbufs[rb_idx].in_recv = false;
                 let n = res as usize;
                 // feed: deframer and shell are disjoint borrows; the
                 // chunk is copied out of the recv buf borrow via split.
@@ -428,12 +471,8 @@ pub fn run(shell: &mut Shell, fd: RawFd) -> Result<u64, i32> {
                     }
                 }
                 // §30.5 invariant: re-arm before new writes queue.
-                if bufs.rbufs[rb_idx].pending_echoes == 0 {
-                    if prep_recv(&mut ring, shell, &mut bufs, rb_idx).is_err() {
-                        return Err(-(Error::Full as i32));
-                    }
-                } else {
-                    bufs.rbufs[rb_idx].want_rearm = true;
+                if arm_next_recv(&mut ring, shell, &mut bufs, rb_idx).is_err() {
+                    return Err(-(Error::Full as i32));
                 }
             } else {
                 let op_idx = (ud & 0xffff_ffff) as usize;

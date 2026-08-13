@@ -230,12 +230,28 @@ first userland C static analysis via clang-tidy/cppcheck, pair-test Phase 13)
 are all **not started**. Note: design doc 29 remains referenced-but-uncommitted;
 30 was numbered around it.
 
-Progress (2026-08-12): **B1, B2, B5 IMPLEMENTED** — both pure cores landed
-and table-tested (C: 877 checks in the sandboxed `urp-bench-units` check;
-Rust: `crates/urp-bench` workspace member, 15 mirrored table tests in
-`urp-bench-rs-tests`, clippy/fmt clean, miri wired into `run-miri`). The
-cross-language hex test vectors are duplicated verbatim in both suites and
-green on both sides. io_uring shells (B3/B4) are next.
+Progress (2026-08-12): **B1–B8 all IMPLEMENTED** (PRs #30–#33).
+
+- Pure cores, both languages, table-tested (C: 877 checks in the sandboxed
+  `urp-bench-units` check; Rust: 15 mirrored suites in `urp-bench-rs-tests`;
+  identical cross-language hex vectors; miri via `run-miri`).
+- io_uring shells: 6 live modes; `uring-bufring` is an explicit
+  `BENCH_SKIP` stub (the one open remnant). `nix run .#urp-bench-local`
+  = C↔C, Rust↔Rust, C↔Rust interop both ways, all `--verify full`.
+- The `uring-sendzc` probe answered the design's core question on 7.1.6:
+  `result=eopnotsupp` — **AF_UNIX has no zero-copy send**; the win is
+  syscall batching (0.9–1.4 → 0.01–0.09 syscalls/msg).
+- Fuzz: `fuzz-bench-deframe` (nix, in ci fuzz-smoke + nightly fuzz-long);
+  cargo-fuzz `bench_frame_decode` + `bench_differential` (10.7 M clean
+  C-vs-Rust comparisons at landing), devshell `run-fuzz`.
+- First userland C static analysis: `analysis-clang-tidy` (57 report-only
+  findings) + `analysis-cppcheck` (0), in `analysis-all`.
+- `nix run .#urp-bench-matrix` sweep + C-vs-Rust delta table (~0 within
+  noise); pair-test **Phase 10g** runs tunneled cells with `scan_splat`
+  armed; `URP_BENCH_FULL=1` extends the tunneled set.
+- The matrix caught two real shared bugs during bring-up (tracker-slot
+  backpressure treated as fatal; multiple outstanding recvs permuting the
+  SOCK_STREAM byte stream) — details in `docs/BENCHMARKING.md`.
 
 ## Known functional gaps
 
@@ -252,6 +268,17 @@ wiring plans land in `docs/design/29-code-review-refactor-plan.md`):
 2. **`buffer_count` / `buffer_size` endpoint config is accepted but unused.**
    Parsed, validated, reported, and change-guarded — but the buffer pool is
    sized by compile-time `URP_NUM_BUFS`/`URP_BUF_SIZE`.
+3. **A second concurrent initiator endpoint never starts its CM machinery**
+   (found 2026-08-12 by pair-test Phase 10g, design 30). With
+   `pair_initiator` active, `urp add bench_init --listen-path … --peer …`
+   returns ok and `urp show` lists the endpoint as active — but no
+   "listening on UDS", no CM address-resolved/established events, and
+   stats stay all-zero; app connects to the listen path then time out.
+   Acceptor endpoints coexist fine (10d/10e/10f create several serially
+   and the 10c3 racer leaves four active). Phase 10g works around it by
+   riding the established pair endpoints (urp-bench replaces socat as the
+   `/tmp/urp-pair-echo.sock` backend). Needs a kernel-side look at the
+   initiator add path (per-module vs per-endpoint CM/listen state).
 
 ## Working-tree hygiene notes
 

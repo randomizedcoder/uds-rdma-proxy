@@ -85,6 +85,11 @@
           inherit (packages) rustToolchain;
         };
         urpBenchLocal = import ./nix/urp-bench-local.nix { inherit pkgs; };
+        urpBenchMatrix = import ./nix/urp-bench-matrix.nix { inherit pkgs; };
+        fuzzRust = import ./nix/fuzz-rust.nix {
+          inherit pkgs;
+          inherit (packages) rustToolchain;
+        };
 
         urpCli = import ./nix/urp-cli.nix {
           inherit pkgs;
@@ -193,6 +198,8 @@
           urp-bench-c = urpBenchC;
           urp-bench-rs = urpBenchRs;
           urp-bench-local = urpBenchLocal;
+          urp-bench-matrix = urpBenchMatrix;
+          fuzz-rust = fuzzRust;
           test-kmod-k0 = testKmodK0;
           soak-1h = soak1h;
           urp-vm = urpVm;
@@ -203,12 +210,14 @@
           inherit (analysis)
             analysis-sparse analysis-smatch analysis-checkpatch
             analysis-w1 analysis-w2 analysis-coccicheck
-            analysis-clippy analysis-rustfmt analysis-all;
+            analysis-clippy analysis-rustfmt
+            analysis-clang-tidy analysis-cppcheck analysis-all;
           # Userspace C fuzzers (manual): nix run .#fuzz-classify
           # Live-kernel fuzzers (baked into the pair-test rootfs; exposed here
           # so they build standalone): fuzz-netlink[-cov|-race] (S3),
           # fuzz-wire (S1/S2).
           inherit (fuzz) fuzz-classify fuzz-rx-seq fuzz-reorder
+            fuzz-bench-deframe
             fuzz-netlink fuzz-netlink-cov fuzz-netlink-race fuzz-wire;
         } // microvms.packages // redpandaUdsTest;
 

@@ -10,7 +10,6 @@ use urp_bench::config::{Config, Mode, Role, Verify};
 use urp_bench::deframe::Deframer;
 use urp_bench::frame::HDR_SIZE;
 use urp_bench::report::Report;
-use urp_bench::Error;
 
 // Bin-only modules: the lib stays io_uring/libc-free and miri-clean.
 mod shell;
@@ -130,21 +129,18 @@ fn run_blocking(shell: &mut Shell, stream: &UnixStream) -> Result<u64, i32> {
     let mut echoes: Vec<PendingEcho> = Vec::new();
 
     while !shell.done_core() || !carry.buf.is_empty() {
-        // top-up
+        // top-up (None = slot backpressure after out-of-order echoes:
+        // stop for this iteration, not an error)
         let (n, fin) = shell.plan();
         for _ in 0..n {
-            let h = shell
-                .next_original(&mut slot, false)
-                .ok_or(-(Error::Full as i32))?;
-            let _ = h;
+            match shell.next_original(&mut slot, false) {
+                Some(_) => {}
+                None => break,
+            }
             let s = slot[..msg_size].to_vec(); // borrow untangling only
             carry.queue(shell, fd, &s)?;
         }
-        if fin {
-            let h = shell
-                .next_original(&mut slot, true)
-                .ok_or(-(Error::Full as i32))?;
-            let _ = h;
+        if fin && shell.next_original(&mut slot, true).is_some() {
             let s = slot[..HDR_SIZE].to_vec();
             carry.queue(shell, fd, &s)?;
         }

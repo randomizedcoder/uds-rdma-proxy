@@ -28,6 +28,7 @@
       {
         cargo clippy -p uds-rdma-protocol --all-targets --offline 2>&1 || true
         cargo clippy -p urp-cli --all-targets --offline 2>&1 || true
+        cargo clippy -p urp-bench --all-targets --offline 2>&1 || true
         # --release: panic=abort is pinned in the release profile, and the
         # no_std panic handler can't build under the unwinding dev profile.
         cargo clippy -p uds-rdma-protocol-ffi --lib --release --offline 2>&1 || true

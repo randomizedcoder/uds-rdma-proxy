@@ -27,7 +27,7 @@ let
       || lib.hasSuffix ".h" b;
   };
 
-  mkCFuzzer = { name, harness, units }:
+  mkCFuzzer = { name, harness, units, extraFlags ? [ ] }:
     pkgs.stdenv.mkDerivation {
       pname = "urp-${name}";
       version = "0.1.0";
@@ -39,7 +39,7 @@ let
           -fsanitize=fuzzer,address,undefined \
           -fno-omit-frame-pointer \
           -Wall -Wextra \
-          -I kernel -I nix/fuzz \
+          -I kernel -I nix/fuzz ${lib.concatStringsSep " " extraFlags} \
           nix/fuzz/${harness} ${lib.concatStringsSep " " units} \
           -o ${name}
         runHook postBuild
@@ -149,6 +149,15 @@ liveFuzzers // {
     name = "fuzz-rx-seq";
     harness = "rx_seq_fuzz.c";
     units = [ "kernel/urp_frame.c" "kernel/urp_stream_sm.c" ];
+  };
+
+  # urp-bench incremental deframer (design 30 §30.12) — the userland
+  # benchmark's parsing surface, chunk schedule fuzzer-controlled.
+  fuzz-bench-deframe = mkCFuzzer {
+    name = "fuzz-bench-deframe";
+    harness = "bench_deframe_fuzz.c";
+    units = [ "tools/urp-bench-core.c" ];
+    extraFlags = [ "-I" "tools" ];
   };
 
   # Default C reorder backend + spec-model differential (real rbtree bundled).

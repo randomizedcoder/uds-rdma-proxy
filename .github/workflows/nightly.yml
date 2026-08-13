@@ -32,7 +32,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [fuzz-classify, fuzz-rx-seq, fuzz-reorder]
+        target: [fuzz-classify, fuzz-rx-seq, fuzz-reorder, fuzz-bench-deframe]
     steps:
       - uses: actions/checkout@v4
       - name: Install Nix

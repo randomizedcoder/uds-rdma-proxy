@@ -177,13 +177,38 @@ performance baseline.
 
 ## io_uring UDS benchmark (design 30)
 
-**Status: designed, not yet implemented.**
-[Design 30](design/30-urp-bench-io-uring.md) specifies `urp-bench`, a
-symmetric C + Rust benchmark pair that drives the **UDS side** of the tunnel
-with io_uring (registered buffers, batched submissions, SQPOLL, a SEND_ZC
-probe) and sweeps message size × batch size × io_uring mode. Its results —
-the mode/size/batch matrix, the C-vs-Rust delta table, and the
-`BENCH_MEMCPY` copy-cost yardstick — will land in this document alongside
-the geometry sweep above, under the same emulated-numbers caveat (the direct
-no-tunnel topology on a real host is the meaningful substrate for the
-io_uring deltas).
+**Status: implemented** ([design 30](design/30-urp-bench-io-uring.md));
+initial direct-topology numbers below are from the smoke subset
+(`URP_BENCH_MATRIX_QUICK=1 nix run .#urp-bench-matrix`) on a developer
+desktop (kernel 7.1.6) — indicative, not a controlled baseline. The full
+matrix is `nix run .#urp-bench-matrix` (~30–45 min); tunneled smoke cells
+run as pair-test Phase 10g, full tunneled set via
+`URP_BENCH_FULL=1 nix run .#urp-microvm-pair-test`.
+
+Headline answers (both languages agree):
+
+- **The copy stays.** `uring-sendzc` on AF_UNIX:
+  `BENCH_ZC sends=8 copied=0 result=eopnotsupp` — the kernel refuses
+  zero-copy sends on unix sockets, exactly as designs 06/13/21 predicted.
+  io_uring cannot "pass the buffer" to `urp.ko`.
+- **Syscall batching is the real win.** blocking control ≈ 0.9–1.4
+  syscalls/msg; batched uring ≈ 0.01–0.09 (batch 32+), a 10–100×
+  reduction. At msg_size 24 the batched modes more than double msgs/s vs
+  the blocking control (~280 k vs ~135 k on this host); at 65516 the copy
+  dominates and the gap closes.
+- **C vs Rust: identical within noise.** Per-cell deltas of the 36-cell
+  smoke matrix are mostly within ±10 % (occasional ±20 % outliers on a
+  noisy desktop do not reproduce). The C↔Rust *interop* cells
+  (`nix run .#urp-bench-local`) pass with `--verify full` — every payload
+  byte checked across implementations.
+- **Copy-cost yardstick** (`BENCH_MEMCPY`, this host): 24 B ≈ 1.0 GB/s
+  (call-overhead bound), 4076 B ≈ 70 GB/s, 65516 B ≈ 62 GB/s — the
+  ceiling any UDS transport is chasing.
+
+Two real bugs the matrix caught during bring-up (both fixed, both
+affected C and Rust identically — the conformance-race design §30.1
+working as intended): tracker-slot backpressure treated as fatal at
+batch=32 with out-of-order echoes, and multiple concurrent recv SQEs on
+one stream socket permuting the byte stream (SOCK_STREAM needs exactly
+one outstanding recv; the buffer pool only parks buffers whose in-place
+echoes are in flight).
