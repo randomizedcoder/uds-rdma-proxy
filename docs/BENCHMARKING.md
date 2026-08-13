@@ -174,3 +174,16 @@ What we expect to see on hardware (and cannot see on the emulator):
 Until then, the microVM harness is the regression gate (correctness +
 memory-safety across the geometry range); the numbers here are **not** a
 performance baseline.
+
+## io_uring UDS benchmark (design 30)
+
+**Status: designed, not yet implemented.**
+[Design 30](design/30-urp-bench-io-uring.md) specifies `urp-bench`, a
+symmetric C + Rust benchmark pair that drives the **UDS side** of the tunnel
+with io_uring (registered buffers, batched submissions, SQPOLL, a SEND_ZC
+probe) and sweeps message size × batch size × io_uring mode. Its results —
+the mode/size/batch matrix, the C-vs-Rust delta table, and the
+`BENCH_MEMCPY` copy-cost yardstick — will land in this document alongside
+the geometry sweep above, under the same emulated-numbers caveat (the direct
+no-tunnel topology on a real host is the meaningful substrate for the
+io_uring deltas).
