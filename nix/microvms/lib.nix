@@ -861,9 +861,9 @@ in rec {
       # State snapshot for post-mortems (captured, never parsed).
       vm_run "$VM2_VIRTIO" "$VM2_PROC" "urp show; urp stats pair_initiator; dmesg | tail -15" 10 \
         > "$RUNDIR/diag/vm2.bench-state-pre.txt" 2>&1 || true
-      BENCH_CELLS="blocking:4076:8 uring-rw:4076:8 uring-fixed:4076:8"
+      BENCH_CELLS="blocking:4076:8 uring-rw:4076:8 uring-fixed:4076:8 uring-bufring:4076:8"
       if [ -n "''${URP_BENCH_FULL:-}" ]; then
-        BENCH_CELLS="$BENCH_CELLS uring-rw:1024:64 uring-rw:65516:4 uring-fixed:16384:32"
+        BENCH_CELLS="$BENCH_CELLS uring-rw:1024:64 uring-rw:65516:4 uring-fixed:16384:32 uring-bufring:65516:4"
       fi
       for cell in $BENCH_CELLS; do
         bm=''${cell%%:*}; brest=''${cell#*:}; bs=''${brest%%:*}; bb=''${brest##*:}

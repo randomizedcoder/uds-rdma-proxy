@@ -30,7 +30,7 @@ pkgs.writeShellApplication {
     BATCHES="1 4 16 64 256"
     DUR=2
     if [ -n "''${URP_BENCH_MATRIX_QUICK:-}" ]; then
-      MODES="blocking uring-rw uring-fixed"
+      MODES="blocking uring-rw uring-fixed uring-bufring"
       SIZES="24 4076 65516"
       BATCHES="1 32"
       DUR=1

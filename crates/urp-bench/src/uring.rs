@@ -3,7 +3,9 @@
 //! no runtime — §30.10). Same modes, same user_data encoding, same
 //! echo-in-place discipline, same skip/fail taxonomy as the C shell.
 
+use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicU16, Ordering};
 
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 
@@ -16,6 +18,7 @@ use urp_bench::Error;
 const UD_KIND_RECV: u64 = 1 << 56;
 const UD_KIND_SEND: u64 = 2 << 56;
 const NOTIF_ZC_COPIED: u32 = 1 << 31; // IORING_NOTIF_USAGE_ZC_COPIED
+const BENCH_BGID: u16 = 0; // provided-buffer group id (bufring mode)
 
 /// SOCK_STREAM invariant: exactly ONE recv SQE outstanding at a time —
 /// concurrent recvs on a stream socket complete in arbitrary order and
@@ -56,6 +59,88 @@ struct Ring {
     ring: IoUring,
     use_fixed: bool,
     use_sendzc: bool,
+    use_bufring: bool,
+    ms_armed: bool,
+    br: Option<BufRing>,
+}
+
+/// Provided-buffer ring for `uring-bufring` mode — the Rust twin of the C
+/// shell's `io_uring_buf_ring` handling. Owns the page-aligned ring of
+/// `io_uring_buf` entries (the tail lives in entry 0's `resv` field, which
+/// `set_addr/len/bid` never touch); the data buffers themselves stay in
+/// `Bufs::rbufs` (referenced by index, exactly like the C shell).
+struct BufRing {
+    base: *mut u8,
+    layout: Layout,
+    mask: u16,
+    tail: u16,
+    /// Buffers currently in the ring (kernel-owned, available to fill).
+    avail: u32,
+}
+
+impl BufRing {
+    /// Allocate + register the ring, then publish all `n` buffers. `n` must
+    /// be a power of two. Returns None if allocation or registration fails.
+    fn new(ring: &IoUring, n: u16, addrs: &[*mut u8]) -> Option<BufRing> {
+        let size = n as usize * std::mem::size_of::<types::BufRingEntry>();
+        let layout = Layout::from_size_align(size, 4096).ok()?;
+        // SAFETY: non-zero size; freed in Drop.
+        let base = unsafe { alloc_zeroed(layout) };
+        if base.is_null() {
+            return None;
+        }
+        // SAFETY: base/len valid for the ring's lifetime (freed in Drop,
+        // after unregister); page-aligned as the interface requires.
+        if unsafe {
+            ring.submitter()
+                .register_buf_ring_with_flags(base as u64, n, BENCH_BGID, 0)
+        }
+        .is_err()
+        {
+            // SAFETY: base came from alloc_zeroed(layout).
+            unsafe { dealloc(base, layout) };
+            return None;
+        }
+        let mut br = BufRing {
+            base,
+            layout,
+            mask: n - 1,
+            tail: 0,
+            avail: 0,
+        };
+        for (bid, &addr) in addrs.iter().enumerate().take(n as usize) {
+            br.publish(bid as u16, addr);
+        }
+        Some(br)
+    }
+
+    /// Write one buffer into the slot at the current tail and advance +
+    /// release-store the tail so the kernel sees the entry first.
+    fn publish(&mut self, bid: u16, addr: *mut u8) {
+        let slot = (self.tail & self.mask) as usize;
+        // SAFETY: slot < entries; the region holds `entries` BufRingEntry.
+        unsafe {
+            let e = (self.base as *mut types::BufRingEntry).add(slot);
+            (*e).set_addr(addr as u64);
+            (*e).set_len(RECV_BUF_SZ as u32);
+            (*e).set_bid(bid);
+        }
+        self.tail = self.tail.wrapping_add(1);
+        // SAFETY: tail() points at entry 0's resv (the ring tail field).
+        unsafe {
+            let tail_ptr = types::BufRingEntry::tail(self.base as *const types::BufRingEntry);
+            (*(tail_ptr as *const AtomicU16)).store(self.tail, Ordering::Release);
+        }
+        self.avail += 1;
+    }
+}
+
+impl Drop for BufRing {
+    fn drop(&mut self) {
+        // SAFETY: base came from alloc_zeroed(layout); the ring is
+        // unregistered on IoUring drop / process exit.
+        unsafe { dealloc(self.base, self.layout) };
+    }
 }
 
 impl Ring {
@@ -136,6 +221,27 @@ fn prep_recv(
     ring.push(&entry.user_data(UD_KIND_RECV | rb_idx as u64), shell)
 }
 
+/// Arm the ONE multishot recv (bufring mode): it draws a fresh provided
+/// buffer per completion from group BENCH_BGID and stays live (each CQE
+/// carries F_MORE) until buffers run out (-ENOBUFS) or the peer closes.
+/// Exactly one multishot recv is ever outstanding — stream byte order
+/// (§30.5). Re-arming after termination happens once at end-of-pass.
+fn arm_multishot(ring: &mut Ring, shell: &mut Shell) -> Result<(), Error> {
+    let entry = opcode::RecvMulti::new(types::Fixed(0), BENCH_BGID).build();
+    ring.ms_armed = true;
+    ring.push(&entry.user_data(UD_KIND_RECV), shell)
+}
+
+/// Hand a drained provided buffer back to the kernel (bufring mode). Like
+/// the C shell, re-arming is deliberately deferred to end-of-pass so a
+/// mid-pass recycle/terminate ordering can't leave the multishot dead.
+fn recycle_provided(ring: &mut Ring, bufs: &Bufs, buf_id: usize) {
+    let addr = bufs.rbufs[buf_id].data.as_ptr() as *mut u8;
+    if let Some(br) = ring.br.as_mut() {
+        br.publish(buf_id as u16, addr);
+    }
+}
+
 /// Arm the single next recv: reuse the drained buffer if its echoes are
 /// gone, else any echo-free buffer, else wait for release_send.
 fn arm_next_recv(
@@ -168,9 +274,15 @@ fn release_send(
     if op.recv_idx >= 0 {
         let rb_idx = op.recv_idx as usize;
         bufs.rbufs[rb_idx].pending_echoes -= 1;
-        if bufs.rbufs[rb_idx].pending_echoes == 0 && bufs.recv_wanted {
-            bufs.recv_wanted = false;
-            prep_recv(ring, shell, bufs, rb_idx)?;
+        if bufs.rbufs[rb_idx].pending_echoes == 0 {
+            if ring.use_bufring {
+                // last echo out of this provided buffer done: hand it back
+                // to the ring (end-of-pass re-arms if the multishot stalled).
+                recycle_provided(ring, bufs, rb_idx);
+            } else if bufs.recv_wanted {
+                bufs.recv_wanted = false;
+                prep_recv(ring, shell, bufs, rb_idx)?;
+            }
         }
     }
     if op.scratch >= 0 {
@@ -324,6 +436,9 @@ pub fn run(shell: &mut Shell, fd: RawFd) -> Result<u64, i32> {
         ring,
         use_fixed: false,
         use_sendzc: cfg.mode == Mode::UringSendzc,
+        use_bufring: false,
+        ms_armed: false,
+        br: None,
     };
 
     if ring.use_sendzc {
@@ -386,9 +501,31 @@ pub fn run(shell: &mut Shell, fd: RawFd) -> Result<u64, i32> {
         ring.use_fixed = true;
     }
 
+    if cfg.mode == Mode::UringBufring {
+        // n_rbufs must be a power of two for the ring mask.
+        if n_rbufs & (n_rbufs - 1) != 0 {
+            skip(&cfg, "bufring_bad_geometry");
+        }
+        let addrs: Vec<*mut u8> = bufs
+            .rbufs
+            .iter_mut()
+            .map(|rb| rb.data.as_mut_ptr())
+            .collect();
+        match BufRing::new(&ring.ring, n_rbufs as u16, &addrs) {
+            Some(br) => ring.br = Some(br),
+            None => skip(&cfg, "no_pbuf_ring"),
+        }
+        ring.use_bufring = true;
+    }
+
     let mut deframer = Deframer::new(msg_size, cfg.msg_size - HDR_SIZE as u32);
-    // ONE outstanding recv (stream ordering — see RecvBuf).
-    if prep_recv(&mut ring, shell, &mut bufs, 0).is_err() {
+    // ONE outstanding recv (stream ordering — see RecvBuf / arm_multishot).
+    let armed = if ring.use_bufring {
+        arm_multishot(&mut ring, shell)
+    } else {
+        prep_recv(&mut ring, shell, &mut bufs, 0)
+    };
+    if armed.is_err() {
         fail(&cfg, "prep_recv", 0);
     }
 
@@ -425,15 +562,39 @@ pub fn run(shell: &mut Shell, fd: RawFd) -> Result<u64, i32> {
         }
         for (ud, res, flags) in cqes {
             if ud & UD_KIND_RECV != 0 {
-                let rb_idx = (ud & 0xffff_ffff) as usize;
-                if res == 0 || res == -libc::ECONNRESET {
-                    shell.peer_closed = true;
-                    continue;
+                let rb_idx;
+                if ring.use_bufring {
+                    if !cqueue::more(flags) {
+                        ring.ms_armed = false; // multishot terminated; re-arm at pass end
+                    }
+                    if res == 0 || res == -libc::ECONNRESET {
+                        shell.peer_closed = true;
+                        continue;
+                    }
+                    if res == -libc::ENOBUFS {
+                        continue; // buffers momentarily empty: re-armed at pass end
+                    }
+                    if res < 0 {
+                        return Err(res);
+                    }
+                    rb_idx = match cqueue::buffer_select(flags) {
+                        Some(b) => b as usize,
+                        None => return Err(-libc::EINVAL), // data CQE without a buffer
+                    };
+                    if let Some(br) = ring.br.as_mut() {
+                        br.avail -= 1;
+                    }
+                } else {
+                    rb_idx = (ud & 0xffff_ffff) as usize;
+                    if res == 0 || res == -libc::ECONNRESET {
+                        shell.peer_closed = true;
+                        continue;
+                    }
+                    if res < 0 {
+                        return Err(res);
+                    }
+                    bufs.rbufs[rb_idx].in_recv = false;
                 }
-                if res < 0 {
-                    return Err(res);
-                }
-                bufs.rbufs[rb_idx].in_recv = false;
                 let n = res as usize;
                 // feed: deframer and shell are disjoint borrows; the
                 // chunk is copied out of the recv buf borrow via split.
@@ -471,7 +632,13 @@ pub fn run(shell: &mut Shell, fd: RawFd) -> Result<u64, i32> {
                     }
                 }
                 // §30.5 invariant: re-arm before new writes queue.
-                if arm_next_recv(&mut ring, shell, &mut bufs, rb_idx).is_err() {
+                if ring.use_bufring {
+                    // In-place echoes hold the provided buffer; recycle now
+                    // only if none pend (held ones recycle in release_send).
+                    if bufs.rbufs[rb_idx].pending_echoes == 0 {
+                        recycle_provided(&mut ring, &bufs, rb_idx);
+                    }
+                } else if arm_next_recv(&mut ring, shell, &mut bufs, rb_idx).is_err() {
                     return Err(-(Error::Full as i32));
                 }
             } else {
@@ -512,6 +679,15 @@ pub fn run(shell: &mut Shell, fd: RawFd) -> Result<u64, i32> {
             }
             if shell.peer_closed {
                 break 'outer;
+            }
+        }
+        // bufring: re-arm the multishot recv once per pass, after ms_armed and
+        // avail have settled, so a mid-pass recycle/terminate ordering can't
+        // leave it dead with buffers waiting (§30.5, mirrors the C shell).
+        if ring.use_bufring && !ring.ms_armed && !shell.peer_closed {
+            let avail = ring.br.as_ref().map(|b| b.avail).unwrap_or(0);
+            if avail > 0 && arm_multishot(&mut ring, shell).is_err() {
+                return Err(-(Error::Full as i32));
             }
         }
         if now_ns() > hard_deadline {

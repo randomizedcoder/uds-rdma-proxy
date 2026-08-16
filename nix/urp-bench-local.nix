@@ -44,13 +44,14 @@ pkgs.writeShellApplication {
     }
 
     COMMON=(--msg-size 4076 --batch 8 --count 2000 --verify full)
-    for m in blocking uring-rw uring-fixed; do
+    for m in blocking uring-rw uring-fixed uring-bufring; do
       run_cell "$C"  "$C"  "c<->c $m"       --mode "$m" "''${COMMON[@]}"
       run_cell "$RS" "$RS" "rust<->rust $m" --mode "$m" "''${COMMON[@]}"
     done
     # Interop both ways — the live C-vs-Rust differential (§30.14).
-    run_cell "$C"  "$RS" "c-listen/rust-connect uring-rw"    --mode uring-rw    "''${COMMON[@]}"
-    run_cell "$RS" "$C"  "rust-listen/c-connect uring-fixed" --mode uring-fixed "''${COMMON[@]}"
+    run_cell "$C"  "$RS" "c-listen/rust-connect uring-rw"       --mode uring-rw      "''${COMMON[@]}"
+    run_cell "$RS" "$C"  "rust-listen/c-connect uring-fixed"    --mode uring-fixed   "''${COMMON[@]}"
+    run_cell "$C"  "$RS" "c-listen/rust-connect uring-bufring"  --mode uring-bufring "''${COMMON[@]}"
 
     # sendzc evidence probe: SKIP with the eopnotsupp evidence line is the
     # expected outcome on AF_UNIX; a BENCH_FAIL is not.

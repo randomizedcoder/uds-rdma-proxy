@@ -44,6 +44,7 @@
 #define ECHO_SCRATCH_SZ	(BENCH_HDR_SIZE + BENCH_PAYLOAD_MAX)
 #define SAMPLE_CAP	200000
 #define FIN_TIMEOUT_S	10
+#define BENCH_BGID	0	/* provided-buffer group id (bufring mode) */
 
 /* user_data encoding: kind in the top byte, index below. */
 #define UD_KIND_RECV	1
@@ -83,6 +84,13 @@ struct run {
 	int use_uring;
 	int use_fixed;		/* fixed buffers registered */
 	int use_sendzc;
+	int use_bufring;	/* provided buffer ring + multishot recv */
+
+	/* provided-buffer ring (bufring mode) */
+	struct io_uring_buf_ring *br;
+	uint32_t br_mask;
+	uint32_t br_avail;	/* buffers currently in the ring (kernel-owned) */
+	int ms_armed;		/* the single multishot recv SQE is live */
 
 	/* buffers */
 	struct recv_buf *rbufs;
@@ -209,6 +217,7 @@ static void queue_echo_uring(struct run *r, struct msg_ctx *mc,
 static void queue_echo_blocking(struct run *r, struct msg_ctx *mc,
 				const struct bench_hdr *hdr,
 				const uint8_t *payload);
+static void recycle_provided(struct run *r, uint32_t buf_id);
 
 static int on_msg(void *ctx, const struct bench_hdr *hdr,
 		  const uint8_t *payload)
@@ -485,9 +494,15 @@ static void release_send(struct run *r, struct send_op *op)
 		struct recv_buf *rb = &r->rbufs[op->recv_idx];
 
 		rb->pending_echoes--;
-		if (rb->pending_echoes == 0 && r->recv_wanted) {
-			r->recv_wanted = 0;
-			prep_recv(r, (uint32_t)op->recv_idx);
+		if (rb->pending_echoes == 0) {
+			if (r->use_bufring)
+				/* last echo out of this provided buffer done:
+				 * hand it back to the ring (re-arms if stalled). */
+				recycle_provided(r, (uint32_t)op->recv_idx);
+			else if (r->recv_wanted) {
+				r->recv_wanted = 0;
+				prep_recv(r, (uint32_t)op->recv_idx);
+			}
 		}
 	}
 	if (op->scratch >= 0)
@@ -565,6 +580,85 @@ static void handle_recv_cqe(struct run *r, struct io_uring_cqe *cqe)
 	}
 	/* §30.5 invariant: re-arm the receive before new writes queue. */
 	arm_next_recv(r, rb_idx);
+}
+
+/* ---- provided-buffer ring (bufring mode) ------------------------------ */
+
+/*
+ * Arm the ONE multishot recv. It draws a fresh provided buffer per
+ * completion from group BENCH_BGID; it stays live (each CQE carries
+ * IORING_CQE_F_MORE) until buffers run out (-ENOBUFS) or the peer closes,
+ * at which point run_uring re-arms it once at end-of-pass. Exactly one
+ * multishot recv is ever outstanding, preserving stream byte order (§30.5).
+ */
+static void arm_multishot(struct run *r)
+{
+	struct io_uring_sqe *sqe = get_sqe(r);
+
+	if (!sqe)
+		return;
+	io_uring_prep_recv_multishot(sqe, 0, NULL, 0, 0);
+	sqe->flags |= IOSQE_FIXED_FILE | IOSQE_BUFFER_SELECT;
+	sqe->buf_group = BENCH_BGID;
+	io_uring_sqe_set_data64(sqe, UD(UD_KIND_RECV, 0));
+	r->ms_armed = 1;
+}
+
+/*
+ * Hand a drained provided buffer back to the kernel. Re-arming the
+ * multishot recv is deliberately NOT done here: within one completion
+ * pass the data CQEs (which recycle) are processed before the terminating
+ * -ENOBUFS CQE (which clears ms_armed), so a recycle-time re-arm would
+ * race and be skipped. The loop re-arms once at the end of the pass
+ * (run_uring), when ms_armed is settled and br_avail is final.
+ */
+static void recycle_provided(struct run *r, uint32_t buf_id)
+{
+	io_uring_buf_ring_add(r->br, r->rbufs[buf_id].data, RECV_BUF_SZ, buf_id,
+			      r->br_mask, 0);
+	io_uring_buf_ring_advance(r->br, 1);
+	r->br_avail++;
+}
+
+static void handle_recv_cqe_bufring(struct run *r, struct io_uring_cqe *cqe)
+{
+	uint32_t buf_id;
+	struct msg_ctx mc = { .r = r };
+	int ret;
+
+	if (!(cqe->flags & IORING_CQE_F_MORE))
+		r->ms_armed = 0;	/* multishot terminated; must re-arm */
+	if (cqe->res == 0 || cqe->res == -ECONNRESET) {
+		r->peer_closed = 1;
+		return;
+	}
+	if (cqe->res == -ENOBUFS)
+		return;			/* stalled: re-armed on next recycle */
+	if (cqe->res < 0) {
+		r->rc = cqe->res;
+		return;
+	}
+	if (!(cqe->flags & IORING_CQE_F_BUFFER)) {
+		r->rc = -BENCH_EINVAL;	/* data CQE without a buffer */
+		return;
+	}
+	buf_id = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+	r->br_avail--;
+
+	mc.chunk = r->rbufs[buf_id].data;
+	mc.chunk_len = (size_t)cqe->res;
+	mc.recv_idx = (int)buf_id;
+	ret = bench_deframe_feed(&r->df, r->rbufs[buf_id].data, (size_t)cqe->res,
+				 on_msg, &mc);
+	if (ret < 0) {
+		r->rc = ret;
+		return;
+	}
+	/* In-place echoes hold the buffer; recycle now only if none pend
+	 * (held buffers are recycled in release_send when the echo lands).
+	 * Re-arming is handled at end-of-pass in run_uring. */
+	if (r->rbufs[buf_id].pending_echoes == 0)
+		recycle_provided(r, buf_id);
 }
 
 static int run_done(const struct run *r)
@@ -680,8 +774,30 @@ static int run_uring(struct run *r)
 		r->use_fixed = 1;
 	}
 
+	if (cfg->mode == BENCH_MODE_URING_BUFRING) {
+		int bret = 0;
+
+		/* n_rbufs must be a power of two for the ring mask. */
+		if (r->n_rbufs & (r->n_rbufs - 1))
+			skip(cfg, "bufring_bad_geometry");
+		r->br = io_uring_setup_buf_ring(&r->ring, r->n_rbufs, BENCH_BGID,
+						0, &bret);
+		if (!r->br)
+			skip(cfg, "no_pbuf_ring");
+		r->br_mask = io_uring_buf_ring_mask(r->n_rbufs);
+		for (i = 0; i < r->n_rbufs; i++)
+			io_uring_buf_ring_add(r->br, r->rbufs[i].data,
+					      RECV_BUF_SZ, i, r->br_mask, (int)i);
+		io_uring_buf_ring_advance(r->br, (int)r->n_rbufs);
+		r->br_avail = r->n_rbufs;
+		r->use_bufring = 1;
+	}
+
 	r->use_uring = 1;
-	prep_recv(r, 0);	/* ONE outstanding recv (stream ordering) */
+	if (r->use_bufring)
+		arm_multishot(r);	/* ONE multishot recv (stream ordering) */
+	else
+		prep_recv(r, 0);	/* ONE outstanding recv (stream ordering) */
 
 	hard_deadline = now_ns() +
 			(FIN_TIMEOUT_S +
@@ -702,17 +818,32 @@ static int run_uring(struct run *r)
 		}
 		io_uring_for_each_cqe(&r->ring, head, cqe) {
 			seen++;
-			if (UD_KIND(cqe->user_data) == UD_KIND_RECV)
-				handle_recv_cqe(r, cqe);
-			else
+			if (UD_KIND(cqe->user_data) != UD_KIND_RECV)
 				handle_send_cqe(r, cqe);
+			else if (r->use_bufring)
+				handle_recv_cqe_bufring(r, cqe);
+			else
+				handle_recv_cqe(r, cqe);
 		}
 		io_uring_cq_advance(&r->ring, seen);
+		/*
+		 * bufring: the single multishot recv terminates (F_MORE clear /
+		 * -ENOBUFS) when buffers momentarily run out. Re-arm it here —
+		 * once per pass, after ms_armed and br_avail have settled — so a
+		 * mid-pass recycle/terminate ordering can't leave it dead with
+		 * buffers waiting (the §30.5 "receives before writes" invariant
+		 * for the multishot path).
+		 */
+		if (r->use_bufring && !r->ms_armed && !r->peer_closed &&
+		    r->br_avail > 0 && r->rc >= 0)
+			arm_multishot(r);
 		if (now_ns() > hard_deadline) {
 			r->rc = -BENCH_EINVAL;
 			fail(cfg, "timeout", 0);
 		}
 	}
+	if (r->br)
+		io_uring_free_buf_ring(&r->ring, r->br, r->n_rbufs, BENCH_BGID);
 	io_uring_queue_exit(&r->ring);
 	return r->rc < 0 ? (int)r->rc : 0;
 }
@@ -1018,9 +1149,6 @@ int main(int argc, char **argv)
 	}
 	if (bench_config_validate(&cfg) < 0 || !path)
 		usage();
-	/* bufring mode is a stub until the PBUF_RING wiring lands (B4+) */
-	if (cfg.mode == BENCH_MODE_URING_BUFRING)
-		skip(&cfg, "bufring_not_implemented");
 
 	r.cfg = &cfg;
 	r.goal = cfg.count ? cfg.count : ~0ull;
