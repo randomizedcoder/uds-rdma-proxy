@@ -329,8 +329,21 @@ void urp_endpoint_drain(struct urp_endpoint *ep)
 	 * expect timeout fired.
 	 */
 	urp_socket_cleanup(ep);
-	urp_rdma_cleanup(ep);
+	/*
+	 * Destroy the per-stream state (which joins the per-stream TX pump
+	 * kthreads, urp_stream_tx_fn) BEFORE urp_rdma_cleanup frees the send
+	 * buffer pool. Those kthreads call urp_buf_alloc_send/urp_buf_free_send
+	 * against ep->bufs on every iteration and on their error/exit paths; if
+	 * urp_rdma_cleanup ran first it would kfree(ep->bufs) (via
+	 * urp_bufs_cleanup) out from under a still-running pump, a use-after-free
+	 * KASAN caught during endpoint teardown. urp_stream_destroy shuts each
+	 * stream's UDS socket before kthread_stop (so the join never hangs in
+	 * kernel_recvmsg), and needs no RDMA resource itself -- the QP is still
+	 * up here, so the pump's parting urp_stream_tx_fin FIN can still post.
+	 * The legacy ep->conn pump is already joined above in urp_socket_cleanup.
+	 */
 	urp_streams_destroy_all(ep);
+	urp_rdma_cleanup(ep);
 	urp_qps_destroy(ep);
 	urp_endpoint_proc_remove(ep);
 
