@@ -329,10 +329,21 @@ against). Each PR is independently green and microVM-verified.
 
 | Phase | Scope | State |
 |---|---|---|
-| **PR1** | `/dev/urp` char device + `->uring_cmd` fop; the shared ABI (`include/uapi/linux/urp_cmd.h`); the pure trust-boundary validators (`kernel/urp_cmd_validate.c`, dual-compiled into `urp.ko` and a userspace check); `REGISTER`/`UNREGISTER` = `pin_user_pages(FOLL_LONGTERM)` / `unpin`. `SEND`/`RECV` validate then `-ENOSYS`. | **landing** |
-| PR2 | `ib_reg_user_mr` on the pinned pool bound to a `fast` endpoint's PD (`lkey`/`rkey`); endpoint kind `fast` via `urp add` | planned |
-| PR3 | `SEND`/`RECV` data path: `ib_post_send`/`ib_post_recv` on the endpoint QP, completion → app CQE; the per-buffer ownership state machine (§31.2) | planned |
+| **PR1** | `/dev/urp` char device + `->uring_cmd` fop; the shared ABI (`include/uapi/linux/urp_cmd.h`); the pure trust-boundary validators (`kernel/urp_cmd_validate.c`, dual-compiled into `urp.ko` and a userspace check); `REGISTER`/`UNREGISTER` = `pin_user_pages(FOLL_LONGTERM)` / `unpin`. `SEND`/`RECV` validate then `-ENOSYS`. | **merged** |
+| **PR2** | `REGISTER` binds the pinned pool to a named connected endpoint and DMA-maps every page against its RDMA device (`ib_dma_map_page`), producing the local `lkey` the data path posts with; the pool shares that endpoint's PD. `UNREGISTER` unmaps + releases the endpoint ref. | **landing** |
+| PR3 | `SEND`/`RECV` data path: `ib_post_send`/`ib_post_recv` on the endpoint QP, completion → app CQE; the per-buffer ownership state machine (§31.2); endpoint kind `fast` so the app (not a UDS pump) drives the QP | planned |
 | PR4 | client libraries (C + Rust, then C++/Seastar per [31a](31a-seastar-cpp-demo.md)); bench topology **T3** (§31.8); `uring_cmd`-decoder fuzz target | planned |
+
+PR2 chose `ib_dma_map_page` + the PD's `local_dma_lkey` over `ib_reg_user_mr`
+(§31.10 Q1): the module already registers *its own* buffers exactly this way
+([design 21](21-kernel-module.md), `urp_bufs_init`), the two-sided `SEND`/`RECV`
+model needs only a local `lkey` (no remote `rkey`), and it keeps the app pool
+in the *same* PD as the QP the data path will post on. A full user MR (for a
+remote `rkey` / one-sided RDMA) can come later if a one-sided mode is added.
+The endpoint kind `fast` moves to PR3, where posting on the QP would otherwise
+collide with a `uds` endpoint's pump — for the PR2 DMA-map milestone, binding
+to any established endpoint's PD is sufficient and is exercised against the
+pair-test `pair_acceptor`.
 
 PR1 specifics worth recording:
 

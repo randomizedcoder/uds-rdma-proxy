@@ -79,10 +79,24 @@ static void expect(const char *label, int got, int want)
 
 int main(int argc, char **argv)
 {
-	const char *dev = (argc > 1) ? argv[1] : URP_CMD_DEVICE_PATH;
-	uint32_t buf_size = (argc > 2) ? (uint32_t)strtoul(argv[2], NULL, 0) : 4096;
-	uint32_t count = (argc > 3) ? (uint32_t)strtoul(argv[3], NULL, 0) : 8;
-	size_t pool_len = (size_t)buf_size * count;
+	const char *dev;
+	const char *endpoint;
+	uint32_t buf_size, count;
+	size_t pool_len;
+
+	if (argc < 3) {
+		fprintf(stderr,
+			"usage: %s <dev> <endpoint> [buf_size] [count]\n"
+			"  <endpoint> is a connected urp endpoint (has a PD) to\n"
+			"  DMA-map the pool against.\n",
+			argv[0]);
+		return 2;
+	}
+	dev = argv[1];
+	endpoint = argv[2];
+	buf_size = (argc > 3) ? (uint32_t)strtoul(argv[3], NULL, 0) : 4096;
+	count = (argc > 4) ? (uint32_t)strtoul(argv[4], NULL, 0) : 8;
+	pool_len = (size_t)buf_size * count;
 	struct io_uring ring;
 	struct urp_cmd_reg reg;
 	struct urp_cmd_reg_sqe reg_sqe;
@@ -114,14 +128,25 @@ int main(int argc, char **argv)
 	printf("URP_FAST_POOL base=%p len=%zu buf_size=%u count=%u\n",
 	       pool, pool_len, buf_size, count);
 
-	/* --- happy path: register the pool (this pins it, FOLL_LONGTERM) --- */
+	/* --- negative: an unknown endpoint is rejected before any pin sticks --- */
+	memset(&reg, 0, sizeof(reg));
 	reg.base = (uint64_t)(uintptr_t)pool;
 	reg.len = pool_len;
 	reg.buf_size = buf_size;
 	reg.count = count;
-	reg.flags = 0;
-	reg.__resv = 0;
+	strncpy(reg.endpoint, "no_such_ep", URP_CMD_NAME_MAX - 1);
 	memset(&reg_sqe, 0, sizeof(reg_sqe));
+	reg_sqe.arg = (uint64_t)(uintptr_t)&reg;
+	expect("REGISTER_BADEP", do_cmd(&ring, fd, URP_CMD_REGISTER, &reg_sqe,
+					sizeof(reg_sqe)), -ENODEV);
+
+	/* --- happy path: register + pin (FOLL_LONGTERM) + DMA-map the pool --- */
+	memset(&reg, 0, sizeof(reg));
+	reg.base = (uint64_t)(uintptr_t)pool;
+	reg.len = pool_len;
+	reg.buf_size = buf_size;
+	reg.count = count;
+	strncpy(reg.endpoint, endpoint, URP_CMD_NAME_MAX - 1);
 	reg_sqe.arg = (uint64_t)(uintptr_t)&reg;
 	expect("REGISTER", do_cmd(&ring, fd, URP_CMD_REGISTER, &reg_sqe,
 				  sizeof(reg_sqe)), 0);
