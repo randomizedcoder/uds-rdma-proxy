@@ -205,10 +205,21 @@ Headline answers (both languages agree):
   (call-overhead bound), 4076 B ≈ 70 GB/s, 65516 B ≈ 62 GB/s — the
   ceiling any UDS transport is chasing.
 
-Two real bugs the matrix caught during bring-up (both fixed, both
-affected C and Rust identically — the conformance-race design §30.1
-working as intended): tracker-slot backpressure treated as fatal at
-batch=32 with out-of-order echoes, and multiple concurrent recv SQEs on
-one stream socket permuting the byte stream (SOCK_STREAM needs exactly
-one outstanding recv; the buffer pool only parks buffers whose in-place
-echoes are in flight).
+Three real bugs the matrix/size-sweep caught during bring-up (all fixed;
+the first two affected C and Rust identically — the conformance-race
+design §30.1 working as intended):
+
+1. **tracker-slot backpressure treated as fatal** at batch=32 with
+   out-of-order echoes.
+2. **multiple concurrent recv SQEs on one stream socket permuting the byte
+   stream** — SOCK_STREAM needs exactly one outstanding recv; the buffer
+   pool only parks buffers whose in-place echoes are in flight.
+3. **`uring-bufring` multishot-recv re-arm deadlock** (found bringing up
+   the provided-buffer-ring mode, 2026-08-16): within one completion pass
+   the data CQEs (which recycle buffers) are processed *before* the
+   terminating `-ENOBUFS` CQE (which clears the armed flag), so a
+   recycle-time re-arm was skipped and both sides blocked forever in
+   `submit_and_wait` at large messages (≥ 65516). Fixed by re-arming the
+   multishot recv exactly once at the end of each completion pass, when the
+   armed flag and the available-buffer count have settled — applied
+   identically to the C and Rust shells.

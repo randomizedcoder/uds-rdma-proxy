@@ -428,6 +428,63 @@ static void test_bufring(void)
 
 	ret = bench_bufring_take(&r);
 	CHECK(ret == b, "reuse recycled idx: got %d want %d", ret, b);
+
+	/* corner: recycle a never-taken index (in_use == 0) → EDUP */
+	{
+		uint16_t fi[2];
+		uint8_t iu[2];
+		struct bench_bufring r2;
+
+		bench_bufring_init(&r2, fi, iu, 2);
+		CHECK(bench_bufring_recycle(&r2, 0) == -BENCH_EDUP,
+		      "recycle never-taken idx → EDUP");
+	}
+
+	/* corner: N == 1 (single buffer, take/exhaust/recycle/reuse) */
+	{
+		uint16_t fi[1];
+		uint8_t iu[1];
+		struct bench_bufring r1;
+		int x;
+
+		bench_bufring_init(&r1, fi, iu, 1);
+		x = bench_bufring_take(&r1);
+		CHECK(x == 0, "N=1 take → 0 (got %d)", x);
+		CHECK(bench_bufring_take(&r1) == -BENCH_EEMPTY, "N=1 exhausted");
+		CHECK(bench_bufring_recycle(&r1, 0) == 0, "N=1 recycle");
+		CHECK(bench_bufring_take(&r1) == 0, "N=1 reuse → 0");
+	}
+
+	/* conservation (the steady-state "no leak" invariant that the bufring
+	 * event loop depends on): take all, recycle all, repeat — free_count
+	 * must return to full and every index be reusable, forever. */
+	{
+		enum { M = 8, ROUNDS = 4 };
+		uint16_t fi[M];
+		uint8_t iu[M], seen[M];
+		struct bench_bufring rc;
+		int round, i, idx, all;
+
+		bench_bufring_init(&rc, fi, iu, M);
+		for (round = 0; round < ROUNDS; round++) {
+			memset(seen, 0, sizeof(seen));
+			for (i = 0; i < M; i++) {
+				idx = bench_bufring_take(&rc);
+				CHECK(idx >= 0 && idx < M && !seen[idx],
+				      "round %d take %d distinct (idx %d)",
+				      round, i, idx);
+				seen[idx] = 1;
+			}
+			CHECK(bench_bufring_take(&rc) == -BENCH_EEMPTY,
+			      "round %d drained", round);
+			CHECK(rc.free_count == 0, "round %d free_count 0", round);
+			all = 1;
+			for (i = 0; i < M; i++)
+				all &= (bench_bufring_recycle(&rc, (uint32_t)i) == 0);
+			CHECK(all, "round %d recycle all", round);
+			CHECK(rc.free_count == M, "round %d free_count restored", round);
+		}
+	}
 }
 
 /* ---- stats ------------------------------------------------------------ */

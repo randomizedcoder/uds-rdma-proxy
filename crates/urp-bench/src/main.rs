@@ -15,7 +15,7 @@ use urp_bench::report::Report;
 mod shell;
 mod uring;
 
-use shell::{fail, now_ns, skip, EchoAction, Shell, RECV_BUF_SZ};
+use shell::{fail, now_ns, EchoAction, Shell, RECV_BUF_SZ};
 
 fn usage() -> ! {
     eprintln!(
@@ -304,10 +304,6 @@ fn main() {
         (Some(p), Ok(())) => p.clone(),
         _ => usage(),
     };
-    if cfg.mode == Mode::UringBufring {
-        skip(&cfg, "bufring_not_implemented");
-    }
-
     let stream = match cfg.role {
         Some(Role::Listen) => {
             let _ = std::fs::remove_file(&path);

@@ -1,10 +1,10 @@
 # 30. urp-bench: io_uring UDS Benchmark — Copy Cost vs Syscall Batching (C + Rust)
 
-Status: **implemented** — designed and built 2026-08-12 (PRs #30–#33).
-All work items B1–B8 landed; the one open remnant is the `uring-bufring`
-mode (provided-buffer rings + multishot recv), which is an explicit
-`BENCH_SKIP reason=bufring_not_implemented` stub — see §30.15. Initial
-results and two matrix-caught implementation bugs are recorded in
+Status: **implemented** — designed and built 2026-08-12 (PRs #30–#33);
+`uring-bufring` completed 2026-08-16. All work items B1–B8 landed, all seven
+modes live in both C and Rust (the `uring-bufring` provided-buffer-ring +
+multishot-recv mode was the last, and interoperates C↔Rust). Initial
+results and three matrix-caught implementation bugs are recorded in
 [BENCHMARKING.md](../BENCHMARKING.md).
 
 A symmetric userland benchmark app pair (`urp-bench`, implemented twice: C +
@@ -278,8 +278,8 @@ Phase 10f geometry-sweep precedent in [BENCHMARKING.md](../BENCHMARKING.md).
 | `lang` | c, rust | conformance race |
 
 - **Smoke subset (CI, per topology):** `msg_size ∈ {24, 4076, 65516}` ×
-  `batch ∈ {1, 32}` × `mode ∈ {blocking, uring-rw, uring-fixed}`,
-  `--verify full`, ~1 s/cell → 18 cells per language, ~40 s per language.
+  `batch ∈ {1, 32}` × `mode ∈ {blocking, uring-rw, uring-fixed,
+  uring-bufring}`, `--verify full`, ~1 s/cell.
 - **Full matrix (nightly / manual):** all cells, 2 s/cell, `--verify header`
   → 9 × 5 × 7 = 315 cells per language, ~20 min per language in the direct
   topology. For the tunneled topology the mode set is trimmed to
@@ -511,12 +511,12 @@ existing `microvm-pair` job.
 |---|---|---|
 | **B1** | C pure core + header spec (`tools/urp-bench-core.{c,h}`) | **IMPLEMENTED** |
 | **B2** | Rust twin core (`crates/urp-bench` lib) + workspace/nix-filter wiring (§30.10 table) | **IMPLEMENTED** |
-| **B3** | C io_uring shell (`tools/urp-bench.c`) + `nix/urp-bench.nix` (liburing) | **IMPLEMENTED** — all modes except `uring-bufring`, which is an explicit `BENCH_SKIP reason=bufring_not_implemented` stub until B8 |
-| **B4** | Rust io_uring backend (`uring.rs`, `main.rs`) + `nix/urp-bench-rs.nix` | **IMPLEMENTED** — same mode set and stub as B3; C↔Rust interop green both ways under `--verify full` (`nix run .#urp-bench-local`); sendzc probe records `eopnotsupp` on AF_UNIX — the §30.1 hypothesis confirmed on 7.1.6 |
+| **B3** | C io_uring shell (`tools/urp-bench.c`) + `nix/urp-bench.nix` (liburing) | **IMPLEMENTED** — all seven modes, including `uring-bufring` (`io_uring_setup_buf_ring` + `io_uring_prep_recv_multishot`; one multishot recv, buffers recycled after the in-place echo lands, re-armed at end-of-pass) |
+| **B4** | Rust io_uring backend (`uring.rs`, `main.rs`) + `nix/urp-bench-rs.nix` | **IMPLEMENTED** — same seven modes as B3 (`uring-bufring` via the `io-uring` crate's `register_buf_ring_with_flags` + `RecvMulti`, a hand-managed page-aligned ring); C↔Rust interop green both ways under `--verify full`, incl. bufring (`nix run .#urp-bench-local`); sendzc probe records `eopnotsupp` on AF_UNIX — the §30.1 hypothesis confirmed on 7.1.6 |
 | **B5** | unit-test suites both languages + `urp-bench-units` check + shared hex vectors | **IMPLEMENTED** — C: 877 table checks in the sandboxed `urp-bench-units` check; Rust: 15 mirrored table tests in `urp-bench-rs-tests`, identical hex vectors, miri via `run-miri` |
 | **B6** | fuzz targets + regression dirs + ci/nightly wiring | **IMPLEMENTED** — `fuzz-bench-deframe` (nix, CI); `bench_frame_decode` + `bench_differential` (cargo-fuzz, devshell; the differential ran 10.7 M comparisons clean at landing) |
 | **B7** | `analysis-clang-tidy` + `analysis-cppcheck` | **IMPLEMENTED** — `nix/analysis/userland-c.nix`, report-only house contract; first landing: clang-tidy 57 findings (stylistic cert/bugprone), cppcheck 0 |
-| **B8** | `.#urp-bench-local` / `.#urp-bench-matrix` apps, pair-test Phase 10g, results section in BENCHMARKING.md | **IMPLEMENTED** — `uring-bufring` remains a `BENCH_SKIP` stub (future work); initial results + 2 matrix-caught bugs recorded in [BENCHMARKING.md](../BENCHMARKING.md) |
+| **B8** | `.#urp-bench-local` / `.#urp-bench-matrix` apps, pair-test Phase 10g, results section in BENCHMARKING.md | **IMPLEMENTED** — all seven modes swept (incl. `uring-bufring`); smoke, quick-matrix, and Phase 10g each exercise `uring-bufring` (C↔C, Rust↔Rust, C↔Rust); initial results + 3 matrix-caught bugs recorded in [BENCHMARKING.md](../BENCHMARKING.md) |
 
 Sequencing: **B1 → B5(C half) first** — the core is table-tested before any
 io_uring code exists. Then B2, B3, B6, B7 in parallel; B4 after B2; B8 last.

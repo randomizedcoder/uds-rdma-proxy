@@ -235,9 +235,10 @@ Progress (2026-08-12): **B1–B8 all IMPLEMENTED** (PRs #30–#33).
 - Pure cores, both languages, table-tested (C: 877 checks in the sandboxed
   `urp-bench-units` check; Rust: 15 mirrored suites in `urp-bench-rs-tests`;
   identical cross-language hex vectors; miri via `run-miri`).
-- io_uring shells: 6 live modes; `uring-bufring` is an explicit
-  `BENCH_SKIP` stub (the one open remnant). `nix run .#urp-bench-local`
-  = C↔C, Rust↔Rust, C↔Rust interop both ways, all `--verify full`.
+- io_uring shells: **all 7 modes live** in both C and Rust (`uring-bufring`
+  = provided-buffer ring + multishot recv, completed 2026-08-16, interops
+  C↔Rust). `nix run .#urp-bench-local` = C↔C, Rust↔Rust, C↔Rust interop
+  both ways (incl. bufring), all `--verify full`.
 - The `uring-sendzc` probe answered the design's core question on 7.1.6:
   `result=eopnotsupp` — **AF_UNIX has no zero-copy send**; the win is
   syscall batching (0.9–1.4 → 0.01–0.09 syscalls/msg).
