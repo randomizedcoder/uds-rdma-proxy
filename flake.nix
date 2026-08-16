@@ -86,6 +86,7 @@
         };
         urpBenchLocal = import ./nix/urp-bench-local.nix { inherit pkgs; };
         urpBenchMatrix = import ./nix/urp-bench-matrix.nix { inherit pkgs; };
+        urpFastPoc = import ./nix/urp-fast-poc.nix { inherit pkgs; };
         fuzzRust = import ./nix/fuzz-rust.nix {
           inherit pkgs;
           inherit (packages) rustToolchain;
@@ -183,6 +184,7 @@
         checks = {
           inherit (nixChecks)
             protocol-tests urp-bench-units urp-bench-rs-tests
+            urp-fast-validate-units
             kernel-module-build
             urp-ko-6_1 urp-ko-6_6 urp-ko-6_12;
         };
@@ -199,6 +201,7 @@
           urp-bench-rs = urpBenchRs;
           urp-bench-local = urpBenchLocal;
           urp-bench-matrix = urpBenchMatrix;
+          urp-fast-poc = urpFastPoc;
           fuzz-rust = fuzzRust;
           test-kmod-k0 = testKmodK0;
           soak-1h = soak1h;

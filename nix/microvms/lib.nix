@@ -950,6 +950,31 @@ in rec {
       echo ""
 
       # -----------------------------------------------------------------
+      # Phase 10h — urp-fast uring_cmd REGISTER/UNREGISTER (design 31, PR1).
+      # Drives /dev/urp against the loaded module: mmap an app buffer pool,
+      # REGISTER it (pins it, FOLL_LONGTERM), exercise the validator's
+      # negative cases (double-register, out-of-range index, misaligned
+      # base), then UNREGISTER (unpins). Standalone — needs only the loaded
+      # module and io_uring in the guest, not the tunnel. Oracle:
+      # URP_FAST_POC_OK plus a clean scan_splat (the pin/unpin leaves no
+      # KASAN/leak trace).
+      # -----------------------------------------------------------------
+      echo "--- Phase 10h: urp-fast uring_cmd REGISTER/UNREGISTER (design 31) ---"
+      fastout="$RUNDIR/diag/vm1.urp-fast-poc.txt"
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+        "ls -l /dev/urp 2>&1; urp-fast-poc /dev/urp 4096 8 2>&1" "$T_BENCH" \
+        > "$fastout" 2>&1 || true
+      scan_splat "$fastout" "urp-fast poc"
+      if grep -q URP_FAST_POC_OK "$fastout"; then
+        pass "urp-fast REGISTER/UNREGISTER pin path (design 31 PR1)"
+        awk '/^URP_FAST_/ {print "    "$0}' "$fastout"
+      else
+        awk '{print "    "$0}' "$fastout"
+        fail "urp-fast poc: no URP_FAST_POC_OK (see $fastout)"
+      fi
+      echo ""
+
+      # -----------------------------------------------------------------
       # Phase 11 — teardown (drain, remove, rmmod), each step timed
       # so the slow command pops out of the verdict table.
       # -----------------------------------------------------------------
