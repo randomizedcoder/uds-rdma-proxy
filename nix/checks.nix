@@ -197,6 +197,39 @@ in
     '';
   };
 
+  # urp-fast command validators (design 31 section 31.10). The pure
+  # trust-boundary checks in kernel/urp_cmd_validate.c compile both into
+  # urp.ko and, here, into a plain userspace binary -- the same source, so a
+  # boundary bug is caught by this fast sandboxed run, not only by the slow
+  # KUnit-in-VM pass. -I kernel lets the "" includes resolve exactly as they
+  # do under kbuild.
+  urp-fast-validate-units = pkgs.stdenv.mkDerivation {
+    name = "urp-fast-validate-units";
+    src = pkgs.lib.fileset.toSource {
+      root = ../.;
+      fileset = pkgs.lib.fileset.unions [
+        ../kernel/urp_cmd_validate.c
+        ../kernel/urp_cmd.h
+        ../kernel/urp_cmd_compat.h
+        ../kernel/include/uapi/linux/urp_cmd.h
+        ../tools/urp-fast-validate-test.c
+      ];
+    };
+    buildPhase = ''
+      $CC -Wall -Wextra -Werror -O2 -I kernel \
+        -o urp-fast-validate-test \
+        tools/urp-fast-validate-test.c kernel/urp_cmd_validate.c
+    '';
+    doCheck = true;
+    checkPhase = ''
+      ./urp-fast-validate-test
+    '';
+    installPhase = ''
+      mkdir -p $out
+      touch $out/passed
+    '';
+  };
+
   # NOTE: miri requires network access to build its sysroot (fetches cfg-if for std).
   # This is incompatible with Nix's sandbox. Run miri via devshell instead:
   #   nix develop --command cargo miri test -p uds-rdma-protocol

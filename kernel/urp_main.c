@@ -19,6 +19,7 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include "urp.h"
+#include "urp_cmd.h"
 
 static int __init urp_init(void)
 {
@@ -34,15 +35,27 @@ static int __init urp_init(void)
 	if (ret)
 		goto err_table;
 
+	/*
+	 * Open the fast-path char device (design 31) before GENL so an aware
+	 * app can REGISTER a pool the moment the module is live. It shares no
+	 * state with the GENL surface, so ordering vs GENL is not critical --
+	 * we tear it down symmetrically in exit.
+	 */
+	ret = urp_cmd_dev_register();
+	if (ret)
+		goto err_proc;
+
 	ret = urp_genl_register();
 	if (ret) {
 		pr_err("genl_register_family failed: %d\n", ret);
-		goto err_proc;
+		goto err_cmd;
 	}
 
 	pr_info("module loaded (idle; configure via `urp add`)\n");
 	return 0;
 
+err_cmd:
+	urp_cmd_dev_unregister();
 err_proc:
 	urp_proc_cleanup();
 err_table:
@@ -60,6 +73,7 @@ static void __exit urp_exit(void)
 	 */
 	urp_genl_unregister();
 	urp_endpoint_drain_all();
+	urp_cmd_dev_unregister();
 	urp_proc_cleanup();
 	urp_endpoint_table_destroy();
 	pr_info("module unloaded\n");

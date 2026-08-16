@@ -8,6 +8,8 @@
 
 #include <kunit/test.h>
 #include "urp.h"
+#include "urp_cmd.h"
+#include "include/uapi/linux/urp_cmd.h"
 
 /* ---- Frame codec tests ---- */
 
@@ -772,6 +774,145 @@ static void test_ep_max_payload(struct kunit *test)
 
 /* ---- Test suite registration ---- */
 
+/*
+ * urp-fast uring_cmd SEND/RECV validator (design 31 section 31.10, the
+ * app->kernel trust boundary). Table-drives urp_cmd_validate_data over the
+ * opcode gate, reserved-field and flag checks, the "no pool registered"
+ * case, and every buf_index / len boundary. Rows that expect success also
+ * assert the decoded fields are copied out verbatim.
+ */
+static void test_cmd_validate_data(struct kunit *test)
+{
+#define GOOD_COUNT 4u
+#define GOOD_BSZ   4096u
+	static const struct {
+		u32 cmd_op;
+		u32 buf_index;
+		u32 len;
+		u16 stream_id;
+		u16 flags;
+		u32 resv;
+		u32 count;	/* pool geometry */
+		u32 buf_size;
+		int want;
+	} cases[] = {
+		/* --- valid --- */
+		{ URP_CMD_SEND, 0, 100,  7, 0,            0, GOOD_COUNT, GOOD_BSZ, 0 },
+		{ URP_CMD_SEND, 0, 100,  7, URP_CMD_F_FIN, 0, GOOD_COUNT, GOOD_BSZ, 0 },
+		{ URP_CMD_RECV, 3, GOOD_BSZ, 0, 0,        0, GOOD_COUNT, GOOD_BSZ, 0 },
+		/* boundaries: last index, len == buf_size, len == 1 */
+		{ URP_CMD_SEND, GOOD_COUNT - 1, GOOD_BSZ, 0, 0, 0, GOOD_COUNT, GOOD_BSZ, 0 },
+		{ URP_CMD_RECV, 0, 1, 0, 0,               0, GOOD_COUNT, GOOD_BSZ, 0 },
+		/* --- opcode gate --- */
+		{ URP_CMD_REGISTER,   0, 100, 0, 0, 0, GOOD_COUNT, GOOD_BSZ, -EOPNOTSUPP },
+		{ URP_CMD_UNREGISTER, 0, 100, 0, 0, 0, GOOD_COUNT, GOOD_BSZ, -EOPNOTSUPP },
+		{ 99,                 0, 100, 0, 0, 0, GOOD_COUNT, GOOD_BSZ, -EOPNOTSUPP },
+		/* --- reserved / flags --- */
+		{ URP_CMD_SEND, 0, 100, 0, 0,        1, GOOD_COUNT, GOOD_BSZ, -EINVAL },
+		{ URP_CMD_RECV, 0, 100, 0, URP_CMD_F_FIN, 0, GOOD_COUNT, GOOD_BSZ, -EINVAL },
+		{ URP_CMD_SEND, 0, 100, 0, (1 << 5), 0, GOOD_COUNT, GOOD_BSZ, -EINVAL },
+		/* --- length --- */
+		{ URP_CMD_SEND, 0, 0,          0, 0, 0, GOOD_COUNT, GOOD_BSZ, -EINVAL },
+		{ URP_CMD_SEND, 0, GOOD_BSZ+1, 0, 0, 0, GOOD_COUNT, GOOD_BSZ, -EMSGSIZE },
+		/* --- pool / index --- */
+		{ URP_CMD_SEND, 0, 100, 0, 0, 0, 0,          GOOD_BSZ, -ENXIO },
+		{ URP_CMD_SEND, GOOD_COUNT, 100, 0, 0, 0, GOOD_COUNT, GOOD_BSZ, -ERANGE },
+		{ URP_CMD_RECV, 0xffffffffu, 100, 0, 0, 0, GOOD_COUNT, GOOD_BSZ, -ERANGE },
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		struct urp_cmd_data in = {
+			.buf_index = cases[i].buf_index,
+			.len	   = cases[i].len,
+			.stream_id = cases[i].stream_id,
+			.flags	   = cases[i].flags,
+			.__resv	   = cases[i].resv,
+		};
+		struct urp_cmd_pool_geom geom = {
+			.count	  = cases[i].count,
+			.buf_size = cases[i].buf_size,
+		};
+		struct urp_cmd_req out = {};
+		int ret = urp_cmd_validate_data(cases[i].cmd_op, &in, &geom, &out);
+
+		KUNIT_EXPECT_EQ_MSG(test, ret, cases[i].want, "case %d: ret", i);
+		if (ret == 0) {
+			KUNIT_EXPECT_EQ_MSG(test, out.op, cases[i].cmd_op,
+					    "case %d: op", i);
+			KUNIT_EXPECT_EQ_MSG(test, out.buf_index,
+					    cases[i].buf_index, "case %d: idx", i);
+			KUNIT_EXPECT_EQ_MSG(test, out.len, cases[i].len,
+					    "case %d: len", i);
+			KUNIT_EXPECT_EQ_MSG(test, out.stream_id,
+					    cases[i].stream_id, "case %d: sid", i);
+			KUNIT_EXPECT_EQ_MSG(test, out.flags, cases[i].flags,
+					    "case %d: flags", i);
+		}
+	}
+#undef GOOD_COUNT
+#undef GOOD_BSZ
+}
+
+/*
+ * urp-fast REGISTER descriptor validator. Table-drives urp_cmd_validate_reg
+ * over base alignment, buf_size clamps, the len-is-a-positive-page-and-buffer-
+ * multiple rule, and the count == len/buf_size cross-check. Uses PAGE_SIZE so
+ * the rows stay correct on any arch KUnit runs on.
+ */
+static void test_cmd_validate_reg(struct kunit *test)
+{
+	static const struct {
+		const char *name;
+		u64 base;
+		u64 len;
+		u32 buf_size;
+		u32 count;
+		u32 flags;
+		u32 resv;
+		int want;
+	} cases[] = {
+		/* valid: page-sized buffers, then sub-page buffers in one page */
+		{ "page-bufs",  4096, 4 * 4096, 4096, 4,  0, 0, 0 },
+		{ "subpage",    4096, 4096,     64,   64, 0, 0, 0 },
+		/* flags / resv must be zero */
+		{ "flags-set",  4096, 4 * 4096, 4096, 4, 1, 0, -EINVAL },
+		{ "resv-set",   4096, 4 * 4096, 4096, 4, 0, 1, -EINVAL },
+		/* base: zero, and misaligned */
+		{ "base-zero",     0, 4 * 4096, 4096, 4, 0, 0, -EINVAL },
+		{ "base-misalign", 4097, 4 * 4096, 4096, 4, 0, 0, -EINVAL },
+		/* buf_size clamps */
+		{ "bsz-small",  4096, 4 * 4096, URP_CMD_BUF_SIZE_MIN - 1, 4, 0, 0, -EINVAL },
+		{ "bsz-big",    4096, 4 * 4096, URP_CMD_BUF_SIZE_MAX + 1, 4, 0, 0, -EINVAL },
+		/* len == 0 */
+		{ "len-zero",   4096, 0, 4096, 4, 0, 0, -EINVAL },
+		/* len not a multiple of buf_size (buf_size not a page divisor) */
+		{ "len-notmult", 4096, 4096, 3072, 4, 0, 0, -EINVAL },
+		/* len a multiple of buf_size but not of a page */
+		{ "len-notpage", 4096, 64 * 63, 64, 63, 0, 0, -EINVAL },
+		/* count zero, over the cap, and != len / buf_size */
+		{ "count-zero",  4096, 4096, 4096, 0, 0, 0, -EINVAL },
+		{ "count-toobig", 4096, (u64)(URP_CMD_POOL_COUNT_MAX + 1) * 4096,
+		  4096, URP_CMD_POOL_COUNT_MAX + 1, 0, 0, -E2BIG },
+		{ "count-mismatch", 4096, 4 * 4096, 4096, 3, 0, 0, -EINVAL },
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		struct urp_cmd_reg reg = {
+			.base		= cases[i].base,
+			.len		= cases[i].len,
+			.buf_size	= cases[i].buf_size,
+			.count		= cases[i].count,
+			.flags		= cases[i].flags,
+			.__resv		= cases[i].resv,
+		};
+		int ret = urp_cmd_validate_reg(&reg);
+
+		KUNIT_EXPECT_EQ_MSG(test, ret, cases[i].want, "%s", cases[i].name);
+	}
+}
+
 static struct kunit_case urp_test_cases[] = {
 	KUNIT_CASE(test_frame_roundtrip_data),
 	KUNIT_CASE(test_frame_roundtrip_control),
@@ -814,6 +955,9 @@ static struct kunit_case urp_test_cases[] = {
 	KUNIT_CASE(test_resolve_num_bufs),
 	KUNIT_CASE(test_resolve_buf_size),
 	KUNIT_CASE(test_ep_max_payload),
+	/* design 31 section 31.10: urp-fast uring_cmd trust boundary */
+	KUNIT_CASE(test_cmd_validate_data),
+	KUNIT_CASE(test_cmd_validate_reg),
 	{}
 };
 

@@ -273,6 +273,9 @@ in
       # aarch64/riscv64 VM variants, and Phase 10g skips the interop
       # cell when urp-bench-rs is absent.
       ++ [ (import ../urp-bench.nix { inherit pkgs; }) ]
+      # urp-fast-poc (design 31): drives the /dev/urp uring_cmd interface
+      # (REGISTER/UNREGISTER pin path) against the loaded module in Phase 10h.
+      ++ [ (import ../urp-fast-poc.nix { inherit pkgs; }) ]
       ++ lib.optionals pkgs.stdenv.hostPlatform.isx86_64 [
         (pkgs.writeShellScriptBin "urp-bench-rs"
           ''exec ${import ../urp-bench-rs.nix { inherit pkgs; }}/bin/urp-bench "$@"'')
