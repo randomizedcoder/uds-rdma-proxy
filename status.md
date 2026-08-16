@@ -254,6 +254,37 @@ Progress (2026-08-12): **B1–B8 all IMPLEMENTED** (PRs #30–#33).
   backpressure treated as fatal; multiple outstanding recvs permuting the
   SOCK_STREAM byte stream) — details in `docs/BENCHMARKING.md`.
 
+## urp-fast zero-copy (design docs 31 + 31a — IN PROGRESS)
+
+`docs/design/31-urp-fast-zero-copy.md` specifies the opt-in fast path: an
+aware app hands its own buffer pool to `urp.ko` over `IORING_OP_URING_CMD`
+into a `/dev/urp` char device, the pool is dual-registered (io_uring fixed
+buffers + RDMA MR), and the NIC DMAs straight into/out of the app's pinned
+pages — the last software copy the `AF_UNIX` path (design 30) provably can't
+remove. `31a` is the C++/Seastar client (Redpanda's framework). Kernel-first
+phasing so the client has a real integration target.
+
+Progress (2026-08-16): **PR1 landing** (branch `urp-fast-cmd-abi`).
+
+- `/dev/urp` misc char device + `->uring_cmd` fop (`kernel/urp_cmd.c`); the
+  shared ABI (`include/uapi/linux/urp_cmd.h`): opcodes
+  `URP_CMD_{REGISTER,UNREGISTER,SEND,RECV}`, inline `urp_cmd_data`, cold-path
+  `urp_cmd_reg`.
+- Trust-boundary validators (`kernel/urp_cmd_validate.c`, design 31 §31.10):
+  a **dual-compile pure core** — same source into `urp.ko` (KUnit
+  `test_cmd_validate_{data,reg}`) and a userspace check
+  (`urp-fast-validate-units`, 55 table cases, in `nix flake check` + ci).
+- `REGISTER`/`UNREGISTER` = `pin_user_pages(FOLL_LONGTERM)` / `unpin` (the
+  pool pins **once**, §31.4). `SEND`/`RECV` validate then `-ENOSYS` (data
+  path is PR3).
+- `nix run .#urp-fast-poc` drives it end-to-end (REGISTER + negative cases +
+  UNREGISTER); pair-test **Phase 10h** runs the PoC against the live module
+  with `scan_splat` armed.
+- Fast path gated on kernel ≥ 6.8 (`<linux/io_uring/cmd.h>` + 4-arg
+  `pin_user_pages`); stubbed on older LTS so 6.1/6.6 compile gates stay green.
+- Next: PR2 `ib_reg_user_mr` + `fast` endpoint kind; PR3 `SEND`/`RECV` posting
+  + per-buffer ownership; PR4 client libs (C/Rust/Seastar) + bench T3 + fuzz.
+
 ## Known functional gaps
 
 Found by the 2026-08-11 docs-vs-implementation review (full analysis and

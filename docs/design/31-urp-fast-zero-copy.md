@@ -1,6 +1,9 @@
 # 31. urp-fast: End-to-End Zero-Copy via an io_uring Command Interface into `urp.ko`
 
-Status: **design / future work** — not implemented. This doc specifies the
+Status: **implementation in progress** — see [§31.9.1](#3191-implementation-status).
+PR1 (the `uring_cmd` char device, the command ABI, the trust-boundary
+validators, and the `REGISTER`/`UNREGISTER` buffer-pool pin path) is landing;
+the RDMA MR path and the `SEND`/`RECV` data path follow. This doc specifies the
 opt-in fast path that [design 20 §20.2](20-future-work.md#202-shared-memory-fast-path)
 sketches in one paragraph and that [design 30](30-urp-bench-io-uring.md)'s
 measurements motivate. It is the answer to *"can an application hand its own
@@ -318,6 +321,36 @@ Not a work plan yet — the shape a plan would take, so the doc is actionable:
 Ordering mirrors design 30: pure/library pieces and the codec first (already
 exist), then the kernel char-device + MR path, then the client library, then
 the bench backend that measures it, then fuzz/analysis wiring.
+
+### 31.9.1 Implementation status
+
+Kernel-first phasing (so the client has a real target to integration-test
+against). Each PR is independently green and microVM-verified.
+
+| Phase | Scope | State |
+|---|---|---|
+| **PR1** | `/dev/urp` char device + `->uring_cmd` fop; the shared ABI (`include/uapi/linux/urp_cmd.h`); the pure trust-boundary validators (`kernel/urp_cmd_validate.c`, dual-compiled into `urp.ko` and a userspace check); `REGISTER`/`UNREGISTER` = `pin_user_pages(FOLL_LONGTERM)` / `unpin`. `SEND`/`RECV` validate then `-ENOSYS`. | **landing** |
+| PR2 | `ib_reg_user_mr` on the pinned pool bound to a `fast` endpoint's PD (`lkey`/`rkey`); endpoint kind `fast` via `urp add` | planned |
+| PR3 | `SEND`/`RECV` data path: `ib_post_send`/`ib_post_recv` on the endpoint QP, completion → app CQE; the per-buffer ownership state machine (§31.2) | planned |
+| PR4 | client libraries (C + Rust, then C++/Seastar per [31a](31a-seastar-cpp-demo.md)); bench topology **T3** (§31.8); `uring_cmd`-decoder fuzz target | planned |
+
+PR1 specifics worth recording:
+
+- **The command decoder is a dual-compile pure core.** `urp_cmd_validate.c`
+  has no kernel-subsystem dependencies, so the *same source* is compiled into
+  the module (KUnit: `test_cmd_validate_data` / `test_cmd_validate_reg`) and
+  into a userspace binary (`urp-fast-validate-units` nix check, 55 table
+  cases). A boundary bug is caught by a fast sandboxed run, not only a slow
+  KUnit-in-VM pass — the design-30 "one contract, two builds that must agree"
+  discipline applied to the app→kernel boundary.
+- **The pin is once, at REGISTER**, exactly as §31.4 requires — not per-op.
+  `urp-fast-poc` (`nix run .#urp-fast-poc`) and pair-test **Phase 10h** prove
+  the pool really pins/unpins against a live module, with a `scan_splat`
+  memory-safety gate.
+- **Kernel floor is 6.8** for the fast path (modern `<linux/io_uring/cmd.h>`
+  + 4-arg `pin_user_pages`); the device is stubbed out on older LTS so the
+  6.1/6.6 compile gates stay green. Unmodified `AF_UNIX` apps are unaffected
+  on every kernel.
 
 ## 31.10 Open questions
 
