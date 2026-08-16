@@ -87,6 +87,11 @@
         urpBenchLocal = import ./nix/urp-bench-local.nix { inherit pkgs; };
         urpBenchMatrix = import ./nix/urp-bench-matrix.nix { inherit pkgs; };
         urpFastPoc = import ./nix/urp-fast-poc.nix { inherit pkgs; };
+        ciLocal = import ./nix/ci-local.nix {
+          inherit pkgs fuzz;
+          checks = nixChecks;
+          urpCli = urpCli;
+        };
         fuzzRust = import ./nix/fuzz-rust.nix {
           inherit pkgs;
           inherit (packages) rustToolchain;
@@ -202,6 +207,10 @@
           urp-bench-local = urpBenchLocal;
           urp-bench-matrix = urpBenchMatrix;
           urp-fast-poc = urpFastPoc;
+          # Local reproduction of the every-push CI: `nix run .#ci-local`
+          # (for hosts without a GitHub runner). Builds the 9 nix-checks
+          # targets + runs the fuzz-smoke harnesses; skips the KVM tiers.
+          ci-local = ciLocal;
           fuzz-rust = fuzzRust;
           test-kmod-k0 = testKmodK0;
           soak-1h = soak1h;
