@@ -549,6 +549,9 @@ The C↔Rust interop cell in B8 is the acceptance gate for B2/B4.
   short-listing that §30.10 confirms.
 - [20-future-work.md §20.1](20-future-work.md) — the open question this doc
   answers with data.
+- [31-urp-fast-zero-copy.md](31-urp-fast-zero-copy.md) — the opt-in fast path
+  this doc's `AF_UNIX` ceiling motivates: an `io_uring` command interface into
+  `urp.ko` that removes the last app-side copy. This bench becomes its harness.
 - [21-kernel-module.md](21-kernel-module.md) — why the kernel side already
   has no removable copy (§21.5's page-flip idea remains future work and is
   untouched here).
