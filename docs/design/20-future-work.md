@@ -12,11 +12,24 @@
 
 Could `AF_XDP` (Express Data Path) or `io_uring` zero-copy features be used to eliminate the kernel copies on the UDS side? This would require the application to use a compatible socket type, partially defeating the "transparent proxy" goal, but could be offered as an optional fast path for aware applications.
 
+> **Now designed in detail**: [Section 31 — urp-fast](31-urp-fast-zero-copy.md)
+> specifies this opt-in fast path as an `IORING_OP_URING_CMD` interface into
+> `urp.ko` (app-owned buffers dual-registered with io_uring + the RDMA MR),
+> with the full SEND/RECEIVE flows, buffer-pool lifecycle, and diagrams.
+> [Design 30](30-urp-bench-io-uring.md) measured the `AF_UNIX` ceiling that
+> motivates it.
+
 > **See also**: [Section 21 — Kernel Module Alternative](21-kernel-module.md) explores a more radical approach: implementing the entire proxy as a kernel module, eliminating the UDS copies entirely by intercepting socket operations before they leave kernel space (2 copies instead of 4, with zero-copy potential via page flipping).
 
 ## 20.2 Shared Memory Fast Path
 
 If both the application and the proxy are on the same host (which they always are, by definition), they could share a memory region directly instead of going through UDS. The application would write directly into RDMA-registered buffers. This eliminates the UDS copy entirely but requires application modification (a client library).
+
+> **Now designed in detail**: [Section 31 — urp-fast](31-urp-fast-zero-copy.md)
+> is exactly this fast path for the kernel-module architecture — the app owns a
+> buffer pool that is dual-registered (io_uring fixed buffers + RDMA MR) and
+> hands buffers to `urp.ko` by index over `io_uring`, achieving zero software
+> copies on both hosts.
 
 > **See also**: [Section 21.7](21-kernel-module.md#217-code-sharing-strategy) proposes extracting a `uds-rdma-protocol` crate (`no_std + alloc`) that could also serve as the foundation for a shared-memory client library — the frame codec and credit state machine are reusable regardless of transport.
 
