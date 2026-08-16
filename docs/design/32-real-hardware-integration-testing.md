@@ -226,8 +226,13 @@ one-way number. SNTP is the wrong tool. The right tool on this hardware is
   before trusting any one-way figure.
 
 The `urp-hw-matrix` runner reports **RTT as the primary latency oracle**
-(always valid) and, when PTP sync is confirmed healthy, **one-way latency** as
-the sharper figure.
+(always valid) and the measured `pmc` `offsetFromMaster`. Because `urp-bench`'s
+`BENCH_OK` currently carries only RTT (`p50_us`/`p99_us`, single-clock), PTP is
+used here to **bound** the one-way estimate: with the clocks proven to agree to
+within the reported offset, `RTT/2` is a defensible one-way figure to that
+tolerance. A *direct* payload-timestamped one-way measurement (stamp
+`CLOCK_REALTIME` in the payload on send, log it on receive) needs a urp-bench
+change and is tracked as future work.
 
 ## 32.9 Oracles
 
@@ -239,9 +244,9 @@ the sharper figure.
   hypothesis (syscall batching is the win; AF_UNIX has no zero-copy) meets real
   hardware, and where design 31's fast path can show a real copy-elimination
   delta.
-- **Latency** — **RTT** p50/p99 (single-clock, always valid); plus **one-way**
-  latency when PTP sync is healthy (§32.8), which isolates each direction and
-  removes the return-path from the number.
+- **Latency** — **RTT** p50/p99 (single-clock, always valid); plus a
+  **PTP-bounded one-way estimate** (`RTT/2` ± the measured `pmc` offset, §32.8).
+  A direct payload-timestamped one-way probe is future work.
 - **Zero-copy** — `URP_FAST_POC_OK` from the `/dev/urp` path.
 - **Hygiene** — no `dmesg` splats after a run (`ssh hpN dmesg | grep -i urp`);
   clean endpoint teardown (the drain-order UAF fixed in PR #39 is exactly the

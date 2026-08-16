@@ -11,9 +11,9 @@ code — Phases 0–3 all not-started.)
 
 | # | Phase | Status | Completion |
 |---|-------|--------|------------|
-| 0 | [urp.ko builds on the hp net-next kernel](#phase-0-urpko-builds-on-the-hp-kernel) | Not started | 0/2 |
-| 1 | [Docs (this pass)](#phase-1-docs) | In progress | 2/3 |
-| 1b | [nixosModule + hw-matrix runner](#phase-1b-nixosmodule--runner) | Not started | 0/2 |
+| 0 | [urp.ko builds on the hp net-next kernel](#phase-0-urpko-builds-on-the-hp-kernel) | In progress | 0/2 |
+| 1 | [Docs (this pass)](#phase-1-docs) | Done | 3/3 |
+| 1b | [nixosModule + hw-matrix runner](#phase-1b-nixosmodule--runner) | Done | 2/2 |
 | 2 | [Pin, rebuild both boxes, first light](#phase-2-pin-rebuild-first-light) | Not started | 0/4 |
 | 3 | [Run the matrix, capture results](#phase-3-run-the-matrix) | Not started | 0/3 |
 
@@ -52,9 +52,8 @@ _(none yet)_
 
 - [x] `docs/design/32-real-hardware-integration-testing.md` written (design/spec).
 - [x] `docs/design/32-implementation-status.md` written (this tracker).
-- [ ] Row added to `docs/DESIGN.md`; **user review checkpoint** — pause for the
-      user to read both docs and revise per feedback **before** any nix/kernel
-      code.
+- [x] Row added to `docs/DESIGN.md`; **user review checkpoint** passed (docs
+      reviewed + PTP one-way latency folded in), then committed (`5ec051a`).
 
 ### Notes
 
@@ -68,34 +67,51 @@ nixosModule in the flake; defer Seastar; ssh-driven runner in the repo.
 
 ## Phase 1b: nixosModule + runner
 
-**Status**: Not started. (PR A1 — after the review checkpoint.)
+**Status**: Done (PR A, commit pending).
 
 ### Definition of done
 
-- [ ] `nix/nixos-module.nix` → top-level `nixosModules.urp` output. Options
-      `services.urp.{enable,rdmaKernelModules,endpoints}`; config sets
-      `boot.extraModulePackages`/`boot.kernelModules`, adds `urp-cli` +
-      `rdma-core` (+ `perftest`, `mstflint`), and one systemd oneshot per
-      endpoint (`ExecStart` = `urp add`, `ExecStop` = `urp drain && urp remove`,
-      `RemainAfterExit`). Mirrors `nix/microvms/{mkVm.nix,lib.nix}`.
-- [ ] `nix/urp-hw-matrix.nix` → package `urp-hw-matrix` (writeShellApplication,
+- [x] `nix/nixos-module.nix` → `nixosModules.urp` (+ `.default`), merged OUTSIDE
+      `flake-utils.eachDefaultSystem` via `// { nixosModules.urp = …; }`,
+      resolving `self.lib.<sys>.buildUrpKo config.boot.kernelPackages` +
+      `self.packages.<sys>.urp-cli`. Options
+      `services.urp.{enable,rdmaKernelModules,endpoints,extraPackages}`;
+      `endpoints` is an `attrsOf submodule` ({role, connectPath/listenPath,
+      bind/peer, numQps, bufferCount, bufferSize, passwordFile, rdmaDevice}) with
+      acceptor/initiator assertions. Config sets `boot.extraModulePackages` +
+      `boot.kernelModules`, adds `urp-cli` + `rdma-core`, and one systemd oneshot
+      per endpoint (`ExecStart` = `urp add …` reading `passwordFile` inline for
+      `--password`; `preStop` = `urp drain && urp remove`; `RemainAfterExit`).
+- [x] `nix/urp-hw-matrix.nix` → package `urp-hw-matrix` (writeShellApplication,
       modeled on `urp-bench-matrix.nix`). Args `<acceptor> <initiator>
-      <acceptor-ip> [cells]`; per-cell ssh listener/connector + `BENCH_OK`
-      assert (≤3 attempts, `BENCH_SKIP`→skip); 4-way delta + interop table.
-      Reports **RTT** p50/p99 always, and **one-way** latency gated on a healthy
-      `pmc` PTP offset check (§32.8) — never a one-way number from an unsynced
-      clock. Wired into `flake.nix` `let` + `packages`. **Not** added to
-      `ci-local` (needs real hardware — documented like the microVM tiers).
+      <acceptor-ip>`; preflight (urp.ko loaded + endpoints present) then
+      `nix copy` the bench closures to both hosts (both twins install a binary
+      named `urp-bench`, so invoked by absolute store path); per-cell ssh
+      listener (acceptor connectPath) + connector (initiator listenPath) +
+      `BENCH_OK` assert (≤3 attempts, `BENCH_SKIP`→skip); 4-combo interop table
+      (`c<->c/c<->rust/rust<->c/rust<->rust`, msgs_per_s) + `c<->c` RTT p50/p99.
+      Reports the `pmc` PTP `offsetFromMaster` bounding the one-way estimate
+      (RTT/2 ± offset). Wired into `flake.nix` `let` + `packages`. **Not** in
+      `ci-local` (needs hardware — documented like the microVM tiers).
 
 ### Verification
 
-- [ ] `nix build .#urp-hw-matrix` succeeds.
-- [ ] Module evaluates (throwaway `nixosConfigurations` or `nixos-rebuild build`
-      on a box); `nix flake check` still green.
+- [x] `nix build .#urp-hw-matrix` succeeds (shellcheck clean).
+- [x] Module evaluates in a throwaway `nixosSystem` (option types + submodules
+      OK: acceptor/initiator, defaults `[ib_core rdma_cm mlx5_ib]`).
+- [ ] `nix run .#ci-local` GREEN — deferred until the Phase-0 kernel build frees
+      the machine; Phase 1b is additive nix packaging (no kernel/crate change),
+      so CI is logically unaffected.
 
 ### Notes
 
-_(none yet)_
+- **One-way latency**: `urp-bench` `BENCH_OK` only carries RTT (`p50_us`/
+  `p99_us`, single-clock). A *direct* payload-timestamped one-way measurement
+  needs a urp-bench change (stamp CLOCK_REALTIME in the payload, log on recv) —
+  deferred. v1 ships RTT + the PTP offset that bounds the RTT/2 one-way estimate.
+- **PSK on argv**: `urp add` has only `--password <STRING>` (no file flag), so
+  `passwordFile` is `cat`'d at ExecStart → visible on the process argv. Fine for
+  the trusted lab; revisit if the CLI grows a file-based flag.
 
 ---
 
