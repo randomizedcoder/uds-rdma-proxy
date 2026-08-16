@@ -69,15 +69,42 @@ struct urp_cmd_ctx {
 	u64			pool_len;	/* total bytes                  */
 	unsigned long		nr_pages;	/* pinned pages                 */
 	struct page		**pages;	/* FOLL_LONGTERM pin            */
+	dma_addr_t		*dma;		/* per-page DMA address (nr_pages) */
 	struct urp_cmd_pool_geom geom;		/* count + buf_size             */
+
+	/*
+	 * The endpoint the pool is registered against. We hold a kref for the
+	 * registration's lifetime; @ib_dev is cached from ep->ib_dev at REGISTER
+	 * so UNREGISTER can unmap even if the endpoint has since cleared it, and
+	 * @lkey is ep->pd->local_dma_lkey -- what the data path (PR3) posts with.
+	 */
+	struct urp_endpoint	*ep;
+	struct ib_device	*ib_dev;
+	u32			lkey;
 };
 
 static void urp_cmd_pool_release(struct urp_cmd_ctx *ctx)
 {
+	unsigned long i;
+
 	lockdep_assert_held(&ctx->lock);
 
 	if (!ctx->registered)
 		return;
+
+	if (ctx->dma) {
+		for (i = 0; i < ctx->nr_pages; i++)
+			ib_dma_unmap_page(ctx->ib_dev, ctx->dma[i], PAGE_SIZE,
+					  DMA_BIDIRECTIONAL);
+		kvfree(ctx->dma);
+		ctx->dma = NULL;
+	}
+	if (ctx->ep) {
+		urp_endpoint_put(ctx->ep);
+		ctx->ep = NULL;
+	}
+	ctx->ib_dev	= NULL;
+	ctx->lkey	= 0;
 
 	unpin_user_pages(ctx->pages, ctx->nr_pages);
 	kvfree(ctx->pages);
@@ -93,6 +120,69 @@ static void urp_cmd_pool_release(struct urp_cmd_ctx *ctx)
 /* ----------------------------------------------------------------------- */
 /* uring_cmd handlers.                                                      */
 /* ----------------------------------------------------------------------- */
+
+/*
+ * Bind the pinned pool to the named endpoint and DMA-map every page against
+ * that endpoint's RDMA device, so the pool shares the endpoint's protection
+ * domain (the data path in a later PR posts on its QP with @lkey). On success
+ * fills ctx->{ep,ib_dev,dma,lkey} and holds an endpoint kref; on failure
+ * returns a negative errno having undone any partial mapping and dropped the
+ * ref. The caller still owns the pin on failure.
+ *
+ * NOTE (hardened in the PR that adds the data path): ep->pd / ep->ib_dev are
+ * read without ep->lock. The kref keeps the endpoint struct alive, but a
+ * concurrent endpoint teardown could still race the mapping. Safe for the
+ * current milestone (the pool is registered against a stable, established
+ * endpoint); the ownership/quiesce protocol closes the race.
+ */
+static int urp_cmd_map_pool(struct urp_cmd_ctx *ctx, struct page **pages,
+			    unsigned long nr_pages, const char *ep_name)
+{
+	struct urp_endpoint *ep;
+	dma_addr_t *dma;
+	unsigned long i;
+	int ret;
+
+	ep = urp_endpoint_get(ep_name);
+	if (!ep)
+		return -ENODEV;
+
+	/* Need an established RDMA back-end (PD + device) to map against. */
+	if (!ep->pd || !ep->ib_dev) {
+		ret = -ENOTCONN;
+		goto err_put;
+	}
+
+	dma = kvmalloc_array(nr_pages, sizeof(*dma), GFP_KERNEL);
+	if (!dma) {
+		ret = -ENOMEM;
+		goto err_put;
+	}
+
+	for (i = 0; i < nr_pages; i++) {
+		dma[i] = ib_dma_map_page(ep->ib_dev, pages[i], 0, PAGE_SIZE,
+					 DMA_BIDIRECTIONAL);
+		if (ib_dma_mapping_error(ep->ib_dev, dma[i])) {
+			ret = -ENOMEM;
+			goto err_unmap;
+		}
+	}
+
+	ctx->ep		= ep;
+	ctx->ib_dev	= ep->ib_dev;
+	ctx->dma	= dma;
+	ctx->lkey	= ep->pd->local_dma_lkey;
+	return 0;
+
+err_unmap:
+	while (i-- > 0)
+		ib_dma_unmap_page(ep->ib_dev, dma[i], PAGE_SIZE,
+				  DMA_BIDIRECTIONAL);
+	kvfree(dma);
+err_put:
+	urp_endpoint_put(ep);
+	return ret;
+}
 
 static int urp_cmd_do_register(struct urp_cmd_ctx *ctx,
 			       const struct io_uring_sqe *sqe)
@@ -110,6 +200,8 @@ static int urp_cmd_do_register(struct urp_cmd_ctx *ctx,
 
 	if (copy_from_user(&reg, u64_to_user_ptr(inl->arg), sizeof(reg)))
 		return -EFAULT;
+
+	reg.endpoint[URP_CMD_NAME_MAX - 1] = '\0';	/* trust nothing */
 
 	ret = urp_cmd_validate_reg(&reg);
 	if (ret)
@@ -152,9 +244,21 @@ static int urp_cmd_do_register(struct urp_cmd_ctx *ctx,
 		goto out;
 	}
 
+	/*
+	 * Register the pinned pool with the endpoint's RDMA device (DMA-map +
+	 * local lkey). nr_pages is set first so a failure here unwinds cleanly.
+	 */
+	ctx->nr_pages = nr_pages;
+	ret = urp_cmd_map_pool(ctx, pages, nr_pages, reg.endpoint);
+	if (ret) {
+		unpin_user_pages(pages, nr_pages);
+		kvfree(pages);
+		ctx->nr_pages = 0;
+		goto out;
+	}
+
 	ctx->base		= reg.base;
 	ctx->pool_len		= reg.len;
-	ctx->nr_pages		= nr_pages;
 	ctx->pages		= pages;
 	ctx->geom.count		= reg.count;
 	ctx->geom.buf_size	= reg.buf_size;

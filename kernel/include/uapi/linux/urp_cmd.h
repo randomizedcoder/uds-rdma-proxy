@@ -52,6 +52,9 @@ enum urp_cmd_op {
 #define URP_CMD_BUF_SIZE_MAX	(1u << 20)	/* 1 MiB, matches BENCH_PAYLOAD_MAX */
 #define URP_CMD_POOL_COUNT_MAX	65536u		/* index fits u16 stream demux headroom */
 
+/* Endpoint-name field width (matches URP_NAME_MAX in <uapi/linux/urp.h>). */
+#define URP_CMD_NAME_MAX	16
+
 /*
  * SEND / RECV inline argument block. Lives in the 16-byte SQE cmd area
  * (io_uring_sqe_cmd()). Exactly 16 bytes; the kernel enforces this with a
@@ -76,7 +79,10 @@ struct urp_cmd_data {
  * REGISTER descriptor. The SQE cmd area carries a pointer to this (see
  * struct urp_cmd_reg_sqe); the kernel copy_from_user()s it once on the cold
  * path. base must be page aligned; len must be a positive multiple of
- * buf_size; count must equal len / buf_size.
+ * buf_size; count must equal len / buf_size. endpoint names the (connected)
+ * urp endpoint whose RDMA device the pool is DMA-mapped against -- the pool
+ * shares that endpoint's protection domain, so the fast-path data posts land
+ * on its QP (design 31 section 31.4). NUL-terminated within the field.
  */
 struct urp_cmd_reg {
 	__u64	base;		/* pool base userspace address (page aligned) */
@@ -85,6 +91,7 @@ struct urp_cmd_reg {
 	__u32	count;		/* buffer count (== len / buf_size)           */
 	__u32	flags;		/* reserved, must be zero                     */
 	__u32	__resv;		/* reserved, must be zero                     */
+	char	endpoint[URP_CMD_NAME_MAX];	/* target endpoint name       */
 };
 
 /* REGISTER inline argument block: a pointer to struct urp_cmd_reg. */

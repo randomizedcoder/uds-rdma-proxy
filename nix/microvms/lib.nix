@@ -950,19 +950,21 @@ in rec {
       echo ""
 
       # -----------------------------------------------------------------
-      # Phase 10h — urp-fast uring_cmd REGISTER/UNREGISTER (design 31, PR1).
+      # Phase 10h — urp-fast uring_cmd REGISTER/UNREGISTER (design 31, PR1+PR2).
       # Drives /dev/urp against the loaded module: mmap an app buffer pool,
-      # REGISTER it (pins it, FOLL_LONGTERM), exercise the validator's
-      # negative cases (double-register, out-of-range index, misaligned
-      # base), then UNREGISTER (unpins). Standalone — needs only the loaded
-      # module and io_uring in the guest, not the tunnel. Oracle:
-      # URP_FAST_POC_OK plus a clean scan_splat (the pin/unpin leaves no
-      # KASAN/leak trace).
+      # REGISTER it against the connected `pair_acceptor` endpoint (pins it
+      # FOLL_LONGTERM AND DMA-maps every page against the acceptor's RDMA
+      # device / PD, PR2), exercise the validator + binding negative cases
+      # (unknown endpoint, double-register, out-of-range index, misaligned
+      # base), then UNREGISTER (unmaps + unpins). Runs on vm1, where
+      # pair_acceptor has a live PD after the pair established (Phase 9/10).
+      # Oracle: URP_FAST_POC_OK plus a clean scan_splat (the pin/map/unmap/
+      # unpin leaves no KASAN/leak trace).
       # -----------------------------------------------------------------
       echo "--- Phase 10h: urp-fast uring_cmd REGISTER/UNREGISTER (design 31) ---"
       fastout="$RUNDIR/diag/vm1.urp-fast-poc.txt"
       vm_run "$VM1_VIRTIO" "$VM1_PROC" \
-        "ls -l /dev/urp 2>&1; urp-fast-poc /dev/urp 4096 8 2>&1" "$T_BENCH" \
+        "ls -l /dev/urp 2>&1; urp-fast-poc /dev/urp pair_acceptor 4096 8 2>&1" "$T_BENCH" \
         > "$fastout" 2>&1 || true
       scan_splat "$fastout" "urp-fast poc"
       if grep -q URP_FAST_POC_OK "$fastout"; then

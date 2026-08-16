@@ -264,26 +264,32 @@ pages — the last software copy the `AF_UNIX` path (design 30) provably can't
 remove. `31a` is the C++/Seastar client (Redpanda's framework). Kernel-first
 phasing so the client has a real integration target.
 
-Progress (2026-08-16): **PR1 landing** (branch `urp-fast-cmd-abi`).
+Progress (2026-08-16): **PR1 merged (#36); PR2 landing** (branch `urp-fast-mr`).
 
-- `/dev/urp` misc char device + `->uring_cmd` fop (`kernel/urp_cmd.c`); the
-  shared ABI (`include/uapi/linux/urp_cmd.h`): opcodes
+- **PR1** — `/dev/urp` misc char device + `->uring_cmd` fop (`kernel/urp_cmd.c`);
+  the shared ABI (`include/uapi/linux/urp_cmd.h`): opcodes
   `URP_CMD_{REGISTER,UNREGISTER,SEND,RECV}`, inline `urp_cmd_data`, cold-path
-  `urp_cmd_reg`.
-- Trust-boundary validators (`kernel/urp_cmd_validate.c`, design 31 §31.10):
+  `urp_cmd_reg`. Trust-boundary validators (`kernel/urp_cmd_validate.c`, §31.10):
   a **dual-compile pure core** — same source into `urp.ko` (KUnit
   `test_cmd_validate_{data,reg}`) and a userspace check
   (`urp-fast-validate-units`, 55 table cases, in `nix flake check` + ci).
-- `REGISTER`/`UNREGISTER` = `pin_user_pages(FOLL_LONGTERM)` / `unpin` (the
-  pool pins **once**, §31.4). `SEND`/`RECV` validate then `-ENOSYS` (data
-  path is PR3).
-- `nix run .#urp-fast-poc` drives it end-to-end (REGISTER + negative cases +
-  UNREGISTER); pair-test **Phase 10h** runs the PoC against the live module
-  with `scan_splat` armed.
+  `REGISTER`/`UNREGISTER` = `pin_user_pages(FOLL_LONGTERM)` / `unpin` (pool
+  pins **once**, §31.4).
+- **PR2** — `REGISTER` now takes an endpoint name (`urp_cmd_reg.endpoint`),
+  binds to a connected endpoint (`urp_endpoint_get`), and DMA-maps every
+  pinned page against its RDMA device (`ib_dma_map_page`), producing the local
+  `lkey` (= `pd->local_dma_lkey`) the data path posts with — the pool shares
+  the endpoint's PD. `UNREGISTER` unmaps + drops the endpoint ref. Chose
+  `ib_dma_map_page` + `local_dma_lkey` over `ib_reg_user_mr` (matches
+  `urp_bufs_init`; two-sided SEND/RECV needs no remote rkey).
+- `SEND`/`RECV` validate then `-ENOSYS` (data path is PR3).
+- `nix run .#urp-fast-poc <dev> <endpoint>` drives it end-to-end (REGISTER +
+  negative cases incl. unknown-endpoint + UNREGISTER); pair-test **Phase 10h**
+  runs it on vm1 against the connected `pair_acceptor`, `scan_splat` armed.
 - Fast path gated on kernel ≥ 6.8 (`<linux/io_uring/cmd.h>` + 4-arg
   `pin_user_pages`); stubbed on older LTS so 6.1/6.6 compile gates stay green.
-- Next: PR2 `ib_reg_user_mr` + `fast` endpoint kind; PR3 `SEND`/`RECV` posting
-  + per-buffer ownership; PR4 client libs (C/Rust/Seastar) + bench T3 + fuzz.
+- Next: PR3 `SEND`/`RECV` posting + per-buffer ownership + `fast` endpoint
+  kind; PR4 client libs (C/Rust/Seastar) + bench T3 + fuzz.
 
 ## Known functional gaps
 
