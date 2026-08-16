@@ -49,6 +49,24 @@
 #include <linux/uaccess.h>
 #include <linux/io_uring/cmd.h>
 
+/*
+ * Typed accessor for the 16-byte inline SQE command area.
+ *
+ * Upstream's io_uring_sqe_cmd() only grew its 2-arg typed form (returning a
+ * (const type *) with a compile-time size assertion) in the 7.x series; the
+ * 6.8-era kernels this fast path also targets expose just the 1-arg
+ * io_uring_sqe_cmd(sqe) that returns a bare (const void *). Rather than gate on
+ * the exact version the macro changed, replicate the typed form locally so the
+ * fast path compiles cleanly across the whole >= 6.8 range. Both kernels back
+ * the accessor with the same sqe->cmd bytes.
+ */
+#define urp_sqe_cmd(sqe, type)						\
+({									\
+	BUILD_BUG_ON(sizeof(type) > (sizeof(struct io_uring_sqe) -	\
+				     offsetof(struct io_uring_sqe, cmd)));\
+	(const type *)(sqe)->cmd;					\
+})
+
 /* Refuse pools larger than this so a bad REGISTER can't try to pin the world. */
 #define URP_CMD_POOL_BYTES_MAX	(1UL << 30)	/* 1 GiB */
 
@@ -188,7 +206,7 @@ static int urp_cmd_do_register(struct urp_cmd_ctx *ctx,
 			       const struct io_uring_sqe *sqe)
 {
 	const struct urp_cmd_reg_sqe *inl =
-		io_uring_sqe_cmd(sqe, struct urp_cmd_reg_sqe);
+		urp_sqe_cmd(sqe, struct urp_cmd_reg_sqe);
 	struct urp_cmd_reg reg;
 	unsigned long nr_pages;
 	struct page **pages;
@@ -288,7 +306,7 @@ static int urp_cmd_do_data(struct urp_cmd_ctx *ctx, u32 cmd_op,
 			   const struct io_uring_sqe *sqe)
 {
 	const struct urp_cmd_data *in =
-		io_uring_sqe_cmd(sqe, struct urp_cmd_data);
+		urp_sqe_cmd(sqe, struct urp_cmd_data);
 	struct urp_cmd_pool_geom geom;
 	struct urp_cmd_req op;
 	int ret;
