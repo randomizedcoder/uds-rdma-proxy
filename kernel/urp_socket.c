@@ -14,7 +14,10 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include "urp.h"
+#include "urp_conn_plan.h"	/* urp_should_unlink_listen_path (design 33) */
+#include <linux/dcache.h>	/* d_is_socket, d_really_is_negative */
 #include <linux/file.h>
+#include <linux/namei.h>
 #include <linux/sched/task.h>
 #include <net/sock.h>
 
@@ -175,6 +178,74 @@ int urp_connect_uds(struct urp_endpoint *ep, const char *path)
 }
 
 /*
+ * Design 33 Bug 2: unlink a stale pathname AF_UNIX socket node.
+ *
+ * Only the initiator binds a pathname listen socket, and nothing ever removed
+ * the filesystem node. After drain+remove -- or a crash/OOM where cleanup never
+ * ran -- the node survives, so the next `urp add` fails -98 EADDRINUSE on bind.
+ * Unlink it here (both before bind and on cleanup). We refuse to remove anything
+ * that is not a socket, so a mis-configured path pointing at a real file can't
+ * destroy data. -ENOENT (nothing there) is the normal case and is silent.
+ *
+ * NB: kern_path_locked() returns with the parent inode locked and a reference
+ * on the target dentry; the exact idmap/signature is verified against the hp
+ * kernel at build time (see design 33 plan).
+ */
+static void urp_unlink_stale_socket(const char *path)
+{
+	struct path target;
+	struct dentry *dentry, *parent;
+	struct inode *dir, *inode;
+	int ret;
+
+	/*
+	 * kern_path_locked() / lookup_one_len() would be the natural primitives
+	 * but they drift across the kernels we build against (kern_path_locked
+	 * is not exported to modules on 6.1; lookup_one_len was removed by 7.x).
+	 * Compose the unlink from symbols that are exported and stable across
+	 * 6.1..7.x: resolve the node (kern_path), grab its parent (dget_parent),
+	 * then vfs_unlink under the parent i_rwsem. Only urp listen paths reach
+	 * here (absolute, e.g. /run/urp.sock).
+	 */
+	ret = kern_path(path, 0, &target);
+	if (ret)
+		return;			/* -ENOENT etc: nothing to remove */
+
+	dentry = target.dentry;
+	parent = dget_parent(dentry);
+	dir = d_inode(parent);
+
+	inode_lock_nested(dir, I_MUTEX_PARENT);
+	inode = d_inode(dentry);
+	if (!inode || dentry->d_parent != parent) {
+		/* Raced with a concurrent rename/unlink -- leave it alone. */
+	} else if (!S_ISSOCK(inode->i_mode)) {
+		/* Never remove a real file/dir that shares the name. */
+		pr_warn("refusing to unlink non-socket %s\n", path);
+	} else {
+		/*
+		 * vfs_unlink() took a struct user_namespace * (via mnt_user_ns)
+		 * until v6.3 switched it to struct mnt_idmap * (via mnt_idmap).
+		 * We build down to 6.1, so gate the idmap argument on the
+		 * version (same idiom as the >=6.8 fast path in urp_cmd.c).
+		 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+		ret = vfs_unlink(mnt_idmap(target.mnt), dir, dentry, NULL);
+#else
+		ret = vfs_unlink(mnt_user_ns(target.mnt), dir, dentry, NULL);
+#endif
+		if (ret)
+			pr_warn("unlink stale socket %s failed: %d\n",
+				path, ret);
+		else
+			pr_info("removed stale socket %s\n", path);
+	}
+	inode_unlock(dir);
+	dput(parent);
+	path_put(&target);
+}
+
+/*
  * Create a listening UDS socket (initiator mode).
  */
 static int urp_listen_uds(struct urp_endpoint *ep, const char *path)
@@ -188,6 +259,14 @@ static int urp_listen_uds(struct urp_endpoint *ep, const char *path)
 		pr_err("sock_create_kern failed: %d\n", ret);
 		return ret;
 	}
+
+	/*
+	 * Design 33 Bug 2: clear any stale node left by a prior instance so
+	 * bind() below doesn't fail -98 EADDRINUSE. Gated by the pure predicate
+	 * (initiator + a path is set) to keep the decision unit-testable.
+	 */
+	if (urp_should_unlink_listen_path(ep->is_initiator, path[0] != '\0'))
+		urp_unlink_stale_socket(path);
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
@@ -322,4 +401,14 @@ void urp_socket_cleanup(struct urp_endpoint *ep)
 		sock_release(ep->listen_sock);
 		ep->listen_sock = NULL;
 	}
+
+	/*
+	 * Design 33 Bug 2: remove the pathname node so a later `urp add`
+	 * (re-create of this endpoint) binds cleanly instead of failing -98
+	 * EADDRINUSE. sock_release() above drops the socket but leaves the
+	 * filesystem node behind. Gated on the pure predicate.
+	 */
+	if (urp_should_unlink_listen_path(ep->is_initiator,
+					  ep->listen_path[0] != '\0'))
+		urp_unlink_stale_socket(ep->listen_path);
 }

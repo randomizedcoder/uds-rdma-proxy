@@ -167,6 +167,15 @@ struct urp_qp {
 	struct ib_qp		*qp;
 	u32			index;		/* position in ep->qps[] */
 	bool			established;	/* set on RDMA_CM_EVENT_ESTABLISHED */
+	/*
+	 * Design 33 Bug 1: does this (acceptor) slot currently hold a claim
+	 * on ep->qps_accepted? Set true once rdma_accept succeeds; cleared
+	 * when the slot is released on CM teardown. Lets the teardown handler
+	 * return the slot for a half-open child that never reached
+	 * ESTABLISHED, without double-decrementing on a second event. Unused
+	 * on the initiator (see urp_acceptor_should_release_slot).
+	 */
+	bool			accept_slot_held;
 
 	/*
 	 * Step 4: per-QP credit-based flow control state. Initialized on

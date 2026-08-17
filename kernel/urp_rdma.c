@@ -891,6 +891,14 @@ static int urp_cm_accept_one(struct rdma_cm_id *child, struct urp_endpoint *ep,
 	if (ret)
 		goto err_destroy_qp;
 
+	/*
+	 * Design 33 Bug 1: mark the slot as held now that the child is fully
+	 * accepted. The teardown handler releases it on ANY subsequent CM
+	 * event for this QP (including a half-open reject before ESTABLISHED),
+	 * so the slot is never leaked. Synchronous failures above take the
+	 * err_release_slot path instead and leave this flag false.
+	 */
+	ep->qps[qp_index].accept_slot_held = true;
 	return 0;
 
 err_destroy_qp:
@@ -992,15 +1000,24 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 			if (ep->qps[ctx->qp_index].established) {
 				ep->qps[ctx->qp_index].established = false;
 				atomic_dec(&ep->qps_connected);
-				/*
-				 * Acceptor: release the slot so the next
-				 * CONNECT_REQUEST can reuse it (the old QP +
-				 * cm_id stay until the next reuse or drain,
-				 * since we can't safely destroy the cm_id from
-				 * inside its own handler).
-				 */
-				if (!ep->is_initiator)
-					atomic_dec(&ep->qps_accepted);
+			}
+			/*
+			 * Acceptor: release the slot so the next CONNECT_REQUEST
+			 * can reuse it (the old QP + cm_id stay until the next
+			 * reuse or drain, since we can't safely destroy the
+			 * cm_id from inside its own handler).
+			 *
+			 * Design 33 Bug 1: this MUST run outside the
+			 * `established` guard above -- a half-open child that
+			 * was rejected/errored before ESTABLISHED still holds
+			 * a slot, and leaking it made the acceptor refuse every
+			 * future connect. accept_slot_held is cleared so a
+			 * second teardown event can't double-decrement.
+			 */
+			if (urp_acceptor_should_release_slot(ep->is_initiator,
+					ep->qps[ctx->qp_index].accept_slot_held)) {
+				ep->qps[ctx->qp_index].accept_slot_held = false;
+				atomic_dec(&ep->qps_accepted);
 			}
 		}
 		/*
