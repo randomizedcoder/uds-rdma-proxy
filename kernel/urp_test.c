@@ -1016,6 +1016,76 @@ static void test_credit_grant_routing(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, strm.send_credits, w);
 }
 
+/*
+ * design 33 Bug 1: acceptor QP-slot release.
+ *
+ * The acceptor claims an ep->qps_accepted slot at CONNECT_REQUEST and must
+ * return it on ANY teardown -- including a half-open child rejected before
+ * ESTABLISHED. Releasing only inside the `established` branch leaked the slot
+ * and the acceptor then refused every future connect. Release iff acceptor and
+ * the slot is still held; the caller clears the flag to avoid a double release.
+ */
+static void test_acceptor_should_release_slot(struct kunit *test)
+{
+	static const struct {
+		bool is_initiator;
+		bool slot_held;
+		bool expect;
+	} cases[] = {
+		/* acceptor holding a slot (established OR half-open) -> release */
+		{ false, true,  true  },
+		/* acceptor, slot already released -> no double-decrement */
+		{ false, false, false },
+		/* initiator never owns an acceptor slot */
+		{ true,  true,  false },
+		{ true,  false, false },
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		bool got = urp_acceptor_should_release_slot(cases[i].is_initiator,
+							    cases[i].slot_held);
+
+		KUNIT_EXPECT_EQ_MSG(test, (int)got, (int)cases[i].expect,
+				    "case %d: is_initiator=%d slot_held=%d", i,
+				    (int)cases[i].is_initiator,
+				    (int)cases[i].slot_held);
+	}
+}
+
+/*
+ * design 33 Bug 2: stale UDS listen-socket unlink decision.
+ *
+ * Only the initiator binds a pathname listen socket, and the node must be
+ * unlinked (before bind and on cleanup) so a re-`urp add` doesn't fail -98
+ * EADDRINUSE. Unlink iff initiator and a listen path is configured. (Only the
+ * decision is pure; the vfs_unlink action is integration-tested.)
+ */
+static void test_should_unlink_listen_path(struct kunit *test)
+{
+	static const struct {
+		bool is_initiator;
+		bool path_set;
+		bool expect;
+	} cases[] = {
+		{ true,  true,  true  }, /* initiator with a listen path */
+		{ true,  false, false }, /* initiator, no path (shouldn't happen) */
+		{ false, true,  false }, /* acceptor has no listen socket */
+		{ false, false, false },
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		bool got = urp_should_unlink_listen_path(cases[i].is_initiator,
+							 cases[i].path_set);
+
+		KUNIT_EXPECT_EQ_MSG(test, (int)got, (int)cases[i].expect,
+				    "case %d: is_initiator=%d path_set=%d", i,
+				    (int)cases[i].is_initiator,
+				    (int)cases[i].path_set);
+	}
+}
+
 static struct kunit_case urp_test_cases[] = {
 	KUNIT_CASE(test_frame_roundtrip_data),
 	KUNIT_CASE(test_frame_roundtrip_control),
@@ -1059,6 +1129,10 @@ static struct kunit_case urp_test_cases[] = {
 	KUNIT_CASE(test_acceptor_eager_connect),
 	/* design 32: credit-grant routing (per-stream vs per-QP pool) */
 	KUNIT_CASE(test_credit_grant_routing),
+	/* design 33 Bug 1: acceptor QP-slot release on any teardown */
+	KUNIT_CASE(test_acceptor_should_release_slot),
+	/* design 33 Bug 2: stale UDS listen-socket unlink decision */
+	KUNIT_CASE(test_should_unlink_listen_path),
 	KUNIT_CASE(test_resolve_num_bufs),
 	KUNIT_CASE(test_resolve_buf_size),
 	KUNIT_CASE(test_ep_max_payload),

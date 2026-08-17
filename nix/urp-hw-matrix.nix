@@ -61,8 +61,20 @@ pkgs.writeShellApplication {
       BATCHES="16"
       DUR=2
     fi
+    # urp-bench is a symmetric peer echo: run_done needs own_fin_echoed &&
+    # peer_fin_seen. If both ends use the same --duration the listener (started
+    # ~1 s earlier) FINs and exits before it can echo the generator's final FIN,
+    # so the generator waits and reports a false timeout. Give the listener a few
+    # extra seconds so it outlives the generator's FIN; the matrix verdict scrapes
+    # the generator's BENCH_OK, so the listener over-running is harmless.
+    LDUR=$((DUR + 3))
 
-    ssh_o() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$@"; }
+    # Connect as root: the bench listener binds the acceptor's root-owned
+    # backend socket (/run/urp-echo.sock) and the generator connects to the
+    # root-owned initiator listen socket (/run/urp.sock); both, plus the
+    # transient systemd unit, need root. root is also a trusted nix user, so
+    # the closure copies below need no signatures.
+    ssh_o() { ssh -o BatchMode=yes -o ConnectTimeout=10 -l root "$@"; }
 
     echo "=== urp-hw-matrix: acceptor=$ACC initiator=$INIT acc_ip=$ACC_IP ==="
 
@@ -78,8 +90,8 @@ pkgs.writeShellApplication {
     echo "  endpoints present on both hosts"
 
     echo "  copying bench closures to hosts (nix copy)..."
-    nix copy --no-check-sigs --to "ssh://$ACC"  "${benchC}" "${benchRs}"
-    nix copy --no-check-sigs --to "ssh://$INIT" "${benchC}" "${benchRs}"
+    nix copy --no-check-sigs --to "ssh://root@$ACC"  "${benchC}" "${benchRs}"
+    nix copy --no-check-sigs --to "ssh://root@$INIT" "${benchC}" "${benchRs}"
     echo "  bench binaries staged"
 
     # --- PTP health (bounds one-way estimate) --------------------------------
@@ -103,11 +115,23 @@ pkgs.writeShellApplication {
               cell="$llang<->$glang/$mode/$sz/$batch"
               ok=0
               for _ in 1 2 3; do
-                # start the listener on the acceptor's connectPath backend
-                ssh_o "$ACC" "pkill -f 'urp-bench --listen' 2>/dev/null; rm -f $ACC_SOCK; \
-                  nohup $LBIN --listen $ACC_SOCK --id 2 --mode $mode --msg-size $sz \
-                    --batch $batch --duration $DUR --verify full >/tmp/urp-hw-l.out 2>&1 & \
-                  sleep 0.4; echo LSTART" >/dev/null 2>&1 || true
+                # Start the listener on the acceptor's connectPath backend as a
+                # transient systemd unit. Two subtleties, both of which silently
+                # failed every cell before:
+                #   * Do NOT `pkill -f 'urp-bench --listen'` here: the remote
+                #     shell's own argv contains that exact string (from the
+                #     `$LBIN --listen ...` below), so pkill kills its own shell
+                #     before systemd-run runs. `systemctl stop urpbench-l` is the
+                #     correct, targeted way to reap the prior listener.
+                #   * systemd-run detaches into its own scope so the listener
+                #     outlives the ssh session (a bare `nohup ... &` child gets
+                #     reaped when the ssh session scope is torn down at logout).
+                # --collect GCs the unit on exit; journalctl carries its BENCH_OK.
+                ssh_o "$ACC" "systemctl stop urpbench-l 2>/dev/null; \
+                  systemctl reset-failed urpbench-l 2>/dev/null; rm -f $ACC_SOCK; \
+                  systemd-run --unit=urpbench-l --collect $LBIN --listen $ACC_SOCK \
+                    --id 2 --mode $mode --msg-size $sz --batch $batch \
+                    --duration $LDUR --verify full; sleep 1" >/dev/null 2>&1 || true
                 # run the generator on the initiator's listenPath
                 if gout=$(ssh_o "$INIT" "$GBIN --connect $INIT_SOCK --id 1 --mode $mode \
                     --msg-size $sz --batch $batch --duration $DUR --verify full 2>&1"); then
@@ -128,13 +152,17 @@ pkgs.writeShellApplication {
         done
       done
     done
-    ssh_o "$ACC" "pkill -f 'urp-bench --listen' 2>/dev/null" >/dev/null 2>&1 || true
+    ssh_o "$ACC" "systemctl stop urpbench-l 2>/dev/null; \
+      systemctl reset-failed urpbench-l 2>/dev/null; rm -f $ACC_SOCK" \
+      >/dev/null 2>&1 || true
 
     # --- Interop delta table -------------------------------------------------
     echo ""
-    echo "=== interop matrix (msgs_per_s per combo; RTT p50/p99 ns) ==="
+    echo "=== interop matrix (msgs_per_s per combo; c<->c RTT p50/p99 us) ==="
+    # Result lines are prefixed "llisten=<l> gen=<g> BENCH_OK ..." (see the
+    # tee above), so match BENCH_OK anywhere on the line, not anchored at ^.
     awk '
-      /^BENCH_OK/ {
+      /BENCH_OK/ {
         ll=""; gl=""; mode=""; sz=""; b=""; mps=""; p50=""; p99=""
         for (i = 1; i <= NF; i++) {
           split($i, kv, "=")
