@@ -14,8 +14,8 @@ code — Phases 0–3 all not-started.)
 | 0 | [urp.ko builds on the hp net-next kernel](#phase-0-urpko-builds-on-the-hp-kernel) | Done (no PR K) | 3/3 |
 | 1 | [Docs (this pass)](#phase-1-docs) | Done | 3/3 |
 | 1b | [nixosModule + hw-matrix runner](#phase-1b-nixosmodule--runner) | Done | 2/2 |
-| 2 | [Pin, rebuild both boxes, first light](#phase-2-pin-rebuild-first-light) | Not started | 0/4 |
-| 3 | [Run the matrix, capture results](#phase-3-run-the-matrix) | Not started | 0/3 |
+| 2 | [Pin, rebuild both boxes, first light](#phase-2-pin-rebuild-first-light) | Done — QP established, data path stalls (bug) | 5/5 |
+| 3 | [Run the matrix, capture results](#phase-3-run-the-matrix) | Blocked (Phase-2 credit-grant stall) | 0/3 |
 
 Legend: **Not started** / **In progress** / **Done** / **Blocked**.
 
@@ -126,45 +126,92 @@ nixosModule in the flake; defer Seastar; ssh-driven runner in the repo.
 
 ## Phase 2: Pin, rebuild, first light
 
-**Status**: Not started. (In the `~/nixos/hp` repo, not this one.)
+**Status**: Done — both boxes deployed, RoCEv2 **QP session established**. Data
+path stalls at the stream handshake (real-HW bug, see Notes → blocks Phase 3).
+Committed in `~/nixos` `efdc537`.
 
 ### Definition of done
 
-- [ ] Both `hp1/flake.nix` and `hp3/flake.nix`: add
+- [x] Both `hp1/flake.nix` and `hp3/flake.nix`: add
       `inputs.uds-rdma-proxy.url = "github:randomizedcoder/uds-rdma-proxy/main"`
-      (or a tag) with `inputs.nixpkgs.follows = "nixpkgs"`; add to the outputs
-      argset + `modules` (`uds-rdma-proxy.nixosModules.urp`).
-- [ ] `services.urp` config declared: **hp1 acceptor** `pair_acceptor
+      with `inputs.nixpkgs.follows = "nixpkgs"`; add to the outputs
+      argset + `modules` (`uds-rdma-proxy.nixosModules.urp`). (Do **not**
+      `follows`-prune redpanda/microvm — the flake's `packages` guards aren't
+      follows-safe; source-only fetch, never built.)
+- [x] `services.urp` config declared: **hp1 acceptor** `pair_acceptor
       --connect-path /run/urp-echo.sock --bind 10.10.2.1:4791`; **hp3 initiator**
       `pair_initiator --listen-path /run/urp.sock --peer 10.10.2.1:4791`.
-      Add `rdma-core perftest mstflint` to `hp{1,3}/systemPackages.nix`.
-- [ ] **PTP time sync** (lab infra, *not* in `nixosModules.urp`): a `ptp.nix`
-      imported by hp1/hp3 — `linuxptp` package, a `ptp4l -H` unit on link B
-      (`enp1s0f1np1`, hp1 grandmaster / hp3 slave), and a `phc2sys` unit steering
-      the system clock from the PHC. Confirm the NIC does HW timestamping
-      (`ethtool -T enp1s0f1np1`). See §32.8.
-- [ ] `git add`; `make update` + `make sync` per host; ssh `hpN` → `make`
-      (reboot via `bootstrap` if needed). hp1 and hp3 have separate locks.
-- [ ] **First light**: `lsmod | grep urp`; `ibv_devices` + `show_gids mlx5_0`
-      (RoCEv2 v2 GID on `10.10.2.x`); `urp show` (both endpoints, session
-      established); optional `ib_send_bw 10.10.2.1` raw-verbs baseline.
+      Added `qperf linuxptp mstflint rdma-core` to `hp{1,3}/systemPackages.nix`
+      (`perftest` not in this nixpkgs → `qperf` for raw-verbs baselines).
+- [x] **PTP time sync** (lab infra, *not* in `nixosModules.urp`): `ptp.nix`
+      imported by hp1/hp3 — `linuxptp`, `ptp4l -H` on link B (`enp1s0f1np1`,
+      hp1 grandmaster / hp3 slave), `phc2sys`. HW timestamping confirmed
+      (`ethtool -T enp1s0f1np1` → hardware-transmit/receive). See §32.8.
+- [x] Deployed (see Notes — **not** on-box `make`; build-on-`l` + `nix copy`,
+      then reboot both). hp1 and hp3 have separate locks.
+- [x] **First light**: urp.ko loaded declaratively at boot on both; `urp show`
+      both endpoints `active`; **RoCEv2 QP session established** hp1↔hp3
+      (`all 1 QPs established`, both sides); acceptor splices to backend UDS
+      (`connected to UDS` → `pump started`).
 
 ### Verification
 
-- [ ] `nixos-rebuild switch` succeeds on **both** boxes.
-- [ ] `urp show` reports an established session; `show_gids` lists a RoCEv2 GID.
-- [ ] `pmc -u -b 0 'GET CURRENT_DATA_SET'` on hp3 shows `offsetFromMaster` in the
-      sub-µs / low-hundreds-of-ns range (PTP healthy → one-way latency valid).
+- [x] System build + activation succeeds on **both** boxes (via `l` + `nix copy`
+      + `switch-to-configuration`; on-box `nixos-rebuild` blocked by the boxes'
+      `.git`-less net-next — see [[hp-urp-deploy-recipe]]).
+- [x] `urp show` → QP `established` both sides; RoCEv2 addr+route resolution OK.
+- [ ] `pmc … GET CURRENT_DATA_SET` on hp3 (`offsetFromMaster`) — PTP units up +
+      HW timestamping confirmed; sub-µs lock reading not yet captured.
 
 ### Notes
 
-_(none yet)_
+**Deploy method (important — see [[hp-urp-deploy-recipe]]):** on-box
+`nixos-rebuild` fails because the boxes' `/home/das/Downloads/net-next` has no
+`.git`, so `netnext-kernel.nix`'s `fetchGit` faults. Built each system on `l`
+(has net-next `.git` + both pinned revs), `nix copy --to ssh://root@hpN`, then
+`switch-to-configuration`. hp1 kernel == running (`gwaliv1`, no kernel change);
+hp3 config wanted a *new* kernel (`m9gjjis` ≠ running `3fnk7dy`) → full kernel
+rebuild + reboot. Both rebooted; urp.ko now loads via `boot.kernelModules` and
+endpoint + PTP services start on boot. (A new out-of-tree module does **not**
+load on a `switch` — modprobe resolves against `/run/booted-system` — so the
+reboot is required.)
+
+**What works on real ConnectX-4 Lx RoCEv2:** urp.ko builds+loads on both
+distinct net-next 7.2-rc1 trees (hp1 series4/`a208f86`, hp3 series5-a/`c9908e2`),
+vermagic OK; RDMA-CM address+route resolution; QP connect/accept; acceptor→
+backend UDS splice + pump; **QP session establishment** (`all 1 QPs
+established`). This is the first proof off emulated `rdma_rxe`.
+
+**Bugs found (first real-HW exposure — blocks Phase 3):**
+1. **Stream flow-control handshake stalls (data-path blocker).** After the QP
+   establishes, opening an app stream sticks: initiator `state=syn-sent
+   tx=16384 rx=0 credits=l506/r0`, acceptor `state=syn-received tx=0 rx=0`.
+   **Remote credits stay `r0`** on both — no credit grant is exchanged, so the
+   SYN-ACK/data never flow (`rx=0`, `rtt_ns=0`, `buffer-alloc-fails=4`).
+   `urp-bench` → `BENCH_FAIL reason=timeout` / backend `peer_closed_early`.
+   The emulated-rxe path masked this. **Phase 3 (matrix) is blocked until this
+   is fixed.**
+2. **UDS bind doesn't unlink a stale socket** → `bind … failed: -98`
+   (EADDRINUSE) on every re-activation; needs manual `rm` of the listen/connect
+   path. (unlink-before-bind fix.)
+3. **Acceptor leaks its QP slot after a dropped session** →
+   `rejecting extra CONNECT_REQUEST (1 >= 1 QPs)` until the acceptor is
+   restarted; a rejected/torn-down session doesn't free the slot.
+4. **`WARNING … ib_free_cq`** on the failed-activate cleanup path
+   (`urp_srq_destroy` ← `urp_rdma_cleanup` ← `urp_endpoint_activate`).
+5. Establishment is order/timing-sensitive: the acceptor connects to its
+   backend UDS *at CM connect-request time* and rejects if absent (contradicts
+   the earlier "session establishes regardless of backend" assumption); and
+   `urp-bench --listen` is one-shot (exits when its session drops).
 
 ---
 
 ## Phase 3: Run the matrix
 
-**Status**: Not started. (PR A2 — results back into this repo.)
+**Status**: **Blocked** by the Phase-2 stream-handshake / credit-grant stall
+(bug 1) — the matrix cannot get `BENCH_OK` until a data stream can flow over an
+established QP. Fix that in `kernel/` first, then run. (PR A2 — results back
+into this repo.)
 
 ### Definition of done
 

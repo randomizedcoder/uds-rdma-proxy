@@ -187,9 +187,13 @@ pkgs.writeShellApplication {
     fi
 
     # ---- Test 5: urp add (acceptor) ----
+    # --mode k0: this test drives the legacy stream_id==0 data path
+    # (urp-test-client echo/throughput/latency), which needs the acceptor's
+    # eager ep->conn backend connect. The default (multistream) connects the
+    # backend per-stream on SYN and would drop stream_id==0 traffic.
 
-    log "Test 5: urp add ''${EP_NAME} --connect-path ... --bind 0.0.0.0:''${PORT}..."
-    if urp add "''${EP_NAME}" --connect-path "''${CONNECT_PATH}" --bind "0.0.0.0:''${PORT}"; then
+    log "Test 5: urp add ''${EP_NAME} --connect-path ... --bind 0.0.0.0:''${PORT} --mode k0..."
+    if urp add "''${EP_NAME}" --connect-path "''${CONNECT_PATH}" --bind "0.0.0.0:''${PORT}" --mode k0; then
         pass "urp add succeeded"
     else
         err "urp add failed"
