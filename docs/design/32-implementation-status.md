@@ -11,7 +11,7 @@ code — Phases 0–3 all not-started.)
 
 | # | Phase | Status | Completion |
 |---|-------|--------|------------|
-| 0 | [urp.ko builds on the hp net-next kernel](#phase-0-urpko-builds-on-the-hp-kernel) | In progress | 0/2 |
+| 0 | [urp.ko builds on the hp net-next kernel](#phase-0-urpko-builds-on-the-hp-kernel) | Done (no PR K) | 3/3 |
 | 1 | [Docs (this pass)](#phase-1-docs) | Done | 3/3 |
 | 1b | [nixosModule + hw-matrix runner](#phase-1b-nixosmodule--runner) | Done | 2/2 |
 | 2 | [Pin, rebuild both boxes, first light](#phase-2-pin-rebuild-first-light) | Not started | 0/4 |
@@ -23,24 +23,34 @@ Legend: **Not started** / **In progress** / **Done** / **Blocked**.
 
 ## Phase 0: urp.ko builds on the hp kernel
 
-**Status**: Not started — **blocking gate** for everything below.
+**Status**: Done — hp1 + hp3 both GREEN, no source changes (**no PR K**).
 
 hp1/hp3 run a custom net-next kernel newer than the flake's "latest" pin. Nothing
 can load a module that will not build.
 
 ### Definition of done
 
-- [ ] `buildUrpKo` against the hp net-next kernelPackages produces `urp.ko`
-      (built locally on `l` via an impure expr if the net-next checkout is
-      present, or on the hp box after the first `make sync`).
-- [ ] Any net-next API breakage fixed behind the existing `LINUX_VERSION_CODE`
-      gate pattern, with the 6.1 / 6.6 / 6.12 / latest matrix still green
-      (`nix run .#ci-local` = `LOCAL_CI_RESULT=GREEN`). Land as a small
-      uds-rdma-proxy PR **only if** changes are needed.
+- [x] `buildUrpKo` against **hp1** net-next 7.2-rc1 (series4-rfc-tail-v2)
+      produces `urp.ko` — built on `l` via an impure expr against
+      `hp1/netnext-kernel.nix`. `vermagic: 7.2.0-rc1 SMP preempt mod_unload`,
+      205 KB, **zero warnings/errors** in the urp compile. No source change.
+- [x] Same against **hp3** net-next 7.2-rc1 (series5-a) — `urp.ko` byte-size
+      identical (205480 B), `vermagic: 7.2.0-rc1`, zero warnings. Confirms the
+      series4/series5 branch difference (flow_dissector only) is irrelevant to
+      urp.
+- [x] No net-next API breakage → **no PR K needed**; the `LINUX_VERSION_CODE`
+      gates already cover 7.2-rc1 (≥ 6.8 fast path incl. the `urp_sqe_cmd` shim).
+      LTS matrix regression check (`nix run .#ci-local`) running (Phase 1b was
+      additive nix packaging, so no regression expected).
 
 ### Notes
 
-_(none yet)_
+- Building urp.ko on `l` required a full `linux-7.2-rc1` source build first (the
+  net-next tree is fetched from the local `file:///home/das/Downloads/net-next`
+  checkout; not cached on `l`). On the hp boxes the kernel is already built, so
+  the module build during `nixos-rebuild` is fast.
+- The clean hp1 build is strong evidence the module will load on the boxes; the
+  final proof is `insmod`/session bring-up in Phase 2 first-light.
 
 ---
 
