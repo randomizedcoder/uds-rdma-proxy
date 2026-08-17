@@ -127,6 +127,12 @@ enum urp_endpoint_attr {
 	URP_ENDPOINT_A_STREAMS		= 13,	/* NLA_NESTED array of urp_stream_attr sets */
 	URP_ENDPOINT_A_STATS		= 14,	/* NLA_NESTED -- urp_stats_attr set */
 
+	/* NLA_U8 -- enum urp_ep_mode; optional config, immutable, default
+	 * multistream. Placed after the read-only children to keep the older
+	 * config attr numbers (1..10) stable.
+	 */
+	URP_ENDPOINT_A_MODE		= 15,
+
 	__URP_ENDPOINT_A_MAX,
 };
 
@@ -179,6 +185,28 @@ enum urp_stats_attr {
 };
 
 #define URP_STATS_A_MAX (__URP_STATS_A_MAX - 1)
+
+/*
+ * Endpoint operating mode (per-endpoint, immutable, set at `urp add`).
+ *
+ * Selects how the acceptor wires its backend UDS:
+ *   MULTISTREAM (default) -- one backend connection per stream, opened lazily
+ *      when that stream's SYN arrives (urp_stream_open_backend). The acceptor
+ *      must NOT eagerly open the legacy single ep->conn connection, which would
+ *      steal a single-accept backend from the real stream.
+ *   K0 -- legacy single-connection mode (stream_id 0). The acceptor eagerly
+ *      opens ep->conn at CONNECT_REQUEST so stream_id==0 traffic has a backend
+ *      ready. Used by test-kmod-k0 / urp-test-client's echo/throughput modes.
+ *
+ * Gated by urp_acceptor_should_eager_connect() (kernel/urp_conn_plan.h).
+ */
+enum urp_ep_mode {
+	URP_EP_MODE_MULTISTREAM	= 0,	/* per-stream backend connect (default) */
+	URP_EP_MODE_K0		= 1,	/* legacy single ep->conn eager connect */
+	__URP_EP_MODE_MAX,
+};
+
+#define URP_EP_MODE_MAX (__URP_EP_MODE_MAX - 1)
 
 /* Endpoint lifecycle states */
 enum urp_endpoint_state {

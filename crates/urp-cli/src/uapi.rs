@@ -65,7 +65,12 @@ pub enum UrpEndpointAttr {
     Qps = 12,
     Streams = 13,
     Stats = 14,
+    Mode = 15,
 }
+
+/// enum urp_ep_mode -- endpoint operating mode (URP_ENDPOINT_A_MODE payload).
+pub const URP_EP_MODE_MULTISTREAM: u8 = 0;
+pub const URP_EP_MODE_K0: u8 = 1;
 
 // --- enum urp_qp_attr ---
 #[repr(u16)]

@@ -7,7 +7,26 @@ use crate::commands::num_qps_parser;
 use crate::error::UrpError;
 use crate::format::encode_sockaddr_in6;
 use crate::netlink::UrpSocket;
-use crate::uapi::{UrpAttr, UrpCmd, UrpEndpointAttr};
+use crate::uapi::{UrpAttr, UrpCmd, UrpEndpointAttr, URP_EP_MODE_K0, URP_EP_MODE_MULTISTREAM};
+
+/// Endpoint operating mode (mirrors kernel `enum urp_ep_mode`).
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Default, clap::ValueEnum)]
+pub enum EpMode {
+    /// Per-stream backend connect (default; correct for real multi-stream traffic).
+    #[default]
+    Multistream,
+    /// Legacy single-connection mode (stream_id 0); acceptor eager-connects the backend.
+    K0,
+}
+
+impl EpMode {
+    fn as_u8(self) -> u8 {
+        match self {
+            EpMode::Multistream => URP_EP_MODE_MULTISTREAM,
+            EpMode::K0 => URP_EP_MODE_K0,
+        }
+    }
+}
 
 #[derive(Args, Debug)]
 pub struct AddArgs {
@@ -49,6 +68,10 @@ pub struct AddArgs {
     /// Specific RDMA device (e.g. mlx5_0). Optional, kernel auto-picks.
     #[arg(long)]
     pub rdma_device: Option<String>,
+
+    /// Endpoint mode: `multistream` (default) or `k0` (legacy single connection).
+    #[arg(long, value_enum, default_value_t = EpMode::Multistream)]
+    pub mode: EpMode,
 }
 
 pub fn build_payload(args: &AddArgs) -> Vec<u8> {
@@ -81,6 +104,12 @@ pub fn build_payload(args: &AddArgs) -> Vec<u8> {
         }
         if let Some(p) = &args.password {
             ep.put_string(UrpEndpointAttr::Password as u16, p);
+        }
+        /* Only send the mode attr when non-default (k0), so a newer CLI still
+         * works against an older module for the common multistream case (the
+         * kernel defaults an absent attr to multistream). */
+        if args.mode != EpMode::Multistream {
+            ep.put_u8(UrpEndpointAttr::Mode as u16, args.mode.as_u8());
         }
     });
     top.into_bytes()

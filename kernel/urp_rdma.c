@@ -14,6 +14,8 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include "urp.h"
+#include "urp_conn_plan.h"
+#include "urp_credit_plan.h"
 #include <linux/inet.h>
 #include <linux/ktime.h>
 /*
@@ -558,13 +560,31 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 		goto repost;
 	case URP_RX_CREDIT: {
 		/*
-		 * CONTROL/CREDIT frame: peer is granting us send credits on the
-		 * QP this completion came in on. No UDS delivery.
+		 * CONTROL/CREDIT frame: peer is granting us send credits. Route
+		 * the grant to the SAME pool the sender drew from, keyed on the
+		 * frame's stream_id (design 32): per-stream traffic
+		 * (stream_id != 0) refills the owning stream->credit; legacy k0
+		 * (stream_id == 0) refills the per-QP pool. Granting every credit
+		 * to the QP pool starved the per-stream TX pump after its initial
+		 * window -- every send then reported a stall and oversent into a
+		 * drained SRQ, triggering an RNR retry storm. See urp_credit_plan.h.
 		 */
-		int qp_idx = urp_qp_index_of(ep, wc->qp);
+		if (dec.flags & URP_CTRL_FLAG_CREDIT) {
+			if (urp_credit_scope_for(stream_id) ==
+			    URP_CREDIT_SCOPE_STREAM) {
+				struct urp_stream *s =
+					urp_stream_lookup(ep, stream_id);
 
-		if (qp_idx >= 0 && (dec.flags & URP_CTRL_FLAG_CREDIT))
-			urp_credit_grant(&ep->qps[qp_idx].credit, dec.credits);
+				if (s)
+					urp_credit_grant(&s->credit, dec.credits);
+			} else {
+				int qp_idx = urp_qp_index_of(ep, wc->qp);
+
+				if (qp_idx >= 0)
+					urp_credit_grant(&ep->qps[qp_idx].credit,
+							 dec.credits);
+			}
+		}
 		goto repost;
 	}
 	case URP_RX_PROBE_PONG: {
@@ -830,7 +850,16 @@ static int urp_cm_accept_one(struct rdma_cm_id *child, struct urp_endpoint *ep,
 	 * the peer slams the connection), the previous pump kthread
 	 * would otherwise survive and racing with the new one.
 	 */
-	if (qp_index == 0 && ep->connect_path[0]) {
+	/*
+	 * k0 (legacy) mode only: open the single ep->conn backend now so
+	 * stream_id==0 traffic has a backend ready. In multistream mode the
+	 * acceptor connects the backend per-stream on SYN
+	 * (urp_stream_open_backend); eager-connecting here would steal the one
+	 * connection a single-accept backend offers, refusing the real stream's
+	 * connect (ECONNREFUSED) and stalling the data path. See urp_conn_plan.h.
+	 */
+	if (qp_index == 0 &&
+	    urp_acceptor_should_eager_connect(ep->mode, ep->connect_path[0] != '\0')) {
 		urp_socket_conn_cleanup(ep);
 		ret = urp_connect_uds(ep, ep->connect_path);
 		if (!ret)

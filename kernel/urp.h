@@ -314,6 +314,11 @@ struct urp_endpoint {
 	u32			num_qps;		/* mutable via SET */
 	u32			buffer_count;		/* mutable via SET */
 	u32			buffer_size;
+	/* enum urp_ep_mode: k0 (legacy single conn) vs multistream (default).
+	 * Gates the acceptor's eager ep->conn backend connect -- see
+	 * urp_conn_plan.h / urp_acceptor_should_eager_connect().
+	 */
+	enum urp_ep_mode	mode;
 	/* raw PSK input from netlink; used at cfg time only */
 	u8			password[URP_PASSWORD_MAX];
 	bool			has_password;

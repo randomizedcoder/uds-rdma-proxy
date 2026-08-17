@@ -9,6 +9,8 @@
 #include <kunit/test.h>
 #include "urp.h"
 #include "urp_cmd.h"
+#include "urp_conn_plan.h"
+#include "urp_credit_plan.h"
 #include "include/uapi/linux/urp_cmd.h"
 
 /* ---- Frame codec tests ---- */
@@ -913,6 +915,107 @@ static void test_cmd_validate_reg(struct kunit *test)
 	}
 }
 
+/*
+ * design 32 hardware bring-up: the acceptor connection plan.
+ *
+ * Regression for the real-HW stall where a multi-stream acceptor eagerly
+ * opened the legacy ep->conn backend at CONNECT_REQUEST, stealing the single
+ * connection the backend accepts so the real stream's per-stream connect was
+ * refused (ECONNREFUSED). urp_acceptor_should_eager_connect() must eager-connect
+ * only in k0 mode with a connect_path set.
+ */
+static void test_acceptor_eager_connect(struct kunit *test)
+{
+	static const struct {
+		enum urp_ep_mode mode;
+		bool have_connect_path;
+		bool expect;
+	} cases[] = {
+		/* multi-stream must NOT eager-connect (the bug) */
+		{ URP_EP_MODE_MULTISTREAM, true,  false },
+		{ URP_EP_MODE_MULTISTREAM, false, false },
+		/* k0 eager-connects only when a connect_path is configured */
+		{ URP_EP_MODE_K0,          true,  true  },
+		{ URP_EP_MODE_K0,          false, false },
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		bool got = urp_acceptor_should_eager_connect(cases[i].mode,
+							     cases[i].have_connect_path);
+
+		KUNIT_EXPECT_EQ_MSG(test, (int)got, (int)cases[i].expect,
+				    "case %d: mode=%d path=%d", i,
+				    (int)cases[i].mode,
+				    (int)cases[i].have_connect_path);
+	}
+}
+
+/*
+ * design 32: credit-grant routing.
+ *
+ * Regression for the real-HW throughput collapse where the multi-stream TX
+ * pump consumes per-stream credit (stream->credit) but incoming CREDIT frames
+ * were granted to the per-QP pool -- so the stream pool drained after its
+ * initial window and never refilled, every send reported a stall, and the
+ * sender oversent into a drained SRQ (RNR retry storm). urp_credit_scope_for()
+ * must route a grant to the SAME pool the sender drew from, keyed on stream_id.
+ *
+ * Uses the real urp_credit primitives so the round-trip (drain -> grant ->
+ * send again) is exercised end to end, not just the routing predicate.
+ */
+static void test_credit_grant_routing(struct kunit *test)
+{
+	static const struct {
+		u32 stream_id;
+		enum urp_credit_scope expect;
+	} scope_cases[] = {
+		{ 0,     URP_CREDIT_SCOPE_QP     }, /* legacy k0 */
+		{ 1,     URP_CREDIT_SCOPE_STREAM }, /* first multi-stream id */
+		{ 3,     URP_CREDIT_SCOPE_STREAM },
+		{ 65535, URP_CREDIT_SCOPE_STREAM },
+	};
+	const u16 w = 8; /* initial window */
+	struct urp_credit qp, strm;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(scope_cases); i++)
+		KUNIT_EXPECT_EQ_MSG(test,
+			(int)urp_credit_scope_for(scope_cases[i].stream_id),
+			(int)scope_cases[i].expect,
+			"scope for stream_id=%u", scope_cases[i].stream_id);
+
+	/* Multi-stream (stream_id 1): drain the stream pool, then a grant
+	 * routed by scope must land on the stream pool so it can send again.
+	 */
+	urp_credit_init(&qp, w);
+	urp_credit_init(&strm, w);
+	for (i = 0; i < w; i++)
+		KUNIT_EXPECT_EQ(test, urp_credit_consume(&strm), 0);
+	KUNIT_EXPECT_EQ(test, urp_credit_consume(&strm), -EAGAIN);
+
+	/* Route a grant for stream 1 the way urp_recv_done does. */
+	KUNIT_ASSERT_EQ(test, (int)urp_credit_scope_for(1),
+			(int)URP_CREDIT_SCOPE_STREAM);
+	urp_credit_grant(&strm, w);
+	KUNIT_EXPECT_EQ_MSG(test, urp_credit_consume(&strm), 0,
+			    "stream pool must refill from its own grant");
+	/* The QP pool was never touched by the stream's grant. */
+	KUNIT_EXPECT_EQ(test, qp.send_credits, w);
+
+	/* Legacy k0 (stream_id 0): the grant routes to the QP pool. */
+	urp_credit_init(&qp, w);
+	urp_credit_init(&strm, w);
+	for (i = 0; i < w; i++)
+		KUNIT_EXPECT_EQ(test, urp_credit_consume(&qp), 0);
+	KUNIT_ASSERT_EQ(test, (int)urp_credit_scope_for(0),
+			(int)URP_CREDIT_SCOPE_QP);
+	urp_credit_grant(&qp, w);
+	KUNIT_EXPECT_EQ_MSG(test, urp_credit_consume(&qp), 0,
+			    "k0 QP pool must refill from its grant");
+	KUNIT_EXPECT_EQ(test, strm.send_credits, w);
+}
+
 static struct kunit_case urp_test_cases[] = {
 	KUNIT_CASE(test_frame_roundtrip_data),
 	KUNIT_CASE(test_frame_roundtrip_control),
@@ -952,6 +1055,10 @@ static struct kunit_case urp_test_cases[] = {
 	KUNIT_CASE(test_stream_next_state),
 	/* design 28 E1: RX frame classifier */
 	KUNIT_CASE(test_classify_frame),
+	/* design 32: acceptor connection plan (eager-connect gate) */
+	KUNIT_CASE(test_acceptor_eager_connect),
+	/* design 32: credit-grant routing (per-stream vs per-QP pool) */
+	KUNIT_CASE(test_credit_grant_routing),
 	KUNIT_CASE(test_resolve_num_bufs),
 	KUNIT_CASE(test_resolve_buf_size),
 	KUNIT_CASE(test_ep_max_payload),
