@@ -15,7 +15,7 @@ code — Phases 0–3 all not-started.)
 | 1 | [Docs (this pass)](#phase-1-docs) | Done | 3/3 |
 | 1b | [nixosModule + hw-matrix runner](#phase-1b-nixosmodule--runner) | Done | 2/2 |
 | 2 | [Pin, rebuild both boxes, first light](#phase-2-pin-rebuild-first-light) | Done — QP established, data path stalls (bug) | 5/5 |
-| 3 | [Run the matrix, capture results](#phase-3-run-the-matrix) | Blocked (Phase-2 credit-grant stall) | 0/3 |
+| 3 | [Run the matrix, capture results](#phase-3-run-the-matrix) | Matrix done — 128/128 BENCH_OK; extra probes pending | 1/3 |
 
 Legend: **Not started** / **In progress** / **Done** / **Blocked**.
 
@@ -208,16 +208,19 @@ established`). This is the first proof off emulated `rdma_rxe`.
 
 ## Phase 3: Run the matrix
 
-**Status**: **Blocked** by the Phase-2 stream-handshake / credit-grant stall
-(bug 1) — the matrix cannot get `BENCH_OK` until a data stream can flow over an
-established QP. Fix that in `kernel/` first, then run. (PR A2 — results back
-into this repo.)
+**Status**: **Matrix done** (2026-08-17) — the Phase-2 credit-grant stall was
+fixed (commit `bd133dd`) and the full sweep now passes **128/128 `BENCH_OK`,
+`verify=full`, 0 skips**. Extra single-purpose probes (`urp-test-client`,
+`urp-fast-poc`) not yet run.
 
 ### Definition of done
 
-- [ ] From `l`: `nix run .#urp-hw-matrix -- hp1 hp3 10.10.2.1` — all four C/Rust
-      cells `BENCH_OK verify=full`, populated delta table. C↔Rust + Rust↔C are
-      the live framing differential.
+- [x] From `l`: `nix run .#urp-hw-matrix -- hp1 hp3 10.10.2.1` — all four C/Rust
+      cells `BENCH_OK verify=full`, populated delta table (C↔Rust + Rust↔C are the
+      live framing differential). **128/128 cells green** over `urp.ko` `5bfcd37`
+      on kernel 7.1.8. Required fixing three latent `urp-hw-matrix` runner bugs
+      (root ssh, self-killing `pkill`, listener/generator duration) + the table
+      renderer.
 - [ ] Extra phases: `urp-test-client 10.10.2.1 <port> {echo,throughput,latency,
       reorder,bigframe}` against a dedicated acceptor; `urp-fast-poc /dev/urp
       pair_acceptor` → `URP_FAST_POC_OK`.
@@ -228,11 +231,20 @@ into this repo.)
 
 ### Results
 
-_(pending — mirrors §32.12 of the design doc)_
+Full results, setup, methodology and the 128-cell interop table live in
+**[32-performance-results.md](32-performance-results.md)**. Summary (C↔C,
+`verify=full`, RTT = round trip, single QP, PTP offset −36 ns):
 
-| cell | mode | msg_size | mbps | msgs/s | RTT p50 | RTT p99 | 1-way p50 | verify | status |
-|------|------|----------|------|--------|---------|---------|-----------|--------|--------|
-| _(pending Phase 3)_ | | | | | | | | | |
+| cell | mode | msg_size | payload MB/s | msgs/s | RTT p50 | RTT p99 |
+|------|------|----------|------|--------|---------|---------|
+| lowest latency | blocking | 24 | — | 21545 | **24.5 µs** | 29.4 µs |
+| small pipelined | uring-rw | 1024 | ~103 | 99934 | 82.2 µs | 114.5 µs |
+| peak msg rate | uring-bufring | 24 | — | **242325** | 38.7 µs | 64.7 µs |
+| peak throughput | uring-rw | 4076 | **~161** | 39633 | 205.0 µs | 321.5 µs |
+| large frame | blocking | 65516 | ~164 | 2500 | 3.39 ms | 4.22 ms |
+
+**128/128 `BENCH_OK`, 0 fail, 0 skip** across c↔c / c↔rust / rust↔c / rust↔rust ×
+{blocking, uring-rw, uring-fixed, uring-bufring} × {24, 1024, 4076, 65516} × {1, 16}.
 
 ### Notes
 
