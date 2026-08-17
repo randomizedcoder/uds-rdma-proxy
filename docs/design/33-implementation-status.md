@@ -2,8 +2,10 @@
 
 Progress tracker for [33. Initiator Connection Bring-up & Recovery](33-initiator-connection-bringup.md).
 
-**Last updated**: 2026-08-17 (Phase 0 bug fixes implemented + build-verified across
-the 6.1/6.6/6.12/7.1 kernel matrix; Phases 1–3 not started.)
+**Last updated**: 2026-08-17 (Phase 0 bug fixes implemented, build-verified across
+the 6.1/6.6/6.12/7.1 kernel matrix, and **hardware-verified on hp1/hp3** — recovery
+now self-heals with a plain initiator restart, no manual steps; Phases 1–3 not
+started.)
 
 ---
 
@@ -11,7 +13,7 @@ the 6.1/6.6/6.12/7.1 kernel matrix; Phases 1–3 not started.)
 
 | # | Phase | Status | Completion |
 |---|-------|--------|------------|
-| 0 | [Compounding recovery bugs](#phase-0-compounding-recovery-bugs) | In progress — code done, hw verify pending | 3/4 |
+| 0 | [Compounding recovery bugs](#phase-0-compounding-recovery-bugs) | Done — code + kernel matrix + hp1/hp3 hw verified | 4/4 |
 | 1 | [Bounded kernel connect-retry + backoff](#phase-1-bounded-kernel-connect-retry--backoff) | Not started | 0/4 |
 | 2 | [Lazy connect on first UDS accept](#phase-2-lazy-connect-on-first-uds-accept) | Not started | 0/4 |
 | 3 | [Userland gRPC control plane](#phase-3-userland-grpc-control-plane) | Not started | 0/5 |
@@ -28,8 +30,9 @@ Phases 1–3 follow.
 
 ## Phase 0: Compounding recovery bugs
 
-**Status**: In progress — both fixes implemented and build-verified across the
-kernel matrix; the hardware reboot-recovery verification on hp1/hp3 is pending.
+**Status**: Done — both fixes implemented, build-verified across the kernel
+matrix, and hardware-verified on hp1/hp3 (recovery self-heals with a plain
+initiator restart; no manual `rm /run/urp.sock`, no acceptor restart).
 
 The design-32 simultaneous-reboot race left the session permanently down until a
 *coordinated* manual restart, because two secondary bugs block automatic
@@ -54,16 +57,25 @@ retry/rendezvous scheme (design [§33.7](33-initiator-connection-bringup.md)).
 - [x] **TDD.** KUnit truth-table tests `test_acceptor_should_release_slot` +
       `test_should_unlink_listen_path` in `kernel/urp_test.c`; standalone
       RED→GREEN predicate harness green against the shipped `urp_conn_plan.h`.
-- [ ] **Hardware verify** on hp1/hp3: the design-32 reboot sequence self-heals —
-      initiator re-`urp add` succeeds without `rm /run/urp.sock`; the acceptor
-      accepts a fresh session after a dropped one without a restart.
+- [x] **Hardware verify** on hp1/hp3: the design-32 reboot sequence self-heals —
+      initiator re-`urp add`/restart succeeds without `rm /run/urp.sock`; the
+      acceptor accepts a fresh session after a dropped one without a restart.
 
 ### Verification
 
 - [x] `urp.ko` builds clean across **6.1.180 / 6.6.148 / 6.12.101 / 7.1.6**
       (`nix build .#checks…urp-ko-{6_1,6_6,6_12} .#checks…kernel-module-build`).
 - [x] `nix run .#ci-local` = GREEN (9/9 builds + 4/4 fuzz-smoke).
-- [ ] hp1/hp3 reboot-recovery (see the pending DoD item above).
+- [x] hp1/hp3 reboot-recovery (deployed `5bfcd37`, both boxes on 7.1.8). A
+      simultaneous reboot reproduced the boot race (hp3 initiator connects at
+      ~22.7 s → `rejected` before hp1 listens at ~23.1 s). Recovery is then
+      unassisted: a single `systemctl restart urp-endpoint-pair_initiator` on hp3
+      logs `removed stale socket /run/urp.sock` (Bug 2 — was `-98 EADDRINUSE`),
+      re-binds, and reaches `all 1 QPs established`; hp1 shows `CM event:
+      established` with **no** `rejecting extra CONNECT_REQUEST` (Bug 1). Held
+      across 3 establish→disconnect→re-establish cycles with no acceptor slot
+      leak. (The boot race itself still needs a restart; Phase 1 retry removes
+      that.)
 
 ### Notes
 
