@@ -86,6 +86,9 @@
         };
         urpBenchLocal = import ./nix/urp-bench-local.nix { inherit pkgs; };
         urpBenchMatrix = import ./nix/urp-bench-matrix.nix { inherit pkgs; };
+        # Real-hardware client matrix (design 32): ssh-driven C/Rust interop
+        # sweep over a standing RoCEv2 session. `nix run .#urp-hw-matrix`.
+        urpHwMatrix = import ./nix/urp-hw-matrix.nix { inherit pkgs; };
         urpFastPoc = import ./nix/urp-fast-poc.nix { inherit pkgs; };
         ciLocal = import ./nix/ci-local.nix {
           inherit pkgs fuzz;
@@ -206,6 +209,9 @@
           urp-bench-rs = urpBenchRs;
           urp-bench-local = urpBenchLocal;
           urp-bench-matrix = urpBenchMatrix;
+          # Real-hardware interop matrix over RoCEv2 (design 32; needs the boxes):
+          #   nix run .#urp-hw-matrix -- <acceptor> <initiator> <acceptor-ip>
+          urp-hw-matrix = urpHwMatrix;
           urp-fast-poc = urpFastPoc;
           # Local reproduction of the every-push CI: `nix run .#ci-local`
           # (for hosts without a GitHub runner). Builds the 9 nix-checks
@@ -258,5 +264,12 @@
           inherit (nixChecks) buildUrpKo;
         };
       }
-    );
+    ) // {
+      # System-agnostic outputs live OUTSIDE eachDefaultSystem. The reusable
+      # NixOS module (design 32) resolves the per-system buildUrpKo / urp-cli
+      # through `self`, so a host that pins this flake gets urp.ko built against
+      # its own kernel plus declarative endpoints.
+      nixosModules.urp = import ./nix/nixos-module.nix { inherit self; };
+      nixosModules.default = self.nixosModules.urp;
+    };
 }
