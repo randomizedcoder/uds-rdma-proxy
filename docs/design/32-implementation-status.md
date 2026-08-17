@@ -40,8 +40,8 @@ can load a module that will not build.
       urp.
 - [x] No net-next API breakage → **no PR K needed**; the `LINUX_VERSION_CODE`
       gates already cover 7.2-rc1 (≥ 6.8 fast path incl. the `urp_sqe_cmd` shim).
-      LTS matrix regression check (`nix run .#ci-local`) running (Phase 1b was
-      additive nix packaging, so no regression expected).
+      `nix run .#ci-local` = **`LOCAL_CI_RESULT=GREEN`** (9/9 builds + 4/4
+      fuzz-smoke) — PR A regresses nothing.
 
 ### Notes
 
@@ -109,9 +109,8 @@ nixosModule in the flake; defer Seastar; ssh-driven runner in the repo.
 - [x] `nix build .#urp-hw-matrix` succeeds (shellcheck clean).
 - [x] Module evaluates in a throwaway `nixosSystem` (option types + submodules
       OK: acceptor/initiator, defaults `[ib_core rdma_cm mlx5_ib]`).
-- [ ] `nix run .#ci-local` GREEN — deferred until the Phase-0 kernel build frees
-      the machine; Phase 1b is additive nix packaging (no kernel/crate change),
-      so CI is logically unaffected.
+- [x] `nix run .#ci-local` = `LOCAL_CI_RESULT=GREEN` (9/9 builds + 4/4
+      fuzz-smoke) — additive nix packaging regresses nothing.
 
 ### Notes
 
