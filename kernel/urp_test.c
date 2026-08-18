@@ -12,6 +12,7 @@
 #include "urp_conn_plan.h"
 #include "urp_credit_plan.h"
 #include "urp_retry_plan.h"
+#include "urp_lazy_plan.h"
 #include "include/uapi/linux/urp_cmd.h"
 
 /* ---- Frame codec tests ---- */
@@ -1227,6 +1228,36 @@ static void test_silent_drop_should_reconnect(struct kunit *test)
 	}
 }
 
+/*
+ * design 33 Phase 2: the first UDS client connect fires a lifetime one-shot
+ * lazy RDMA dial -- initiator only (the acceptor waits for CONNECT_REQUEST),
+ * and only on the accept that flips the connect_started latch 0->1.
+ */
+static void test_should_start_lazy_connect(struct kunit *test)
+{
+	static const struct {
+		bool is_initiator;
+		bool already_started;
+		bool expect;
+	} cases[] = {
+		{ true,  false, true  }, /* initiator, first accept: dial */
+		{ true,  true,  false }, /* initiator, latch set: no re-dial */
+		{ false, false, false }, /* acceptor never lazy-dials */
+		{ false, true,  false },
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		bool got = urp_should_start_lazy_connect(cases[i].is_initiator,
+							 cases[i].already_started);
+
+		KUNIT_EXPECT_EQ_MSG(test, (int)got, (int)cases[i].expect,
+				    "case %d: is_initiator=%d already_started=%d",
+				    i, (int)cases[i].is_initiator,
+				    (int)cases[i].already_started);
+	}
+}
+
 static struct kunit_case urp_test_cases[] = {
 	KUNIT_CASE(test_frame_roundtrip_data),
 	KUNIT_CASE(test_frame_roundtrip_control),
@@ -1279,6 +1310,8 @@ static struct kunit_case urp_test_cases[] = {
 	KUNIT_CASE(test_connect_backoff_ms),
 	KUNIT_CASE(test_should_emit_probes),
 	KUNIT_CASE(test_silent_drop_should_reconnect),
+	/* design 33 Phase 2: lazy-connect on first UDS accept */
+	KUNIT_CASE(test_should_start_lazy_connect),
 	KUNIT_CASE(test_resolve_num_bufs),
 	KUNIT_CASE(test_resolve_buf_size),
 	KUNIT_CASE(test_ep_max_payload),

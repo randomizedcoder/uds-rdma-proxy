@@ -188,6 +188,13 @@ int urp_endpoint_create(struct urp_endpoint *cfg, struct urp_endpoint **out)
 	ep->state        = URP_STATE_CREATING;
 	mutex_init(&ep->lock);
 	init_completion(&ep->cm_done);
+	/*
+	 * design 33 Phase 2: lazy-connect latch + terminal flag. Set before the
+	 * rhashtable publish below so a concurrent dumpit/drain walker never
+	 * observes an uninitialized latch.
+	 */
+	atomic_set(&ep->connect_started, 0);
+	ep->connect_failed = false;
 	/* One reference for the table entry (dropped by urp_endpoint_remove). */
 	kref_init(&ep->refcount);
 
