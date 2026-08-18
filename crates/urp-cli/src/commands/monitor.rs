@@ -1,8 +1,8 @@
 use clap::Args;
 
-use crate::error::UrpError;
-use crate::format::Endpoint;
-use crate::netlink::UrpSocket;
+use urp_netlink::error::UrpError;
+use urp_netlink::format::Endpoint;
+use urp_netlink::netlink::UrpSocket;
 
 #[derive(Args, Debug)]
 pub struct MonitorArgs {}

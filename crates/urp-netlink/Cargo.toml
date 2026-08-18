@@ -1,0 +1,16 @@
+[package]
+name = "urp-netlink"
+version = "0.1.0"
+edition = "2021"
+description = "Generic-netlink client for the urp (UDS-RDMA Proxy) kernel module, shared by urp-cli and urp-control"
+license = "GPL-2.0-or-later"
+
+[lib]
+name = "urp_netlink"
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

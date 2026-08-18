@@ -1,10 +1,10 @@
 use clap::Args;
 
-use crate::attr::AttrBuf;
+use urp_netlink::attr::AttrBuf;
 use crate::commands::num_qps_parser;
-use crate::error::UrpError;
-use crate::netlink::UrpSocket;
-use crate::uapi::{UrpAttr, UrpCmd, UrpEndpointAttr};
+use urp_netlink::error::UrpError;
+use urp_netlink::netlink::UrpSocket;
+use urp_netlink::uapi::{UrpAttr, UrpCmd, UrpEndpointAttr};
 
 #[derive(Args, Debug)]
 pub struct SetArgs {

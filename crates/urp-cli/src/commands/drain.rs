@@ -1,9 +1,9 @@
 use clap::Args;
 
-use crate::attr::AttrBuf;
-use crate::error::UrpError;
-use crate::netlink::UrpSocket;
-use crate::uapi::{UrpAttr, UrpCmd, UrpEndpointAttr, UrpEndpointState};
+use urp_netlink::attr::AttrBuf;
+use urp_netlink::error::UrpError;
+use urp_netlink::netlink::UrpSocket;
+use urp_netlink::uapi::{UrpAttr, UrpCmd, UrpEndpointAttr, UrpEndpointState};
 
 #[derive(Args, Debug)]
 pub struct DrainArgs {

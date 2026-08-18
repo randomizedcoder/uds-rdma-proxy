@@ -192,6 +192,7 @@
         checks = {
           inherit (nixChecks)
             protocol-tests urp-bench-units urp-bench-rs-tests
+            urp-netlink-tests
             urp-fast-validate-units
             kernel-module-build
             urp-ko-6_1 urp-ko-6_6 urp-ko-6_12;

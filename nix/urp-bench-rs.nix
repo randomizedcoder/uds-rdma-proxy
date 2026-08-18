@@ -17,6 +17,7 @@ let
         baseName == "uds-rdma-protocol-ffi" ||
         baseName == "urp-bench" ||
         baseName == "urp-cli" ||
+        baseName == "urp-netlink" ||
         baseName == "src" ||
         baseName == "commands"
       )) ||
