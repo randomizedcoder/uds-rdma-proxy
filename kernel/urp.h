@@ -227,9 +227,39 @@ struct urp_qp {
 	 * rdma_connect from a context where it can acquire the mutex.
 	 */
 	struct work_struct	connect_work;
+
+	/*
+	 * Design 33 Phase 1: bounded initiator connect-retry. connect_attempts
+	 * counts re-dials since the last successful ESTABLISHED (reset to 0
+	 * there); connect_retry_work re-dials from scratch after a capped
+	 * exponential backoff. Deferred to a work item because the re-dial
+	 * destroys and rebuilds this QP's cm_id, which must NOT happen from
+	 * inside the cm_id's own event handler. Unused on the acceptor.
+	 */
+	unsigned int		connect_attempts;
+	struct delayed_work	connect_retry_work;
 };
 
 #define URP_QP_MISS_THRESHOLD	3
+
+/*
+ * Design 33 Phase 1: initiator connect-retry tunables. These are the compiled
+ * defaults; the live values are the urp_connect_* globals below, writable at
+ * runtime via /proc/sys/urp/connect_* (see urp_sysctl.c). max_attempts=0
+ * disables retry. Backoff is capped exponential (base << attempt, clamped to
+ * ceil) -- ~10 min total window at the defaults.
+ */
+#define URP_CONNECT_MAX_ATTEMPTS_DEFAULT	300
+#define URP_CONNECT_BACKOFF_BASE_MS_DEFAULT	100
+#define URP_CONNECT_BACKOFF_CEIL_MS_DEFAULT	2000
+
+extern unsigned int urp_connect_max_attempts;
+extern unsigned int urp_connect_backoff_base_ms;
+extern unsigned int urp_connect_backoff_ceil_ms;
+
+/* urp_sysctl.c -- /proc/sys/urp/ runtime tunables (design 33 Phase 1). */
+int  urp_sysctl_register(void);
+void urp_sysctl_unregister(void);
 
 /* Phase 3b: PSK auth (design 17 / Tier 0.5). */
 #define URP_PSK_HASH_LEN	32	/* SHA-256 digest size */
@@ -429,6 +459,13 @@ extern struct rhashtable	urp_endpoints;
 extern bool			urp_endpoints_inited;
 
 /* urp_endpoint.c -- lifecycle */
+/*
+ * Design 33 Phase 1: decode the endpoint's stored IPv4-mapped sockaddr_in6
+ * into the (dotted-quad string, port) tuple urp_rdma re-dials with. Shared by
+ * urp_endpoint_activate and the connect-retry work item.
+ */
+int  urp_endpoint_extract_v4(const struct sockaddr_in6 *addr, char *out_ip,
+			     size_t out_len, int *out_port);
 int  urp_endpoint_table_init(void);
 void urp_endpoint_table_destroy(void);
 /*
@@ -464,6 +501,10 @@ int  urp_stream_connect_uds(struct urp_stream *stream, const char *path);
 /* urp_rdma.c */
 /* Phase 5 Step 3: deferred rdma_connect (see urp_rdma.c). */
 void urp_connect_work_fn(struct work_struct *w);
+/* Design 33 Phase 1: deferred initiator connect-retry (backoff re-dial). */
+void urp_connect_retry_work_fn(struct work_struct *w);
+/* Design 33 Phase 1.5: probe-detected silent-drop -> connect-retry (no CM event). */
+void urp_connect_retry_on_silent_drop(struct urp_endpoint *ep, struct urp_qp *qp);
 
 int  urp_rdma_init(struct urp_endpoint *ep, const char *peer_addr,
 		   int peer_port, int bind_port, bool is_initiator);

@@ -11,6 +11,7 @@
 #include "urp_cmd.h"
 #include "urp_conn_plan.h"
 #include "urp_credit_plan.h"
+#include "urp_retry_plan.h"
 #include "include/uapi/linux/urp_cmd.h"
 
 /* ---- Frame codec tests ---- */
@@ -1086,6 +1087,146 @@ static void test_should_unlink_listen_path(struct kunit *test)
 	}
 }
 
+/*
+ * design 33 Phase 1: initiator connect-retry eligibility.
+ *
+ * Only the initiator dials, so the acceptor never retries. The initiator
+ * retries while under the attempt budget; max_attempts == 0 is the runtime
+ * "off switch" (connect_max_attempts sysctl). Same predicate covers first
+ * bring-up and reconnect-on-drop (counter resets to 0 on ESTABLISHED).
+ */
+static void test_should_retry_connect(struct kunit *test)
+{
+	static const struct {
+		bool is_initiator;
+		unsigned int attempts;
+		unsigned int max_attempts;
+		bool expect;
+	} cases[] = {
+		{ false, 0,   300, false }, /* acceptor never retries */
+		{ false, 5,   300, false },
+		{ true,  0,   300, true  }, /* initiator, budget remaining */
+		{ true,  299, 300, true  }, /* last allowed attempt */
+		{ true,  300, 300, false }, /* budget exhausted */
+		{ true,  301, 300, false },
+		{ true,  0,   0,   false }, /* max_attempts=0 disables retry */
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		bool got = urp_should_retry_connect(cases[i].is_initiator,
+						    cases[i].attempts,
+						    cases[i].max_attempts);
+
+		KUNIT_EXPECT_EQ_MSG(test, (int)got, (int)cases[i].expect,
+				    "case %d: is_initiator=%d attempts=%u max=%u",
+				    i, (int)cases[i].is_initiator,
+				    cases[i].attempts, cases[i].max_attempts);
+	}
+}
+
+/*
+ * design 33 Phase 1: capped-exponential connect backoff (base << attempt,
+ * clamped to ceil). base=100 ceil=2000: 100,200,400,800,1600, then saturate
+ * at 2000. Must never invoke shift UB / overflow at large attempts, and a
+ * mis-ordered (ceil < base) pair degrades to constant ceil.
+ */
+static void test_connect_backoff_ms(struct kunit *test)
+{
+	static const struct {
+		unsigned int attempt;
+		unsigned int base_ms;
+		unsigned int ceil_ms;
+		unsigned int expect;
+	} cases[] = {
+		{ 0,       100,  2000, 100  },
+		{ 1,       100,  2000, 200  },
+		{ 2,       100,  2000, 400  },
+		{ 3,       100,  2000, 800  },
+		{ 4,       100,  2000, 1600 },
+		{ 5,       100,  2000, 2000 }, /* clamps */
+		{ 50,      100,  2000, 2000 },
+		{ 1000000, 100,  2000, 2000 }, /* no shift UB / overflow */
+		{ 0,       1000, 500,  500  }, /* ceil < base -> constant ceil */
+		{ 3,       1000, 500,  500  },
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		unsigned int got = urp_connect_backoff_ms(cases[i].attempt,
+							  cases[i].base_ms,
+							  cases[i].ceil_ms);
+
+		KUNIT_EXPECT_EQ_MSG(test, got, cases[i].expect,
+				    "case %d: attempt=%u base=%u ceil=%u", i,
+				    cases[i].attempt, cases[i].base_ms,
+				    cases[i].ceil_ms);
+	}
+}
+
+/*
+ * design 33 Phase 1.5: liveness probing runs on all multi-QP endpoints (health
+ * / load balancing) and additionally on a single-QP *initiator* (silent-drop
+ * keepalive). A single-QP acceptor stays quiet.
+ */
+static void test_should_emit_probes(struct kunit *test)
+{
+	static const struct {
+		bool is_initiator;
+		unsigned int num_qps;
+		bool expect;
+	} cases[] = {
+		{ false, 1, false }, /* single-QP acceptor: quiet baseline */
+		{ true,  1, true  }, /* single-QP initiator: silent-drop keepalive */
+		{ false, 4, true  }, /* multi-QP: health/LB probing both roles */
+		{ true,  4, true  },
+		{ false, 0, false }, /* no QPs: nothing to probe */
+		{ true,  0, true  }, /* initiator predicate keys on role, not count */
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		bool got = urp_should_emit_probes(cases[i].is_initiator,
+						  cases[i].num_qps);
+
+		KUNIT_EXPECT_EQ_MSG(test, (int)got, (int)cases[i].expect,
+				    "case %d: is_initiator=%d num_qps=%u",
+				    i, (int)cases[i].is_initiator,
+				    cases[i].num_qps);
+	}
+}
+
+/*
+ * design 33 Phase 1.5: a probe-detected silent drop converts to a reconnect
+ * only on the initiator, and only for a QP that actually carried a session
+ * (was_established) -- a never-established bring-up failure is the CM-event
+ * retry path's job, not the liveness path's.
+ */
+static void test_silent_drop_should_reconnect(struct kunit *test)
+{
+	static const struct {
+		bool is_initiator;
+		bool was_established;
+		bool expect;
+	} cases[] = {
+		{ true,  true,  true  }, /* initiator, live session dropped */
+		{ true,  false, false }, /* initiator, never established */
+		{ false, true,  false }, /* acceptor never reconnects */
+		{ false, false, false },
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		bool got = urp_silent_drop_should_reconnect(cases[i].is_initiator,
+							    cases[i].was_established);
+
+		KUNIT_EXPECT_EQ_MSG(test, (int)got, (int)cases[i].expect,
+				    "case %d: is_initiator=%d was_established=%d",
+				    i, (int)cases[i].is_initiator,
+				    (int)cases[i].was_established);
+	}
+}
+
 static struct kunit_case urp_test_cases[] = {
 	KUNIT_CASE(test_frame_roundtrip_data),
 	KUNIT_CASE(test_frame_roundtrip_control),
@@ -1133,6 +1274,11 @@ static struct kunit_case urp_test_cases[] = {
 	KUNIT_CASE(test_acceptor_should_release_slot),
 	/* design 33 Bug 2: stale UDS listen-socket unlink decision */
 	KUNIT_CASE(test_should_unlink_listen_path),
+	/* design 33 Phase 1: initiator connect-retry eligibility + backoff */
+	KUNIT_CASE(test_should_retry_connect),
+	KUNIT_CASE(test_connect_backoff_ms),
+	KUNIT_CASE(test_should_emit_probes),
+	KUNIT_CASE(test_silent_drop_should_reconnect),
 	KUNIT_CASE(test_resolve_num_bufs),
 	KUNIT_CASE(test_resolve_buf_size),
 	KUNIT_CASE(test_ep_max_payload),

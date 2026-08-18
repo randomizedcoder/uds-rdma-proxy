@@ -16,6 +16,7 @@
 #include "urp.h"
 #include "urp_conn_plan.h"
 #include "urp_credit_plan.h"
+#include "urp_retry_plan.h"
 #include <linux/inet.h>
 #include <linux/ktime.h>
 /*
@@ -757,6 +758,25 @@ static void urp_cm_id_destroy(struct rdma_cm_id **idp)
 }
 
 /*
+ * Drain and destroy one QP's verbs QP + cm_id (and the cm_ctx hanging off it),
+ * leaving the slot ready for a fresh cm_id. Idempotent: safe when the slot is
+ * already clear. MUST NOT be called from inside that cm_id's own event handler
+ * (rdma_destroy_id would deadlock/UAF) -- callers are the acceptor's reuse path
+ * and the initiator's connect-retry work item, both outside the CM callback.
+ */
+static void urp_qp_hard_teardown(struct urp_endpoint *ep, u32 i)
+{
+	if (ep->qps[i].qp) {
+		ib_drain_qp(ep->qps[i].qp);
+		rdma_destroy_qp(ep->qps[i].cm_id);
+		ep->qps[i].qp = NULL;
+	}
+	if (ep->qps[i].cm_id)
+		urp_cm_id_destroy(&ep->qps[i].cm_id);
+	ep->qps[i].established = false;
+}
+
+/*
  * Acceptor: handle one CONNECT_REQUEST event on the listener cm_id.
  *
  * For each peer-side QP, the peer initiates one CM connection which
@@ -812,15 +832,8 @@ static int urp_cm_accept_one(struct rdma_cm_id *child, struct urp_endpoint *ep,
 	 * marks the slot free; we defer destruction until reuse or drain to
 	 * avoid destroying a cm_id from inside its own event handler.
 	 */
-	if (ep->qps[qp_index].cm_id) {
-		if (ep->qps[qp_index].qp) {
-			ib_drain_qp(ep->qps[qp_index].qp);
-			rdma_destroy_qp(ep->qps[qp_index].cm_id);
-			ep->qps[qp_index].qp = NULL;
-		}
-		urp_cm_id_destroy(&ep->qps[qp_index].cm_id);
-		ep->qps[qp_index].established = false;
-	}
+	if (ep->qps[qp_index].cm_id)
+		urp_qp_hard_teardown(ep, qp_index);
 
 	child_ctx = kzalloc(sizeof(*child_ctx), GFP_KERNEL);
 	if (!child_ctx) {
@@ -974,12 +987,27 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 	case RDMA_CM_EVENT_ESTABLISHED:
 		if (ep->qps && ctx->qp_index < ep->num_qps) {
 			ep->qps[ctx->qp_index].established = true;
+			/* Design 33 Phase 1: a fresh establish clears the
+			 * connect-retry budget, so a later disconnect gets its
+			 * own full backoff window.
+			 */
+			ep->qps[ctx->qp_index].connect_attempts = 0;
 			/* Step 5: skip the probe-driven QUALIFYING grace
 			 * period for now and go straight to ACTIVE. The
 			 * miss-counter in probe_work_fn still demotes to
 			 * DRAINING on >= URP_QP_MISS_THRESHOLD misses.
 			 */
 			ep->qps[ctx->qp_index].health = URP_QP_STATE_ACTIVE;
+			/*
+			 * Design 33 Phase 1.5: clear the probe liveness counters
+			 * so a QP that was demoted by a silent drop (and is now
+			 * freshly re-established) starts from a clean slate -- a
+			 * stale last_ping_ns / miss count would otherwise trip the
+			 * silent-drop reconnect again on the very next probe tick.
+			 */
+			ep->qps[ctx->qp_index].last_ping_ns = 0;
+			ep->qps[ctx->qp_index].consecutive_misses = 0;
+			ep->qps[ctx->qp_index].consecutive_pongs = 0;
 			if ((u32)atomic_inc_return(&ep->qps_connected) ==
 			    ep->num_qps) {
 				ep->connected = true;
@@ -997,9 +1025,24 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 	case RDMA_CM_EVENT_UNREACHABLE:
 	case RDMA_CM_EVENT_REJECTED:
 		if (ep->qps && ctx->qp_index < ep->num_qps) {
-			if (ep->qps[ctx->qp_index].established) {
+			bool was_established = ep->qps[ctx->qp_index].established;
+
+			if (was_established) {
 				ep->qps[ctx->qp_index].established = false;
 				atomic_dec(&ep->qps_connected);
+				/*
+				 * Design 33 Phase 1: a live session dropped.
+				 * Re-arm the accept-thread waiter so a
+				 * reconnecting client blocks on cm_done again
+				 * (instead of racing onto a dead QP), and clear
+				 * any stale completion count from the previous
+				 * establish.
+				 */
+				if ((u32)atomic_read(&ep->qps_connected) <
+					    ep->num_qps && ep->connected) {
+					ep->connected = false;
+					reinit_completion(&ep->cm_done);
+				}
 			}
 			/*
 			 * Acceptor: release the slot so the next CONNECT_REQUEST
@@ -1019,16 +1062,58 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 				ep->qps[ctx->qp_index].accept_slot_held = false;
 				atomic_dec(&ep->qps_accepted);
 			}
+
+			/*
+			 * Design 33 Phase 1: the initiator re-dials with capped
+			 * exponential backoff instead of giving up -- healing
+			 * both the boot race (never established: the initiator's
+			 * connect beat the acceptor's rdma_listen) and a
+			 * mid-session peer reboot (was_established). The re-dial
+			 * runs from connect_retry_work because it destroys this
+			 * cm_id, which is illegal from inside the cm_id's own
+			 * handler. We deliberately do NOT complete(&cm_done): a
+			 * parked accept-thread waiter stays blocked until we
+			 * either re-establish (ESTABLISHED completes it) or
+			 * exhaust the budget (terminal path below).
+			 */
+			if (urp_should_retry_connect(ep->is_initiator,
+					ep->qps[ctx->qp_index].connect_attempts,
+					urp_connect_max_attempts)) {
+				unsigned int delay_ms = urp_connect_backoff_ms(
+					ep->qps[ctx->qp_index].connect_attempts,
+					urp_connect_backoff_base_ms,
+					urp_connect_backoff_ceil_ms);
+
+				ep->qps[ctx->qp_index].connect_attempts++;
+				/*
+				 * On a mid-session drop, tear down the legacy
+				 * ep->conn on the primary QP so a reconnecting
+				 * local client gets a fresh stream (mirrors the
+				 * acceptor cleanup in the terminal path). A
+				 * never-established failure has no conn yet.
+				 */
+				if (was_established && ctx->qp_index == 0)
+					urp_socket_conn_cleanup(ep);
+				schedule_delayed_work(
+					&ep->qps[ctx->qp_index].connect_retry_work,
+					msecs_to_jiffies(delay_ms));
+				pr_info("QP %u CM down (%s); initiator retry %u/%u in %u ms\n",
+					ctx->qp_index,
+					rdma_event_msg(event->event),
+					ep->qps[ctx->qp_index].connect_attempts,
+					urp_connect_max_attempts, delay_ms);
+				break;
+			}
 		}
 		/*
-		 * Phase 4 Step 5: on the acceptor's primary QP, tear down
-		 * the legacy ep->conn before the next test client reconnects.
-		 * Without this, urp_cm_accept_one for the new client overwrites
-		 * conn->uds_sock + conn->tx_thread, orphaning the previous
-		 * pump kthread and leaking ~16 KB stack + struct socket per
-		 * connect/disconnect cycle. The 1-hour soak found this -- the
-		 * leak rate was ~210 kB/cycle (the orphan pump plus auxiliary
-		 * state). Pre-fix: 12 urp-tx kthreads after ~30 churn cycles.
+		 * Acceptor, or initiator with the retry budget exhausted:
+		 * terminal teardown. Phase 4 Step 5: on the acceptor's primary
+		 * QP, tear down the legacy ep->conn before the next test client
+		 * reconnects. Without this, urp_cm_accept_one for the new client
+		 * overwrites conn->uds_sock + conn->tx_thread, orphaning the
+		 * previous pump kthread and leaking ~16 KB stack + struct socket
+		 * per connect/disconnect cycle. The 1-hour soak found this --
+		 * ~210 kB/cycle; 12 urp-tx kthreads after ~30 churn cycles.
 		 */
 		if (!ep->is_initiator && ctx->qp_index == 0)
 			urp_socket_conn_cleanup(ep);
@@ -1075,6 +1160,138 @@ static int urp_make_cm_id(struct urp_endpoint *ep, u32 qp_index,
 
 	*out = id;
 	return 0;
+}
+
+/*
+ * Design 33 Phase 1.5: a SILENT drop -- a hard peer reboot brings the RC
+ * connection down without RDMA-CM delivering any event to us -- is invisible to
+ * the CM error handler, so the CM-driven retry never fires and the initiator
+ * sits on a dead-but-"established" QP. The probe path (missed PONGs, see
+ * urp_emit_ping_on) is the only signal. On >= URP_QP_MISS_THRESHOLD misses it
+ * calls here to synthesize exactly what the CM error handler does for a
+ * was_established drop: demote the session, re-arm the accept-thread waiter,
+ * and schedule the same bounded connect-retry (or surface terminal failure when
+ * the budget is spent). Runs in probe_work (workqueue) context; the actual
+ * cm_id teardown + re-dial happens later in connect_retry_work, never here.
+ *
+ * The caller (urp_emit_ping_on) has already gated on
+ * urp_silent_drop_should_reconnect() (initiator + a QP that was established)
+ * and must NOT post further PINGs on @qp after this returns -- it is being
+ * demoted and torn down.
+ */
+void urp_connect_retry_on_silent_drop(struct urp_endpoint *ep, struct urp_qp *qp)
+{
+	/* Mirror the CM error handler's was_established bookkeeping. */
+	qp->established = false;
+	atomic_dec(&ep->qps_connected);
+	if ((u32)atomic_read(&ep->qps_connected) < ep->num_qps && ep->connected) {
+		ep->connected = false;
+		reinit_completion(&ep->cm_done);
+	}
+
+	if (urp_should_retry_connect(ep->is_initiator, qp->connect_attempts,
+				     urp_connect_max_attempts)) {
+		unsigned int delay_ms = urp_connect_backoff_ms(qp->connect_attempts,
+			urp_connect_backoff_base_ms, urp_connect_backoff_ceil_ms);
+
+		qp->connect_attempts++;
+		/*
+		 * Primary QP carries the legacy ep->conn: tear it down so a
+		 * reconnecting local client gets a fresh stream (mirrors the
+		 * CM error path).
+		 */
+		if (qp->index == 0)
+			urp_socket_conn_cleanup(ep);
+		schedule_delayed_work(&qp->connect_retry_work,
+				      msecs_to_jiffies(delay_ms));
+		pr_info("QP %u silent drop (%u missed probes); initiator retry %u/%u in %u ms\n",
+			qp->index, qp->consecutive_misses, qp->connect_attempts,
+			urp_connect_max_attempts, delay_ms);
+	} else {
+		ep->cm_status = -ETIMEDOUT;
+		complete(&ep->cm_done);
+		pr_info("QP %u silent drop: retry budget exhausted\n", qp->index);
+	}
+}
+
+/*
+ * Design 33 Phase 1: initiator connect-retry. Runs from a delayed work item
+ * (scheduled by the CM error handler after a capped exponential backoff) so it
+ * can legally destroy the failed cm_id -- forbidden from inside the cm_id's own
+ * event handler. Tears down the dead QP/cm_id and re-dials from scratch,
+ * reusing the endpoint's stored peer address. The re-entered CM state machine
+ * drives the next ADDR/ROUTE/CONNECT phase; a further failure lands back in the
+ * CM error handler until the budget (urp_connect_max_attempts) is spent.
+ *
+ * Teardown safety: urp_rdma_cleanup cancel_delayed_work_sync's this work
+ * BEFORE destroying cm_ids, so a concurrent drain either cancels us before we
+ * start (state check below is a fast-path) or blocks until this returns; either
+ * way no cm_id is touched from two contexts at once.
+ */
+void urp_connect_retry_work_fn(struct work_struct *w)
+{
+	struct urp_qp *qp = container_of(to_delayed_work(w), struct urp_qp,
+					 connect_retry_work);
+	struct urp_endpoint *ep = qp->ep;
+	struct sockaddr_in addr;
+	char ip[INET6_ADDRSTRLEN];
+	struct rdma_cm_id *id;
+	int port = 0;
+	int ret;
+
+	if (ep->state != URP_STATE_ACTIVE)
+		return;
+
+	/* Destroy the failed QP/cm_id -- safe here, not in its own handler. */
+	urp_qp_hard_teardown(ep, qp->index);
+
+	ret = urp_endpoint_extract_v4(&ep->peer_addr, ip, sizeof(ip), &port);
+	if (ret) {
+		pr_err("connect retry: bad peer addr: %d\n", ret);
+		goto rearm;
+	}
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(port);
+	addr.sin_addr.s_addr = in_aton(ip);
+
+	ret = urp_make_cm_id(ep, qp->index, false, &id);
+	if (ret) {
+		pr_err("connect retry: cm_id create failed: %d\n", ret);
+		goto rearm;
+	}
+	qp->cm_id = id;
+
+	ret = rdma_resolve_addr(id, NULL, (struct sockaddr *)&addr, 2000);
+	if (ret) {
+		pr_err("connect retry: rdma_resolve_addr failed: %d\n", ret);
+		urp_cm_id_destroy(&qp->cm_id);
+		goto rearm;
+	}
+	pr_info("QP %u connect retry %u: re-dialing %s:%d\n",
+		qp->index, qp->connect_attempts, ip, port);
+	return;
+
+rearm:
+	/*
+	 * Couldn't even start the re-dial (transient alloc/resolve failure).
+	 * Re-arm the backoff if the budget remains; otherwise surface terminal
+	 * failure so a parked accept-thread waiter stops waiting.
+	 */
+	if (urp_should_retry_connect(ep->is_initiator, qp->connect_attempts,
+				     urp_connect_max_attempts)) {
+		unsigned int delay_ms = urp_connect_backoff_ms(
+			qp->connect_attempts, urp_connect_backoff_base_ms,
+			urp_connect_backoff_ceil_ms);
+
+		qp->connect_attempts++;
+		schedule_delayed_work(&qp->connect_retry_work,
+				      msecs_to_jiffies(delay_ms));
+	} else {
+		ep->cm_status = -ETIMEDOUT;
+		complete(&ep->cm_done);
+	}
 }
 
 int urp_rdma_init(struct urp_endpoint *ep, const char *peer_addr,
@@ -1156,6 +1373,18 @@ void urp_rdma_cleanup(struct urp_endpoint *ep)
 {
 	struct ib_device *dev = ep->ib_dev;
 	u32 i;
+
+	/*
+	 * Design 33 Phase 1: stop any pending/in-flight connect-retry BEFORE we
+	 * destroy cm_ids. The retry work item destroys and rebuilds a QP's
+	 * cm_id, so it must not race this teardown. cancel_delayed_work_sync
+	 * either cancels a not-yet-fired retry or blocks until a running one
+	 * returns; after this loop no retry can touch ep->qps.
+	 */
+	if (ep->qps) {
+		for (i = 0; i < ep->num_qps; i++)
+			cancel_delayed_work_sync(&ep->qps[i].connect_retry_work);
+	}
 
 	/* Disconnect all established QPs. */
 	if (ep->qps) {
