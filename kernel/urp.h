@@ -503,6 +503,8 @@ int  urp_stream_connect_uds(struct urp_stream *stream, const char *path);
 void urp_connect_work_fn(struct work_struct *w);
 /* Design 33 Phase 1: deferred initiator connect-retry (backoff re-dial). */
 void urp_connect_retry_work_fn(struct work_struct *w);
+/* Design 33 Phase 1.5: probe-detected silent-drop -> connect-retry (no CM event). */
+void urp_connect_retry_on_silent_drop(struct urp_endpoint *ep, struct urp_qp *qp);
 
 int  urp_rdma_init(struct urp_endpoint *ep, const char *peer_addr,
 		   int peer_port, int bind_port, bool is_initiator);

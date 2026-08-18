@@ -14,6 +14,7 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include "urp.h"
+#include "urp_retry_plan.h"
 #include <linux/sched.h>
 #include <linux/sched/task.h>
 #include <linux/ktime.h>
@@ -370,6 +371,19 @@ static int urp_emit_ping_on(struct urp_endpoint *ep, struct urp_qp *qp)
 			qp->health = URP_QP_STATE_DRAINING;
 			pr_warn("QP %u demoted to DRAINING after %u misses\n",
 				qp->index, qp->consecutive_misses);
+			/*
+			 * Design 33 Phase 1.5: on the initiator a demoted QP is
+			 * a silent drop (hard peer reboot -- no CM event). Turn
+			 * it into the same bounded connect-retry the CM error
+			 * path uses, so the session self-heals. The retry tears
+			 * this QP down, so stop here -- do NOT post another PING
+			 * on it below.
+			 */
+			if (urp_silent_drop_should_reconnect(ep->is_initiator,
+							     qp->established)) {
+				urp_connect_retry_on_silent_drop(ep, qp);
+				return 0;
+			}
 		}
 	}
 
@@ -405,7 +419,13 @@ static void urp_probe_work_fn(struct work_struct *work)
 	if (!ep->probe_active || ep->state != URP_STATE_ACTIVE)
 		return;
 
-	if (ep->qps && ep->num_qps > 1) {
+	/*
+	 * Design 33 Phase 1.5: multi-QP endpoints probe for per-QP health /
+	 * load balancing; a single-QP initiator additionally probes purely as a
+	 * silent-drop keepalive (a hard peer reboot delivers no CM event, so the
+	 * missing PONGs are the only signal). A single-QP acceptor stays quiet.
+	 */
+	if (ep->qps && urp_should_emit_probes(ep->is_initiator, ep->num_qps)) {
 		for (i = 0; i < ep->num_qps; i++)
 			urp_emit_ping_on(ep, &ep->qps[i]);
 	}

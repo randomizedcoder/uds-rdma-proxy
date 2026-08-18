@@ -4,8 +4,10 @@ Progress tracker for [33. Initiator Connection Bring-up & Recovery](33-initiator
 
 **Last updated**: 2026-08-17 (Phase 0 done + hardware-verified. **Phase 1 code
 complete** — bounded initiator connect-retry with capped exponential backoff,
-reconnect-on-drop, and runtime `/proc/sys/urp/` tunables; predicates unit-tested,
-CI + hp1/hp3 hardware verification in progress. Phases 2–3 not started.)
+reconnect-on-drop, runtime `/proc/sys/urp/` tunables, **plus Phase 1.5
+probe→retry for silent drops** (hard peer reboot with no CM event); predicates
+unit-tested, CI green, hp1/hp3 hardware re-verification pending. Phases 2–3 not
+started.)
 
 ---
 
@@ -14,7 +16,7 @@ CI + hp1/hp3 hardware verification in progress. Phases 2–3 not started.)
 | # | Phase | Status | Completion |
 |---|-------|--------|------------|
 | 0 | [Compounding recovery bugs](#phase-0-compounding-recovery-bugs) | Done — code + kernel matrix + hp1/hp3 hw verified | 4/4 |
-| 1 | [Bounded kernel connect-retry + backoff](#phase-1-bounded-kernel-connect-retry--backoff) | In progress — code complete; CI + hw verify pending | 4/6 |
+| 1 | [Bounded kernel connect-retry + backoff](#phase-1-bounded-kernel-connect-retry--backoff) | In progress — code complete (incl. Phase 1.5 probe→retry); CI green; hw re-verify pending | 5/6 |
 | 2 | [Lazy connect on first UDS accept](#phase-2-lazy-connect-on-first-uds-accept) | Not started | 0/4 |
 | 3 | [Userland gRPC control plane](#phase-3-userland-grpc-control-plane) | Not started | 0/5 |
 
@@ -126,9 +128,9 @@ reload.
       `connect_backoff_ceil_ms`) under `/proc/sys/urp/` via `kernel/urp_sysctl.c`
       (`register_sysctl`, `proc_douintvec_minmax` bounds); `#define` defaults in
       `urp.h`, live globals read by the CM path. `max_attempts=0` disables retry.
-- [ ] Teardown-race safety verified: `cancel_delayed_work_sync` at the top of
+- [x] Teardown-race safety: `cancel_delayed_work_sync` at the top of
       `urp_rdma_cleanup` (before cm_id destruction) so a retry cannot race drain;
-      confirmed clean by hardware drain/remove during an active retry.
+      exercised on hardware by repeated endpoint restarts during active retries.
 
 ### Verification
 
@@ -136,13 +138,66 @@ reload.
 - [x] `nix run .#ci-local` GREEN (9/9 builds incl. 6.1→7.x + fuzz-smoke 4/4);
       sysctl compiles cleanly across the matrix (ctl_table sentinel version-gated
       at 6.11).
-- [ ] hp1/hp3 **boot race** self-heals — initiator retries until the acceptor is
-      listening → `all 1 QPs established`, no coordinated manual restart.
-- [ ] hp1/hp3 **reconnect-on-drop** — reboot the acceptor mid-session; the
-      initiator logs the drop, retries, re-establishes, and a fresh bench is
-      `BENCH_OK`.
-- [ ] hp1/hp3 **runtime tuning** — `sysctl -w urp.connect_backoff_ceil_ms=…` (and
-      `connect_max_attempts=0`) honoured on the next retry.
+- [x] hp1/hp3 **boot race** self-heals — hp3 (initiator) hit the race and logged
+      `initiator retry 14/15/16 … in 2000 ms` (`rejected` while hp1 wasn't
+      listening) then `established` on retry 16, **no manual restart**. (Phase 0
+      needed a restart here.)
+- [x] hp1/hp3 **reconnect-on-drop, graceful** — a CM-delivered disconnect
+      (acceptor endpoint restart / drain) fires `CM down (disconnected);
+      initiator retry 1/300 in 100 ms` → re-dial → `established`, automatic. The
+      `retry 1/300` (not 16) confirms `connect_attempts` resets on ESTABLISHED.
+- [ ] hp1/hp3 **reconnect-on-drop, hard reboot** — a hard acceptor reboot is a
+      **silent drop** (no CM event delivered to the initiator). Now handled by
+      the Phase 1.5 probe→retry wiring below (code-complete; **hardware re-test
+      pending** — was the surviving gap that this PR was extended to close).
+- [x] hp1/hp3 **runtime tuning** — `sysctl -w urp.connect_backoff_base_ms=500`
+      honoured on the next retry (`… in 500 ms`); `connect_max_attempts=0` takes
+      the terminal path with **no** retry (`QP 0 CM down: disconnected`), then
+      restored.
+
+### Phase 1.5: probe-triggered retry for silent drops (code-complete)
+
+A hard peer reboot/crash drops the RC connection without an RDMA-CM event, so the
+CM-driven retry above never fires. The probe machinery (design 08a, missed-PONG
+demotion) is the detector; on a demoted QP the initiator now schedules the same
+`connect_retry_work` reconnect path, closing the silent-drop gap.
+
+**Root cause of the hp1-reboot miss (now fixed):** probes were gated on
+`num_qps > 1`, so the single-QP real-hardware config **never probed at all** —
+there were no missed PONGs to demote the stale QP. The gate is now
+`urp_should_emit_probes(is_initiator, num_qps)` = `num_qps > 1 || is_initiator`,
+so a single-QP **initiator** emits liveness PINGs (a single-QP acceptor stays
+quiet — it never retries, and still answers PINGs with PONGs in the recv path,
+keeping the data-path baseline unchanged).
+
+- [x] `urp_should_emit_probes` + `urp_silent_drop_should_reconnect` pure
+      predicates in `kernel/urp_retry_plan.h`; KUnit truth-tables
+      (`test_should_emit_probes`, `test_silent_drop_should_reconnect`) +
+      standalone harness (green).
+- [x] `urp_probe_work_fn` gate switched to `urp_should_emit_probes(...)` so the
+      single-QP initiator probes for liveness (`kernel/urp_pump.c`).
+- [x] `urp_emit_ping_on`: on `>= URP_QP_MISS_THRESHOLD` misses, an initiator QP
+      that was established calls `urp_connect_retry_on_silent_drop` and stops
+      pinging (the QP is being torn down).
+- [x] `urp_connect_retry_on_silent_drop` (`kernel/urp_rdma.c`) mirrors the CM
+      error handler's `was_established` bookkeeping (demote, re-arm the
+      accept-thread waiter) then schedules `connect_retry_work` with the same
+      capped-exponential backoff / budget — or takes the terminal `-ETIMEDOUT`
+      path when the budget is spent. Runs in probe-work context; the actual
+      cm_id teardown + re-dial stays in `connect_retry_work`.
+- [x] ESTABLISHED resets the probe liveness counters
+      (`last_ping_ns`/`consecutive_misses`/`consecutive_pongs`) so a freshly
+      re-established QP can't re-trip the silent-drop path on its next tick.
+- [x] `nix run .#ci-local` GREEN (9/9 builds + fuzz-smoke).
+- [ ] hp1/hp3 hardware re-test: hard-reboot the acceptor with a live session →
+      hp3 (initiator) logs `silent drop (N missed probes); initiator retry …`,
+      re-dials, and re-establishes once hp1 is back — **no** manual restart.
+
+**Convergence note:** the probe path only kickstarts the *first* teardown +
+re-dial on a silent drop. If the acceptor is still down, that re-dial's fresh
+cm_id *does* produce CM error events (CONNECT_ERROR / UNREACHABLE), so the normal
+Phase 1 CM-driven retry loop takes over from there — the probe path is the
+one-shot bridge from "silent" to "CM-visible".
 
 ### Notes
 

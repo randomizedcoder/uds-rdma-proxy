@@ -998,6 +998,16 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 			 * DRAINING on >= URP_QP_MISS_THRESHOLD misses.
 			 */
 			ep->qps[ctx->qp_index].health = URP_QP_STATE_ACTIVE;
+			/*
+			 * Design 33 Phase 1.5: clear the probe liveness counters
+			 * so a QP that was demoted by a silent drop (and is now
+			 * freshly re-established) starts from a clean slate -- a
+			 * stale last_ping_ns / miss count would otherwise trip the
+			 * silent-drop reconnect again on the very next probe tick.
+			 */
+			ep->qps[ctx->qp_index].last_ping_ns = 0;
+			ep->qps[ctx->qp_index].consecutive_misses = 0;
+			ep->qps[ctx->qp_index].consecutive_pongs = 0;
 			if ((u32)atomic_inc_return(&ep->qps_connected) ==
 			    ep->num_qps) {
 				ep->connected = true;
@@ -1150,6 +1160,58 @@ static int urp_make_cm_id(struct urp_endpoint *ep, u32 qp_index,
 
 	*out = id;
 	return 0;
+}
+
+/*
+ * Design 33 Phase 1.5: a SILENT drop -- a hard peer reboot brings the RC
+ * connection down without RDMA-CM delivering any event to us -- is invisible to
+ * the CM error handler, so the CM-driven retry never fires and the initiator
+ * sits on a dead-but-"established" QP. The probe path (missed PONGs, see
+ * urp_emit_ping_on) is the only signal. On >= URP_QP_MISS_THRESHOLD misses it
+ * calls here to synthesize exactly what the CM error handler does for a
+ * was_established drop: demote the session, re-arm the accept-thread waiter,
+ * and schedule the same bounded connect-retry (or surface terminal failure when
+ * the budget is spent). Runs in probe_work (workqueue) context; the actual
+ * cm_id teardown + re-dial happens later in connect_retry_work, never here.
+ *
+ * The caller (urp_emit_ping_on) has already gated on
+ * urp_silent_drop_should_reconnect() (initiator + a QP that was established)
+ * and must NOT post further PINGs on @qp after this returns -- it is being
+ * demoted and torn down.
+ */
+void urp_connect_retry_on_silent_drop(struct urp_endpoint *ep, struct urp_qp *qp)
+{
+	/* Mirror the CM error handler's was_established bookkeeping. */
+	qp->established = false;
+	atomic_dec(&ep->qps_connected);
+	if ((u32)atomic_read(&ep->qps_connected) < ep->num_qps && ep->connected) {
+		ep->connected = false;
+		reinit_completion(&ep->cm_done);
+	}
+
+	if (urp_should_retry_connect(ep->is_initiator, qp->connect_attempts,
+				     urp_connect_max_attempts)) {
+		unsigned int delay_ms = urp_connect_backoff_ms(qp->connect_attempts,
+			urp_connect_backoff_base_ms, urp_connect_backoff_ceil_ms);
+
+		qp->connect_attempts++;
+		/*
+		 * Primary QP carries the legacy ep->conn: tear it down so a
+		 * reconnecting local client gets a fresh stream (mirrors the
+		 * CM error path).
+		 */
+		if (qp->index == 0)
+			urp_socket_conn_cleanup(ep);
+		schedule_delayed_work(&qp->connect_retry_work,
+				      msecs_to_jiffies(delay_ms));
+		pr_info("QP %u silent drop (%u missed probes); initiator retry %u/%u in %u ms\n",
+			qp->index, qp->consecutive_misses, qp->connect_attempts,
+			urp_connect_max_attempts, delay_ms);
+	} else {
+		ep->cm_status = -ETIMEDOUT;
+		complete(&ep->cm_done);
+		pr_info("QP %u silent drop: retry budget exhausted\n", qp->index);
+	}
 }
 
 /*

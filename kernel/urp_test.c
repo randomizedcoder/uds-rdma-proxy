@@ -1164,6 +1164,69 @@ static void test_connect_backoff_ms(struct kunit *test)
 	}
 }
 
+/*
+ * design 33 Phase 1.5: liveness probing runs on all multi-QP endpoints (health
+ * / load balancing) and additionally on a single-QP *initiator* (silent-drop
+ * keepalive). A single-QP acceptor stays quiet.
+ */
+static void test_should_emit_probes(struct kunit *test)
+{
+	static const struct {
+		bool is_initiator;
+		unsigned int num_qps;
+		bool expect;
+	} cases[] = {
+		{ false, 1, false }, /* single-QP acceptor: quiet baseline */
+		{ true,  1, true  }, /* single-QP initiator: silent-drop keepalive */
+		{ false, 4, true  }, /* multi-QP: health/LB probing both roles */
+		{ true,  4, true  },
+		{ false, 0, false }, /* no QPs: nothing to probe */
+		{ true,  0, true  }, /* initiator predicate keys on role, not count */
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		bool got = urp_should_emit_probes(cases[i].is_initiator,
+						  cases[i].num_qps);
+
+		KUNIT_EXPECT_EQ_MSG(test, (int)got, (int)cases[i].expect,
+				    "case %d: is_initiator=%d num_qps=%u",
+				    i, (int)cases[i].is_initiator,
+				    cases[i].num_qps);
+	}
+}
+
+/*
+ * design 33 Phase 1.5: a probe-detected silent drop converts to a reconnect
+ * only on the initiator, and only for a QP that actually carried a session
+ * (was_established) -- a never-established bring-up failure is the CM-event
+ * retry path's job, not the liveness path's.
+ */
+static void test_silent_drop_should_reconnect(struct kunit *test)
+{
+	static const struct {
+		bool is_initiator;
+		bool was_established;
+		bool expect;
+	} cases[] = {
+		{ true,  true,  true  }, /* initiator, live session dropped */
+		{ true,  false, false }, /* initiator, never established */
+		{ false, true,  false }, /* acceptor never reconnects */
+		{ false, false, false },
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		bool got = urp_silent_drop_should_reconnect(cases[i].is_initiator,
+							    cases[i].was_established);
+
+		KUNIT_EXPECT_EQ_MSG(test, (int)got, (int)cases[i].expect,
+				    "case %d: is_initiator=%d was_established=%d",
+				    i, (int)cases[i].is_initiator,
+				    (int)cases[i].was_established);
+	}
+}
+
 static struct kunit_case urp_test_cases[] = {
 	KUNIT_CASE(test_frame_roundtrip_data),
 	KUNIT_CASE(test_frame_roundtrip_control),
@@ -1214,6 +1277,8 @@ static struct kunit_case urp_test_cases[] = {
 	/* design 33 Phase 1: initiator connect-retry eligibility + backoff */
 	KUNIT_CASE(test_should_retry_connect),
 	KUNIT_CASE(test_connect_backoff_ms),
+	KUNIT_CASE(test_should_emit_probes),
+	KUNIT_CASE(test_silent_drop_should_reconnect),
 	KUNIT_CASE(test_resolve_num_bufs),
 	KUNIT_CASE(test_resolve_buf_size),
 	KUNIT_CASE(test_ep_max_payload),

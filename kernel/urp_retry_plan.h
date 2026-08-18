@@ -66,4 +66,42 @@ urp_connect_backoff_ms(unsigned int attempt, unsigned int base_ms,
 	return ms > ceil_ms ? ceil_ms : (unsigned int)ms;
 }
 
+/*
+ * Should this endpoint emit liveness PINGs on its QP(s)?
+ *
+ * A hard peer reboot is a SILENT drop: the RC connection dies without RDMA-CM
+ * delivering any event to the initiator, so the CM-driven retry above never
+ * fires. Periodic PINGs (and their missing PONGs) are the only signal that a
+ * silent drop happened. Multi-QP endpoints already probe for per-QP health
+ * (load balancing, DRAINING demotion). Single-QP endpoints gained no benefit
+ * from probing -- until Phase 1.5, where the *initiator* needs the PING
+ * keepalive to notice a silent drop and re-dial. The acceptor never retries,
+ * so a single-QP acceptor stays quiet (unchanged data-path baseline); it still
+ * answers PINGs with PONGs unconditionally in the recv path.
+ */
+static inline bool
+urp_should_emit_probes(bool is_initiator, unsigned int num_qps)
+{
+	return num_qps > 1 || is_initiator;
+}
+
+/*
+ * On a probe-detected silent drop (>= miss-threshold consecutive missing
+ * PONGs), should we convert the dead QP into a reconnect?
+ *
+ * Only the initiator dials, so only it reconnects; the acceptor merely demotes
+ * the QP out of its dispatch set (urp_qp_select_round_robin skips DRAINING) and
+ * waits for a fresh CONNECT_REQUEST. @was_established gates out a QP that never
+ * carried a session (a bring-up failure is already handled by the CM-event
+ * retry path, not the liveness path -- there are no PONGs to miss before
+ * ESTABLISHED). When true, the caller runs the same bounded connect-retry the
+ * CM error handler uses, so a silent drop self-heals identically to a
+ * CM-visible one.
+ */
+static inline bool
+urp_silent_drop_should_reconnect(bool is_initiator, bool was_established)
+{
+	return is_initiator && was_established;
+}
+
 #endif /* _URP_RETRY_PLAN_H */
