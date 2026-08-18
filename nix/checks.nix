@@ -24,9 +24,19 @@ let
         baseName == "urp-bench" ||
         baseName == "urp-cli" ||
         baseName == "urp-netlink" ||
+        baseName == "urp-control" ||
         baseName == "src" ||
-        baseName == "commands"
+        baseName == "commands" ||
+        baseName == "tests"
       )) ||
+      # Plus the proto tree -- urp-control's build.rs codegens from it, and
+      # cargo parses every workspace member even for `-p <other>`.
+      (type == "directory" && (
+        baseName == "proto" ||
+        baseName == "urp_control" ||
+        baseName == "v1"
+      )) ||
+      (pkgs.lib.hasSuffix ".proto" baseName) ||
       (baseName == "Cargo.toml") ||
       (baseName == "Cargo.lock") ||
       (pkgs.lib.hasSuffix ".rs" baseName) ||
@@ -184,6 +194,31 @@ in
 
     cargoBuildFlags = [ "-p" "urp-netlink" "-p" "urp-cli" ];
     cargoTestFlags  = [ "-p" "urp-netlink" "-p" "urp-cli" ];
+
+    installPhase = ''
+      runHook preInstall
+      mkdir -p $out
+      touch $out/passed
+      runHook postInstall
+    '';
+  };
+
+  # urp-control control-plane tests (design 33 Phase 3): the pure logic.rs
+  # truth tables + the two-process loopback integration (serve+connect over
+  # 127.0.0.1). build.rs runs tonic-build, so protoc is a nativeBuildInput and
+  # PROTOC is set for the offline sandbox. Runs fully sandboxed (loopback TCP,
+  # fake state source, injected sd_notify + RDMA-failure signal -- no hardware).
+  urp-control-tests = pkgs.rustPlatform.buildRustPackage {
+    pname = "urp-control-tests";
+    version = "0.1.0";
+    inherit src;
+
+    cargoLock.lockFile = ../Cargo.lock;
+    nativeBuildInputs = [ rustToolchain pkgs.protobuf ];
+    PROTOC = "${pkgs.protobuf}/bin/protoc";
+
+    cargoBuildFlags = [ "-p" "urp-control" ];
+    cargoTestFlags  = [ "-p" "urp-control" ];
 
     installPhase = ''
       runHook preInstall

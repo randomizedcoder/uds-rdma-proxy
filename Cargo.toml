@@ -5,6 +5,7 @@ members = [
     "crates/uds-rdma-protocol-ffi",
     "crates/urp-bench",
     "crates/urp-cli",
+    "crates/urp-control",
     "crates/urp-netlink",
 ]
 

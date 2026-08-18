@@ -105,6 +105,11 @@
           inherit (packages) rustToolchain;
         };
 
+        urpControl = import ./nix/urp-control.nix {
+          inherit pkgs;
+          inherit (packages) rustToolchain;
+        };
+
         # Phase 3a: FFI staticlib for the optional Rust-backed reorder
         # buffer. Only consumed by the kernel build when
         # CONFIG_URP_REORDER_RUST=y; the default urp-ko build (C rbtree
@@ -192,7 +197,7 @@
         checks = {
           inherit (nixChecks)
             protocol-tests urp-bench-units urp-bench-rs-tests
-            urp-netlink-tests
+            urp-netlink-tests urp-control-tests
             urp-fast-validate-units
             kernel-module-build
             urp-ko-6_1 urp-ko-6_6 urp-ko-6_12;
@@ -204,6 +209,7 @@
           # Kernel-version matrix (Phase 5 DoD 7): `nix build .#urp-ko-6_1` etc.
           inherit (nixChecks) urp-ko-6_1 urp-ko-6_6 urp-ko-6_12;
           urp-cli = urpCli;
+          urp-control = urpControl;
           urp-protocol-ffi = urpProtocolFfi;
           # io_uring UDS benchmark (design 30): `nix run .#urp-bench-local`
           urp-bench-c = urpBenchC;

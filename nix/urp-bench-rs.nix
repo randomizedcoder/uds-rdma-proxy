@@ -18,9 +18,19 @@ let
         baseName == "urp-bench" ||
         baseName == "urp-cli" ||
         baseName == "urp-netlink" ||
+        baseName == "urp-control" ||
         baseName == "src" ||
-        baseName == "commands"
+        baseName == "commands" ||
+        baseName == "tests"
       )) ||
+      # Plus the proto tree -- cargo parses every workspace member (incl.
+      # urp-control's build.rs paths) even for `-p urp-bench`.
+      (type == "directory" && (
+        baseName == "proto" ||
+        baseName == "urp_control" ||
+        baseName == "v1"
+      )) ||
+      (pkgs.lib.hasSuffix ".proto" baseName) ||
       (baseName == "Cargo.toml") ||
       (baseName == "Cargo.lock") ||
       (pkgs.lib.hasSuffix ".rs" baseName);
