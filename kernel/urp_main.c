@@ -36,6 +36,16 @@ static int __init urp_init(void)
 		goto err_table;
 
 	/*
+	 * Design 33 Phase 1: publish /proc/sys/urp/ before the control surface
+	 * opens so the connect-retry policy is settable the moment endpoints
+	 * can be created. Failure is non-fatal in spirit but we surface it so a
+	 * misconfigured build is noticed.
+	 */
+	ret = urp_sysctl_register();
+	if (ret)
+		goto err_proc;
+
+	/*
 	 * Open the fast-path char device (design 31) before GENL so an aware
 	 * app can REGISTER a pool the moment the module is live. It shares no
 	 * state with the GENL surface, so ordering vs GENL is not critical --
@@ -43,7 +53,7 @@ static int __init urp_init(void)
 	 */
 	ret = urp_cmd_dev_register();
 	if (ret)
-		goto err_proc;
+		goto err_sysctl;
 
 	ret = urp_genl_register();
 	if (ret) {
@@ -56,6 +66,8 @@ static int __init urp_init(void)
 
 err_cmd:
 	urp_cmd_dev_unregister();
+err_sysctl:
+	urp_sysctl_unregister();
 err_proc:
 	urp_proc_cleanup();
 err_table:
@@ -74,6 +86,7 @@ static void __exit urp_exit(void)
 	urp_genl_unregister();
 	urp_endpoint_drain_all();
 	urp_cmd_dev_unregister();
+	urp_sysctl_unregister();
 	urp_proc_cleanup();
 	urp_endpoint_table_destroy();
 	pr_info("module unloaded\n");

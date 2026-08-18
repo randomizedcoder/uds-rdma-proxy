@@ -2,10 +2,10 @@
 
 Progress tracker for [33. Initiator Connection Bring-up & Recovery](33-initiator-connection-bringup.md).
 
-**Last updated**: 2026-08-17 (Phase 0 bug fixes implemented, build-verified across
-the 6.1/6.6/6.12/7.1 kernel matrix, and **hardware-verified on hp1/hp3** — recovery
-now self-heals with a plain initiator restart, no manual steps; Phases 1–3 not
-started.)
+**Last updated**: 2026-08-17 (Phase 0 done + hardware-verified. **Phase 1 code
+complete** — bounded initiator connect-retry with capped exponential backoff,
+reconnect-on-drop, and runtime `/proc/sys/urp/` tunables; predicates unit-tested,
+CI + hp1/hp3 hardware verification in progress. Phases 2–3 not started.)
 
 ---
 
@@ -14,7 +14,7 @@ started.)
 | # | Phase | Status | Completion |
 |---|-------|--------|------------|
 | 0 | [Compounding recovery bugs](#phase-0-compounding-recovery-bugs) | Done — code + kernel matrix + hp1/hp3 hw verified | 4/4 |
-| 1 | [Bounded kernel connect-retry + backoff](#phase-1-bounded-kernel-connect-retry--backoff) | Not started | 0/4 |
+| 1 | [Bounded kernel connect-retry + backoff](#phase-1-bounded-kernel-connect-retry--backoff) | In progress — code complete; CI + hw verify pending | 4/6 |
 | 2 | [Lazy connect on first UDS accept](#phase-2-lazy-connect-on-first-uds-accept) | Not started | 0/4 |
 | 3 | [Userland gRPC control plane](#phase-3-userland-grpc-control-plane) | Not started | 0/5 |
 
@@ -91,37 +91,70 @@ retry/rendezvous scheme (design [§33.7](33-initiator-connection-bringup.md)).
 
 ## Phase 1: Bounded kernel connect-retry + backoff
 
-**Status**: Not started.
+**Status**: In progress — code complete, CI + hp1/hp3 hardware verification
+pending.
 
 On a failed resolve/connect the initiator re-arms with capped exponential
 backoff instead of giving up — the correctness floor that makes bring-up
-independent of orchestration (design R1/R2).
+independent of orchestration (design R1/R2). Scope (locked with the user)
+**also covers reconnect-on-drop**: a mid-session DISCONNECT of an established
+session (e.g. the acceptor reboots) re-dials on the same bounded budget, not
+just the first bring-up. The retry window and aggressiveness are **runtime
+tunable** via `/proc/sys/urp/` so an operator can pick their stance without a
+reload.
 
 ### Definition of done
 
-- [ ] Per-QP retry state (`connect_attempts`, `struct delayed_work
-      connect_retry_work`) on `struct urp_qp`; init in `urp_qps_init`, cancel in
+- [x] Per-QP retry state (`connect_attempts`, `struct delayed_work
+      connect_retry_work`) on `struct urp_qp`; `INIT_DELAYED_WORK` +
+      `connect_attempts = 0` in `urp_qps_init`, `cancel_delayed_work_sync` in
       `urp_qps_destroy`.
-- [ ] `urp_connect_retry_work_fn` re-arms a fresh cm_id (mirror `urp_make_cm_id`)
-      + `rdma_resolve_addr` from a work context (CM `qp_mutex` constraint), reusing
-      the guarded shared PD/CQ/pool.
-- [ ] CM error handler schedules the retry (initiator only) with
-      `urp_connect_backoff_ms(attempt)` and does **not** `complete(&ep->cm_done)`
-      until retries are exhausted; `connect_attempts` reset on ESTABLISHED.
-- [ ] Pure predicates `urp_connect_should_retry` + `urp_connect_backoff_ms` in
-      `kernel/urp_retry_plan.h`, KUnit table in `urp_test.c`.
+- [x] `urp_connect_retry_work_fn` (`kernel/urp_rdma.c`) tears down the failed
+      QP/cm_id via the shared `urp_qp_hard_teardown` helper and re-dials a fresh
+      `urp_make_cm_id` + `rdma_resolve_addr` from a work context (CM `qp_mutex`
+      constraint), reusing the guarded shared PD/CQ/pool and rebuilding the target
+      from `ep->peer_addr` via `urp_endpoint_extract_v4`.
+- [x] CM error handler (initiator only) captures `was_established`, re-arms the
+      accept-thread waiter (`ep->connected = false` + `reinit_completion`) on a
+      live drop, schedules the retry with `urp_connect_backoff_ms(...)`, and does
+      **not** `complete(&ep->cm_done)` until the budget is exhausted;
+      `connect_attempts` reset on ESTABLISHED.
+- [x] Pure predicates `urp_should_retry_connect` + `urp_connect_backoff_ms` in
+      `kernel/urp_retry_plan.h`; KUnit truth-tables (`test_should_retry_connect`,
+      `test_connect_backoff_ms`) in `urp_test.c` + standalone harness (green).
+- [x] Runtime tunables (`connect_max_attempts` / `connect_backoff_base_ms` /
+      `connect_backoff_ceil_ms`) under `/proc/sys/urp/` via `kernel/urp_sysctl.c`
+      (`register_sysctl`, `proc_douintvec_minmax` bounds); `#define` defaults in
+      `urp.h`, live globals read by the CM path. `max_attempts=0` disables retry.
+- [ ] Teardown-race safety verified: `cancel_delayed_work_sync` at the top of
+      `urp_rdma_cleanup` (before cm_id destruction) so a retry cannot race drain;
+      confirmed clean by hardware drain/remove during an active retry.
 
 ### Verification
 
-- [ ] KUnit + standalone harness green; `nix run .#ci-local` GREEN.
-- [ ] hp1/hp3 boot race self-heals — initiator retries until the acceptor is
+- [x] KUnit + standalone predicate harness green.
+- [x] `nix run .#ci-local` GREEN (9/9 builds incl. 6.1→7.x + fuzz-smoke 4/4);
+      sysctl compiles cleanly across the matrix (ctl_table sentinel version-gated
+      at 6.11).
+- [ ] hp1/hp3 **boot race** self-heals — initiator retries until the acceptor is
       listening → `all 1 QPs established`, no coordinated manual restart.
+- [ ] hp1/hp3 **reconnect-on-drop** — reboot the acceptor mid-session; the
+      initiator logs the drop, retries, re-establishes, and a fresh bench is
+      `BENCH_OK`.
+- [ ] hp1/hp3 **runtime tuning** — `sysctl -w urp.connect_backoff_ceil_ms=…` (and
+      `connect_max_attempts=0`) honoured on the next retry.
 
 ### Notes
 
-- Mirror the existing async idioms: `connect_work` (`work_struct`, deferred off
-  the CM handler) for the mutex constraint, `probe_work` (`delayed_work`) for the
-  backoff timing.
+- Mirrors the existing async idioms: `connect_work` (`work_struct`, deferred off
+  the CM handler) for the `qp_mutex` constraint, `probe_work` (`delayed_work`) for
+  the backoff timing.
+- The retry re-dial destroys and rebuilds the QP's cm_id, which is illegal from
+  inside the cm_id's own event handler — hence the deferred work item, and the
+  `urp_qp_hard_teardown` helper is shared with the acceptor's slot-reuse path.
+- sysctl portability: `register_sysctl("urp", …)` has a stable signature 6.1→7.x;
+  only the `ctl_table` terminating sentinel is version-gated (required <6.11,
+  removed 6.11+).
 
 ---
 

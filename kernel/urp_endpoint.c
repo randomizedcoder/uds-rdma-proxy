@@ -105,8 +105,8 @@ struct urp_endpoint *urp_endpoint_get(const char *name)
  * IPv4-mapped IPv6); native IPv6 lands in Phase 3 along with the rdma_init
  * refactor.
  */
-static int urp_endpoint_extract_v4(const struct sockaddr_in6 *addr,
-				   char *out_ip, size_t out_len, int *out_port)
+int urp_endpoint_extract_v4(const struct sockaddr_in6 *addr,
+			    char *out_ip, size_t out_len, int *out_port)
 {
 	__be32 v4;
 

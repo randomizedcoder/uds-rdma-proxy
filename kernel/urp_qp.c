@@ -42,6 +42,14 @@ int urp_qps_init(struct urp_endpoint *ep)
 		 * recursively take id->qp_mutex.
 		 */
 		INIT_WORK(&ep->qps[i].connect_work, urp_connect_work_fn);
+		/*
+		 * Design 33 Phase 1: bounded initiator connect-retry. The
+		 * delayed work re-dials with capped exponential backoff; the
+		 * attempt counter resets to 0 on each ESTABLISHED.
+		 */
+		INIT_DELAYED_WORK(&ep->qps[i].connect_retry_work,
+				  urp_connect_retry_work_fn);
+		ep->qps[i].connect_attempts = 0;
 	}
 
 	atomic_set(&ep->qps_connected, 0);
@@ -54,8 +62,18 @@ void urp_qps_destroy(struct urp_endpoint *ep)
 	u32 i;
 
 	if (ep->qps) {
-		for (i = 0; i < ep->num_qps; i++)
+		for (i = 0; i < ep->num_qps; i++) {
 			cancel_work_sync(&ep->qps[i].connect_work);
+			/*
+			 * Design 33 Phase 1: belt-and-suspenders. The retry
+			 * work is already cancelled at the top of
+			 * urp_rdma_cleanup (before cm_ids are destroyed) so it
+			 * can't race QP teardown; this second cancel covers any
+			 * activate-failure path that frees qps without a full
+			 * rdma_cleanup.
+			 */
+			cancel_delayed_work_sync(&ep->qps[i].connect_retry_work);
+		}
 	}
 	kfree(ep->qps);
 	ep->qps = NULL;
