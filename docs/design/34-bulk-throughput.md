@@ -371,6 +371,13 @@ Three findings sharpen the phasing:
 
 ## 34.6 The windowing function (designed; built in a later phase)
 
+> **Implementation-ready spec: [design 35](35-windowing-flow-control.md).** That
+> doc expands this summary with the wire format + interop gate, the pump
+> completion-waitqueue coupling (where the throughput actually comes from), the
+> BDP sizing math (window need is only ~116 KB at this link — windowing is a
+> correctness/efficiency layer, not the raw-speed lever), F2 scale-out, and the
+> phasing/verification. This section is the short version.
+
 Replaces the 4×u16 **frame** counters in `struct urp_credit`
 (`kernel/urp_credit.h:19`) with per-stream **byte** accounting:
 
@@ -442,6 +449,9 @@ they come after measurement proves the copy wall is what's left.
 
 ## 34.8 Relation to other docs
 
+- [design 35](35-windowing-flow-control.md) — the implementation-ready windowing
+  + pump + scale-out spec that §34.6 summarizes; the path from this doc's
+  measurement to line rate.
 - [design 30](30-urp-bench-io-uring.md) — the bench and its symmetric-echo RTT
   protocol; this doc adds the orthogonal one-way `stream` pattern (§34.4) as a
   second measurement regime.
