@@ -1117,6 +1117,15 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 		 */
 		if (!ep->is_initiator && ctx->qp_index == 0)
 			urp_socket_conn_cleanup(ep);
+		/*
+		 * design 33 Phase 2 fail-fast: the initiator has exhausted its
+		 * retry budget -- mark the endpoint terminally dead so a late
+		 * UDS client is rejected fast instead of parking forever on the
+		 * completion we fire just below. Never cleared; recovery is
+		 * `urp remove`/`add`.
+		 */
+		if (ep->is_initiator)
+			WRITE_ONCE(ep->connect_failed, true);
 		ep->cm_status = event->status;
 		complete(&ep->cm_done);
 		pr_info("QP %u CM down: %s\n", ctx->qp_index,
@@ -1208,6 +1217,8 @@ void urp_connect_retry_on_silent_drop(struct urp_endpoint *ep, struct urp_qp *qp
 			qp->index, qp->consecutive_misses, qp->connect_attempts,
 			urp_connect_max_attempts, delay_ms);
 	} else {
+		/* design 33 Phase 2 fail-fast: terminal (initiator-only path). */
+		WRITE_ONCE(ep->connect_failed, true);
 		ep->cm_status = -ETIMEDOUT;
 		complete(&ep->cm_done);
 		pr_info("QP %u silent drop: retry budget exhausted\n", qp->index);
@@ -1215,13 +1226,92 @@ void urp_connect_retry_on_silent_drop(struct urp_endpoint *ep, struct urp_qp *qp
 }
 
 /*
+ * Dial one QP: resolve the peer v4 address, make a fresh initiator cm_id, and
+ * kick off rdma_resolve_addr (which drives the CM state machine on to route
+ * resolve / connect). Shared by the eager-less lazy starter and the Phase-1
+ * retry work.
+ *
+ * Strict failure contract: on ANY internal failure this self-destroys whatever
+ * it created and leaves qp->cm_id == NULL, so both callers are cm_id-cleanup-
+ * agnostic (no caller has to unwind a half-built cm_id on a transient failure).
+ * The caller must have ensured qp->cm_id is NULL on entry (never-dialed QP, or
+ * post urp_qp_hard_teardown). Returns 0 or a negative errno.
+ */
+static int urp_qp_resolve_addr(struct urp_endpoint *ep, u32 i)
+{
+	struct urp_qp *qp = &ep->qps[i];
+	struct sockaddr_in addr;
+	char ip[INET6_ADDRSTRLEN];
+	struct rdma_cm_id *id;
+	int port = 0;
+	int ret;
+
+	ret = urp_endpoint_extract_v4(&ep->peer_addr, ip, sizeof(ip), &port);
+	if (ret) {
+		pr_err("QP %u dial: bad peer addr: %d\n", i, ret);
+		return ret;
+	}
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(port);
+	addr.sin_addr.s_addr = in_aton(ip);
+
+	ret = urp_make_cm_id(ep, i, false, &id);
+	if (ret) {
+		pr_err("QP %u dial: cm_id create failed: %d\n", i, ret);
+		return ret;
+	}
+	qp->cm_id = id;
+
+	ret = rdma_resolve_addr(id, NULL, (struct sockaddr *)&addr, 2000);
+	if (ret) {
+		pr_err("QP %u dial: rdma_resolve_addr failed: %d\n", i, ret);
+		urp_cm_id_destroy(&qp->cm_id);	/* strict: qp->cm_id == NULL */
+		return ret;
+	}
+	return 0;
+}
+
+/*
+ * design 33 Phase 2: fire the deferred initiator dial when the first UDS
+ * client connects. Called lock-free from the accept thread (the eager dial ran
+ * under ep->lock; the accept path does not hold it -- deliberate). The one-shot
+ * connect_started latch (flipped by the caller) guarantees a single invocation.
+ *
+ * A per-QP inline failure does NOT wedge the endpoint: urp_qp_resolve_addr has
+ * already nulled that QP's cm_id, so we hand it to the Phase-1 retry engine.
+ * This also covers num_qps > 1 where a mid-loop failure would otherwise leave
+ * some QPs dialed and some not.
+ */
+void urp_lazy_connect_start(struct urp_endpoint *ep)
+{
+	u32 i;
+
+	pr_info("%s: first client connect -> dialing RDMA (%u QP%s)\n",
+		ep->name, ep->num_qps, ep->num_qps == 1 ? "" : "s");
+
+	for (i = 0; i < ep->num_qps; i++) {
+		int ret = urp_qp_resolve_addr(ep, i);
+
+		if (ret) {
+			pr_warn("%s: QP %u lazy dial failed (%d); scheduling retry\n",
+				ep->name, i, ret);
+			schedule_delayed_work(&ep->qps[i].connect_retry_work,
+				msecs_to_jiffies(urp_connect_backoff_base_ms));
+		}
+	}
+}
+
+/*
  * Design 33 Phase 1: initiator connect-retry. Runs from a delayed work item
  * (scheduled by the CM error handler after a capped exponential backoff) so it
  * can legally destroy the failed cm_id -- forbidden from inside the cm_id's own
- * event handler. Tears down the dead QP/cm_id and re-dials from scratch,
- * reusing the endpoint's stored peer address. The re-entered CM state machine
- * drives the next ADDR/ROUTE/CONNECT phase; a further failure lands back in the
- * CM error handler until the budget (urp_connect_max_attempts) is spent.
+ * event handler. Tears down the dead QP/cm_id and re-dials from scratch (via
+ * urp_qp_resolve_addr), reusing the endpoint's stored peer address. The
+ * re-entered CM state machine drives the next ADDR/ROUTE/CONNECT phase; a
+ * further failure lands back in the CM error handler until the budget
+ * (urp_connect_max_attempts) is spent.
  *
  * Teardown safety: urp_rdma_cleanup cancel_delayed_work_sync's this work
  * BEFORE destroying cm_ids, so a concurrent drain either cancels us before we
@@ -1233,10 +1323,6 @@ void urp_connect_retry_work_fn(struct work_struct *w)
 	struct urp_qp *qp = container_of(to_delayed_work(w), struct urp_qp,
 					 connect_retry_work);
 	struct urp_endpoint *ep = qp->ep;
-	struct sockaddr_in addr;
-	char ip[INET6_ADDRSTRLEN];
-	struct rdma_cm_id *id;
-	int port = 0;
 	int ret;
 
 	if (ep->state != URP_STATE_ACTIVE)
@@ -1245,32 +1331,11 @@ void urp_connect_retry_work_fn(struct work_struct *w)
 	/* Destroy the failed QP/cm_id -- safe here, not in its own handler. */
 	urp_qp_hard_teardown(ep, qp->index);
 
-	ret = urp_endpoint_extract_v4(&ep->peer_addr, ip, sizeof(ip), &port);
-	if (ret) {
-		pr_err("connect retry: bad peer addr: %d\n", ret);
+	ret = urp_qp_resolve_addr(ep, qp->index);
+	if (ret)
 		goto rearm;
-	}
-
-	memset(&addr, 0, sizeof(addr));
-	addr.sin_family = AF_INET;
-	addr.sin_port = htons(port);
-	addr.sin_addr.s_addr = in_aton(ip);
-
-	ret = urp_make_cm_id(ep, qp->index, false, &id);
-	if (ret) {
-		pr_err("connect retry: cm_id create failed: %d\n", ret);
-		goto rearm;
-	}
-	qp->cm_id = id;
-
-	ret = rdma_resolve_addr(id, NULL, (struct sockaddr *)&addr, 2000);
-	if (ret) {
-		pr_err("connect retry: rdma_resolve_addr failed: %d\n", ret);
-		urp_cm_id_destroy(&qp->cm_id);
-		goto rearm;
-	}
-	pr_info("QP %u connect retry %u: re-dialing %s:%d\n",
-		qp->index, qp->connect_attempts, ip, port);
+	pr_info("QP %u connect retry %u: re-dialing\n",
+		qp->index, qp->connect_attempts);
 	return;
 
 rearm:
@@ -1289,6 +1354,8 @@ rearm:
 		schedule_delayed_work(&qp->connect_retry_work,
 				      msecs_to_jiffies(delay_ms));
 	} else {
+		/* design 33 Phase 2 fail-fast: terminal (initiator-only path). */
+		WRITE_ONCE(ep->connect_failed, true);
 		ep->cm_status = -ETIMEDOUT;
 		complete(&ep->cm_done);
 	}
@@ -1299,35 +1366,23 @@ int urp_rdma_init(struct urp_endpoint *ep, const char *peer_addr,
 {
 	struct sockaddr_in addr;
 	int ret;
-	u32 i;
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
 
 	if (is_initiator) {
-		addr.sin_port = htons(peer_port);
-		addr.sin_addr.s_addr = in_aton(peer_addr);
-
-		for (i = 0; i < ep->num_qps; i++) {
-			struct rdma_cm_id *id;
-
-			ret = urp_make_cm_id(ep, i, false, &id);
-			if (ret) {
-				pr_err("cm_id %u create failed: %d\n",
-				       i, ret);
-				goto err_destroy_all;
-			}
-
-			ep->qps[i].cm_id = id;
-
-			ret = rdma_resolve_addr(id, NULL,
-						(struct sockaddr *)&addr, 2000);
-			if (ret) {
-				pr_err("rdma_resolve_addr[%u] failed: %d\n",
-				       i, ret);
-				goto err_destroy_all;
-			}
-		}
+		/*
+		 * design 33 Phase 2: connect on first use. Do NOT dial here --
+		 * the initiator holds zero RDMA resources while idle (goal R4)
+		 * and never races the acceptor's rdma_listen at boot. The first
+		 * UDS client accept fires urp_lazy_connect_start(); PD/CQ/pool
+		 * allocation is already lazy (urp_endpoint_setup_shared is
+		 * one-shot, driven from the CM handler), so deferring the dial
+		 * defers all RDMA-object allocation for free. peer_addr is
+		 * rebuilt from ep->peer_addr at dial time, so nothing to stash.
+		 */
+		pr_info("%s: initiator deferring RDMA dial to first UDS accept\n",
+			ep->name);
 		return 0;
 	}
 
@@ -1359,13 +1414,6 @@ int urp_rdma_init(struct urp_endpoint *ep, const char *peer_addr,
 
 err_destroy_listen:
 	urp_cm_id_destroy(&ep->listen_id);
-	return ret;
-
-err_destroy_all:
-	for (i = 0; i < ep->num_qps; i++) {
-		if (ep->qps[i].cm_id)
-			urp_cm_id_destroy(&ep->qps[i].cm_id);
-	}
 	return ret;
 }
 

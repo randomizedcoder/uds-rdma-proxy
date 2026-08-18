@@ -15,6 +15,7 @@
 
 #include "urp.h"
 #include "urp_conn_plan.h"	/* urp_should_unlink_listen_path (design 33) */
+#include "urp_lazy_plan.h"	/* urp_should_start_lazy_connect (design 33 P2) */
 #include <linux/dcache.h>	/* d_is_socket, d_really_is_negative */
 #include <linux/file.h>
 #include <linux/namei.h>
@@ -53,10 +54,50 @@ static int urp_accept_thread_fn(void *data)
 
 		pr_debug("UDS connection accepted\n");
 
+		/*
+		 * design 33 Phase 2: the first client connect fires the
+		 * one-shot lazy RDMA dial. atomic_cmpxchg flips the latch 0->1
+		 * exactly once; urp_should_start_lazy_connect gates on role +
+		 * that prior latch value. The state == ACTIVE guard rejects the
+		 * sliver where the accept thread is already live but state is
+		 * still pre-ACTIVE (urp_socket_init starts the thread before
+		 * urp_endpoint_activate sets state = ACTIVE).
+		 */
+		if (ep->state == URP_STATE_ACTIVE &&
+		    urp_should_start_lazy_connect(ep->is_initiator,
+			atomic_cmpxchg(&ep->connect_started, 0, 1) != 0))
+			urp_lazy_connect_start(ep);
+
 		/* Wait for RDMA to be ready before opening a stream. */
 		if (!ep->connected) {
+			/*
+			 * design 33 Phase 2 fail-fast: after retry exhaustion
+			 * the initiator's terminal paths set connect_failed and
+			 * consume cm_done. Don't park a late client on an
+			 * already-consumed completion -- reject it and let the
+			 * endpoint stay dead until `urp remove`/`add`.
+			 */
+			if (READ_ONCE(ep->connect_failed)) {
+				pr_err("RDMA connect terminally failed (%d); rejecting client\n",
+				       ep->cm_status);
+				sock_release(new_sock);
+				new_sock = NULL;
+				continue;
+			}
 			pr_info("waiting for RDMA connection...\n");
 			wait_for_completion_interruptible(&ep->cm_done);
+			/*
+			 * Drain releases the waiter via complete(&cm_done) in
+			 * urp_socket_cleanup before kthread_stop; a woken thread
+			 * whose endpoint is no longer ACTIVE must exit the loop
+			 * (release the held sock first -- it was accepted above)
+			 * so kthread_stop joins cleanly.
+			 */
+			if (ep->state != URP_STATE_ACTIVE) {
+				sock_release(new_sock);
+				new_sock = NULL;
+				break;
+			}
 			if (!ep->connected) {
 				pr_err("RDMA connection failed\n");
 				sock_release(new_sock);
@@ -388,6 +429,19 @@ void urp_socket_cleanup(struct urp_endpoint *ep)
 	 */
 	if (ep->listen_sock)
 		kernel_sock_shutdown(ep->listen_sock, SHUT_RDWR);
+
+	/*
+	 * design 33 Phase 2: release an accept-thread waiter parked on cm_done
+	 * (a client accepted but still waiting for the lazy dial to establish)
+	 * BEFORE kthread_stop -- kthread_stop sends no signal, so a thread in
+	 * wait_for_completion_interruptible would never wake and the join would
+	 * hang. state is already DRAINING here (set in urp_endpoint_drain), so
+	 * the woken thread takes the state != ACTIVE break and exits the loop.
+	 * Single accept thread, backlog 1 -> one possible waiter; a stray count
+	 * is harmless on an endpoint being torn down. This also closes a latent
+	 * pre-existing hang: a client parked here during the eager path's drain.
+	 */
+	complete(&ep->cm_done);
 
 	if (ep->accept_thread) {
 		kthread_stop(ep->accept_thread);

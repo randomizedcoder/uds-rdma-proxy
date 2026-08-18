@@ -442,6 +442,19 @@ struct urp_endpoint {
 	int			cm_status;
 	bool			connected;
 
+	/*
+	 * design 33 Phase 2: lazy connect-on-first-use. The initiator no longer
+	 * dials RDMA-CM at `urp add`; the first UDS client accept fires a
+	 * lifetime one-shot dial. connect_started is the latch (0 -> 1 via
+	 * atomic_cmpxchg in the accept thread; never reset). connect_failed is
+	 * set on the initiator's terminal retry-exhaustion paths so a late
+	 * client fails fast instead of parking forever on a consumed cm_done --
+	 * the endpoint stays dead until `urp remove`/`add`. Accessed lock-free
+	 * (single writer per terminal event, READ_ONCE/WRITE_ONCE).
+	 */
+	atomic_t		connect_started;
+	bool			connect_failed;
+
 	/* Phase 3b: per-endpoint probe ticker. Fires every
 	 * URP_PROBE_INTERVAL_MS on the system workqueue, emits one PING
 	 * per established QP, reschedules itself. Cancelled in
@@ -505,6 +518,8 @@ void urp_connect_work_fn(struct work_struct *w);
 void urp_connect_retry_work_fn(struct work_struct *w);
 /* Design 33 Phase 1.5: probe-detected silent-drop -> connect-retry (no CM event). */
 void urp_connect_retry_on_silent_drop(struct urp_endpoint *ep, struct urp_qp *qp);
+/* Design 33 Phase 2: fire the deferred initiator dial on first UDS accept. */
+void urp_lazy_connect_start(struct urp_endpoint *ep);
 
 int  urp_rdma_init(struct urp_endpoint *ep, const char *peer_addr,
 		   int peer_port, int bind_port, bool is_initiator);
