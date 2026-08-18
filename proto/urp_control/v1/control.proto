@@ -1,0 +1,87 @@
+// urp control-plane gRPC service (design 33 Phase 3).
+//
+// The acceptor endpoint serves this once its urp endpoint is rdma_listen-ing;
+// the initiator calls it and, on mutual-ready, opens a readiness gate the real
+// application starts behind. The application's own UDS connect then fires the
+// Phase-2 kernel dial. gRPC-OK is a *hint*, not a RoCEv2 guarantee (the control
+// channel shares L2/L3 but not the lossless L4 fabric), so the kernel Phase-1
+// retry stays the safety net underneath -- the control plane must never
+// duplicate it.
+//
+// Wire-compatibility discipline: proto3, additive-only, never renumber. Field
+// numbers 5..15 on the request/reply/ping/pong messages are reserved for future
+// additive growth; only `auth_token = 4` is un-reserved in v1. prost drops
+// unknown fields, so v1 <-> v1.x interop holds.
+
+syntax = "proto3";
+
+package urp.control.v1;
+
+service UrpControl {
+  // Single-shot reachability + version/param check (the bring-up gate).
+  rpc Rendezvous(RendezvousRequest) returns (RendezvousReply);
+
+  // Persistent bidi session: an initial readiness check, then jittered
+  // heartbeats + event-driven probes. The stream IS the liveness channel.
+  rpc Heartbeat(stream HeartbeatPing) returns (stream HeartbeatPong);
+
+  // reserved for later: NegotiateParams / DrainStream / GetStats
+}
+
+message RendezvousRequest {
+  string endpoint_name = 1; // acceptor endpoint the initiator wants to reach
+  uint32 proto_version = 2; // control-plane protocol version (URP_CONTROL_PROTO_VERSION)
+  string local_id = 3;      // caller identity (host/endpoint), observability only
+  bytes auth_token = 4;     // SHA-256(passwordFile); constant-time compared
+  reserved 5 to 15;
+}
+
+message RendezvousReply {
+  bool ready = 1;           // acceptor endpoint active + holding >=1 QP
+  string peer_id = 2;       // acceptor identity, observability only
+  uint32 num_qps = 3;       // acceptor endpoint QP count
+  uint32 buffer_size = 4;   // acceptor endpoint buffer size (param sanity check)
+  reserved 5 to 15;
+}
+
+// Why this ping was sent -- lets the acceptor and logs distinguish a routine
+// beat from an urgent data-path-failure probe.
+enum ProbeReason {
+  PROBE_REASON_UNKNOWN = 0;
+  PROBE_REASON_INITIAL = 1;      // first ping on a fresh stream (seq 0)
+  PROBE_REASON_PERIODIC = 2;     // the jittered ~60s heartbeat
+  PROBE_REASON_RDMA_FAILURE = 3; // out-of-band: the RDMA data path just went down
+}
+
+message HeartbeatPing {
+  // Auth + identity are sent on EVERY ping: the server stays stateless per
+  // message (cheap SHA-256 compare), so no per-session auth state to lose.
+  string endpoint_name = 1;
+  uint32 proto_version = 2;
+  string local_id = 3;
+  bytes auth_token = 4;
+
+  uint64 seq = 5;           // monotonic per stream, client-incrementing
+  ProbeReason reason = 6;
+  uint64 send_unix_ns = 7;  // client send timestamp, for RTT / clock-skew observability
+  reserved 8 to 15;
+}
+
+// Server health, so a busy/draining acceptor can shed load explicitly rather
+// than dropping the stream ("I'm too busy -- go away").
+enum ServerStatus {
+  SERVER_STATUS_OK = 0;
+  SERVER_STATUS_BUSY = 1;        // overloaded: client should back off suggested_backoff_ms
+  SERVER_STATUS_DRAINING = 2;    // going away: client should re-rendezvous elsewhere/later
+}
+
+message HeartbeatPong {
+  uint64 seq = 1;           // echoes the ping seq
+  bool ready = 2;           // acceptor endpoint active + rdma_listen-ing
+  ServerStatus status = 3;  // BUSY/DRAINING => client backs off / re-dials
+  uint32 suggested_backoff_ms = 4; // honored when status != OK
+  uint32 num_qps = 5;
+  uint32 buffer_size = 6;
+  string peer_id = 7;
+  reserved 8 to 15;
+}

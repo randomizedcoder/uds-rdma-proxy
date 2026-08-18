@@ -1,0 +1,34 @@
+[package]
+name = "urp-control"
+version = "0.1.0"
+edition = "2021"
+description = "urp control-plane gRPC daemon (design 33 Phase 3): acceptor serves Rendezvous/Heartbeat, initiator gates the app on mutual-ready"
+license = "GPL-2.0-or-later"
+
+[[bin]]
+name = "urp-control"
+path = "src/main.rs"
+
+[lib]
+name = "urp_control"
+path = "src/lib.rs"
+
+[dependencies]
+urp-netlink = { path = "../urp-netlink" }
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
+tokio-stream = "0.1"
+async-stream = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"
+subtle = "2"
+rand = "0.8"
+sd-notify = "0.4"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "1"
+
+[build-dependencies]
+tonic-build = "0.12"

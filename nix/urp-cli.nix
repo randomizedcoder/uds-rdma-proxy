@@ -25,8 +25,10 @@ let
         baseName == "urp-bench" ||
         baseName == "urp-cli" ||
         baseName == "urp-netlink" ||
+        baseName == "urp-control" ||
         baseName == "src" ||
-        baseName == "commands"
+        baseName == "commands" ||
+        baseName == "tests"
       )) ||
       # Plus the kernel UAPI header -- urp-cli's tests re-parse it for
       # constant-consistency checks against the Rust mirror.
@@ -36,10 +38,18 @@ let
         baseName == "uapi" ||
         baseName == "linux"
       )) ||
+      # Plus the proto tree -- urp-control's build.rs codegens from it, and
+      # cargo parses every workspace member even for `-p urp-cli`.
+      (type == "directory" && (
+        baseName == "proto" ||
+        baseName == "urp_control" ||
+        baseName == "v1"
+      )) ||
       (baseName == "Cargo.toml") ||
       (baseName == "Cargo.lock") ||
       (pkgs.lib.hasSuffix ".rs" baseName) ||
-      (pkgs.lib.hasSuffix ".h" baseName);
+      (pkgs.lib.hasSuffix ".h" baseName) ||
+      (pkgs.lib.hasSuffix ".proto" baseName);
   };
 in
 pkgs.rustPlatform.buildRustPackage {
