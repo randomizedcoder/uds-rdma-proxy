@@ -28,6 +28,7 @@
 #include <fcntl.h>
 #include <liburing.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -130,6 +131,19 @@ struct run {
 	uint64_t zc_sends;
 
 	int recv_wanted;	/* no recv armed: every buffer had echoes */
+
+	/* --pattern stream (§34.4). do_generate: this side sources traffic
+	 * (echo pattern, or the connect side of a stream). do_echo: reflect
+	 * peer originals (echo pattern only). */
+	int do_generate;
+	int do_echo;
+	int src_carry_empty;	/* stream source: outbound fully flushed */
+	uint64_t tx_wire_bytes;	/* stream source: wire bytes handed to the socket */
+	uint64_t rx_data_bytes;	/* stream sink: wire bytes of data delivered */
+	uint64_t rx_data_msgs;	/* stream sink: data frames delivered */
+	uint64_t t_first_rx_ns;	/* stream sink: first data frame (goodput window) */
+	uint64_t t_stream_end_ns;	/* stream sink: peer FIN seen */
+
 	int64_t rc;		/* first fatal error */
 };
 
@@ -246,13 +260,30 @@ static int on_msg(void *ctx, const struct bench_hdr *hdr,
 		return 0;
 	}
 
-	/* a peer original: echo it back */
-	if (hdr->flags & BENCH_FLAG_FIN)
-		r->peer_fin_seen = 1;
+	/* a peer original */
 	if (r->cfg->verify == BENCH_VERIFY_FULL &&
 	    bench_verify_payload(payload, hdr->payload_len, hdr->origin_id,
 				 hdr->seq) < 0)
 		return -BENCH_ECORRUPT;
+
+	if (!r->do_echo) {
+		/* stream sink: count delivered bytes, never echo. Goodput is
+		 * measured from the first data frame to the peer's FIN. */
+		if (hdr->flags & BENCH_FLAG_FIN) {
+			r->peer_fin_seen = 1;
+			r->t_stream_end_ns = now_ns();
+		} else {
+			if (r->t_first_rx_ns == 0)
+				r->t_first_rx_ns = now_ns();
+			r->rx_data_bytes += BENCH_HDR_SIZE + hdr->payload_len;
+			r->rx_data_msgs++;
+		}
+		return 0;
+	}
+
+	/* echo pattern: reflect it back */
+	if (hdr->flags & BENCH_FLAG_FIN)
+		r->peer_fin_seen = 1;
 	if (r->use_uring)
 		queue_echo_uring(r, mc, hdr, payload);
 	else
@@ -665,6 +696,20 @@ static int run_done(const struct run *r)
 {
 	uint32_t i;
 
+	if (r->cfg->pattern == BENCH_PATTERN_STREAM) {
+		if (r->do_generate) {
+			/* source: FIN sent, outbound flushed, no sends pending */
+			if (!r->own_fin_sent || !r->src_carry_empty)
+				return 0;
+			for (i = 0; i < r->n_sends; i++)
+				if (r->sends[i].in_use)
+					return 0;
+			return 1;
+		}
+		/* sink: drain until the source's FIN (or it closes). */
+		return r->peer_fin_seen || r->peer_closed;
+	}
+
 	if (r->peer_closed)
 		return 1;
 	if (!(r->own_fin_echoed && r->peer_fin_seen))
@@ -707,6 +752,11 @@ static int run_uring(struct run *r)
 	uint64_t hard_deadline;
 	uint32_t i;
 	int ret;
+
+	/* The one-way stream pattern is implemented on the blocking backend
+	 * only for now; the io_uring source/sink split is a follow-up (§34.4). */
+	if (cfg->pattern == BENCH_PATTERN_STREAM)
+		skip(cfg, "stream_mode_todo");
 
 	p.flags = 0;
 	if (cfg->mode == BENCH_MODE_URING_SQPOLL) {
@@ -942,7 +992,10 @@ static int queue_original_blocking(struct run *r, int fin)
 	uint64_t t = now_ns();
 	int ret;
 
-	if (bench_track_sent(&r->tracker, (uint32_t)r->next_seq, t) < 0)
+	/* In stream mode there are no echoes to clear the RTT window, so the
+	 * tracker is not the pacing gate (the socket/carry backpressure is). */
+	if (r->cfg->pattern == BENCH_PATTERN_ECHO &&
+	    bench_track_sent(&r->tracker, (uint32_t)r->next_seq, t) < 0)
 		return 1;	/* oldest window slot still in flight */
 
 	h.magic = BENCH_MAGIC;
@@ -959,6 +1012,7 @@ static int queue_original_blocking(struct run *r, int fin)
 	}
 	r->next_seq++;
 	r->sent_originals++;
+	r->tx_wire_bytes += BENCH_HDR_SIZE + h.payload_len;
 
 	ret = blk_queue(r, buf, BENCH_HDR_SIZE);
 	if (ret == 0 && h.payload_len) {
@@ -990,8 +1044,26 @@ static int run_blocking(struct run *r)
 		ssize_t got;
 		int ret;
 
-		/* top-up (writes drain into the carry buffer + socket) */
-		if (!r->own_fin_sent) {
+		/* top-up: the echo pattern and the stream *source* generate;
+		 * the stream *sink* (do_generate == 0) never sources traffic. */
+		if (r->do_generate && !r->own_fin_sent &&
+		    r->cfg->pattern == BENCH_PATTERN_STREAM) {
+			/* Blast while the socket accepts: carry empty means the
+			 * last write fully drained, so keep feeding; a partial
+			 * write leaves carry_len>0 and we fall through to poll
+			 * POLLOUT. No RTT tracker window here (§34.4). */
+			while (r->rc >= 0 && !r->own_fin_sent &&
+			       blk_state.carry_len == 0) {
+				if (r->deadline_ns && now_ns() >= r->deadline_ns)
+					remaining = 0;
+				else
+					remaining = r->goal > r->sent_originals ?
+						    r->goal - r->sent_originals : 0;
+				queue_original_blocking(r, remaining == 0);
+				if (remaining == 0)
+					break;	/* FIN queued */
+			}
+		} else if (r->do_generate && !r->own_fin_sent) {
 			if (r->deadline_ns && now_ns() >= r->deadline_ns)
 				remaining = 0;
 			else
@@ -1047,6 +1119,9 @@ static int run_blocking(struct run *r)
 				}
 			}
 		}
+		/* stream source completion (run_done) keys off a fully-drained
+		 * outbound path. */
+		r->src_carry_empty = (blk_state.carry_len == 0);
 		if (now_ns() > hard_deadline)
 			fail(r->cfg, "timeout", 0);
 	}
@@ -1085,8 +1160,9 @@ static void usage(void)
 		"  --mode {blocking,uring-rw,uring-fixed,uring-bufring,\n"
 		"          uring-sqpoll,uring-sendzc}\n"
 		"  --msg-size BYTES --batch N (--count N | --duration S)\n"
-		"  [--verify {none,header,full}] [--defer-taskrun]\n"
-		"  [--memcpy-baseline] [--quiet-zc]\n");
+		"  [--verify {none,header,full}] [--pattern {echo,stream}]\n"
+		"  [--defer-taskrun] [--memcpy-baseline] [--quiet-zc]\n"
+		"  (pattern stream: connect=source, listen=sink; blocking mode)\n");
 	exit(2);
 }
 
@@ -1108,6 +1184,10 @@ int main(int argc, char **argv)
 	char line[512];
 	uint32_t i;
 	int a, ret;
+
+	/* A stream source keeps writing after the sink may have closed; take
+	 * EPIPE as an error instead of a fatal signal. */
+	signal(SIGPIPE, SIG_IGN);
 
 	for (a = 1; a < argc; a++) {
 		const char *s = argv[a];
@@ -1134,6 +1214,9 @@ int main(int argc, char **argv)
 		} else if (!strcmp(s, "--verify") && a + 1 < argc) {
 			if (bench_verify_parse(argv[++a], &cfg.verify) < 0)
 				usage();
+		} else if (!strcmp(s, "--pattern") && a + 1 < argc) {
+			if (bench_pattern_parse(argv[++a], &cfg.pattern) < 0)
+				usage();
 		} else if (!strcmp(s, "--defer-taskrun")) {
 			cfg.defer_taskrun = 1;
 		} else if (!strcmp(s, "--memcpy-baseline")) {
@@ -1151,6 +1234,12 @@ int main(int argc, char **argv)
 		usage();
 
 	r.cfg = &cfg;
+	/* Role split (§34.4): echo sides both source+reflect; a stream source
+	 * (connect) only sources, a stream sink (listen) only drains. */
+	r.do_generate = cfg.pattern == BENCH_PATTERN_ECHO ||
+			cfg.role == BENCH_ROLE_CONNECT;
+	r.do_echo = cfg.pattern == BENCH_PATTERN_ECHO;
+	r.src_carry_empty = 1;
 	r.goal = cfg.count ? cfg.count : ~0ull;
 	r.n_rbufs = cfg.batch * 2 < 4 ? 4 : (cfg.batch * 2 > 64 ? 64 :
 					     cfg.batch * 2);
@@ -1218,11 +1307,16 @@ int main(int argc, char **argv)
 
 	if (ret < 0)
 		fail(&cfg, "run", ret);
-	if (r.peer_closed && !(r.own_fin_echoed && r.peer_fin_seen))
+	if (cfg.pattern == BENCH_PATTERN_ECHO) {
+		if (r.peer_closed && !(r.own_fin_echoed && r.peer_fin_seen))
+			fail(&cfg, "peer_closed_early", 0);
+		if (bench_stats_finalize(&r.stats, &rtt) < 0 && cfg.count > 0)
+			fail(&cfg, "no_samples", 0);
+	} else if (cfg.role == BENCH_ROLE_LISTEN && r.peer_closed &&
+		   !r.peer_fin_seen) {
+		/* stream sink: peer closed before its FIN => truncated. */
 		fail(&cfg, "peer_closed_early", 0);
-
-	if (bench_stats_finalize(&r.stats, &rtt) < 0 && cfg.count > 0)
-		fail(&cfg, "no_samples", 0);
+	}
 
 	cpu_ns = ((uint64_t)(ru1.ru_utime.tv_sec - ru0.ru_utime.tv_sec) *
 			  1000000ull +
@@ -1244,6 +1338,21 @@ int main(int argc, char **argv)
 		.reassembled = r.df.msgs_reassembled,
 		.msgs_rx_total = r.msgs_rx_total,
 	};
+	if (cfg.pattern == BENCH_PATTERN_STREAM) {
+		if (cfg.role == BENCH_ROLE_LISTEN) {
+			/* sink: authoritative goodput = bytes delivered over the
+			 * first-frame..FIN window. */
+			uint64_t win = r.t_stream_end_ns > r.t_first_rx_ns ?
+				       r.t_stream_end_ns - r.t_first_rx_ns :
+				       (t1 - t0);
+			rep.msgs = r.rx_data_msgs;
+			rep.bytes = r.rx_data_bytes;
+			rep.elapsed_ns = win;
+		} else {
+			/* source: bytes handed to the socket (secondary). */
+			rep.bytes = r.tx_wire_bytes;
+		}
+	}
 	if (bench_format_result(&rep, line, sizeof(line)) < 0)
 		fail(&cfg, "format", 0);
 	puts(line);

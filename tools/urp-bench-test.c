@@ -636,6 +636,36 @@ static void test_mode_verify_parse(void)
 	      "verify bogus");
 }
 
+static void test_pattern_parse(void)
+{
+	static const struct {
+		const char *s;
+		int want_ret;
+		enum bench_pattern want;
+	} cases[] = {
+		{ "echo", 0, BENCH_PATTERN_ECHO },	/* P: default */
+		{ "stream", 0, BENCH_PATTERN_STREAM },	/* P */
+		{ "bogus", -BENCH_EINVAL, 0 },		/* N */
+		{ "", -BENCH_EINVAL, 0 },		/* B: empty */
+		{ "STREAM", -BENCH_EINVAL, 0 },		/* C: case-sensitive */
+	};
+	size_t i;
+
+	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		enum bench_pattern p = BENCH_PATTERN_ECHO;
+		int ret = bench_pattern_parse(cases[i].s, &p);
+
+		CHECK(ret == cases[i].want_ret, "pattern '%s': ret %d",
+		      cases[i].s, ret);
+		if (ret == 0) {
+			CHECK(p == cases[i].want, "pattern '%s': got %d",
+			      cases[i].s, p);
+			CHECK(strcmp(bench_pattern_str(p), cases[i].s) == 0,
+			      "pattern '%s': str roundtrip", cases[i].s);
+		}
+	}
+}
+
 /* ---- result formatting ------------------------------------------------ */
 
 static void test_format_result(void)
@@ -698,6 +728,7 @@ int main(void)
 	test_stats();
 	test_config();
 	test_mode_verify_parse();
+	test_pattern_parse();
 	test_format_result();
 
 	printf("urp-bench-test: %d checks, %d failures\n", checks, failures);

@@ -53,6 +53,15 @@ pkgs.writeShellApplication {
     run_cell "$RS" "$C"  "rust-listen/c-connect uring-fixed"    --mode uring-fixed   "''${COMMON[@]}"
     run_cell "$C"  "$RS" "c-listen/rust-connect uring-bufring"  --mode uring-bufring "''${COMMON[@]}"
 
+    # One-way stream pattern (design 34 §34.4): connect=source, listen=sink,
+    # blocking backend. Same four lang combos, so the C<->Rust cells double as
+    # the differential for the stream path.
+    STREAM=(--mode blocking --pattern stream --msg-size 4076 --batch 8 --count 5000 --verify full)
+    run_cell "$C"  "$C"  "c<->c stream"              "''${STREAM[@]}"
+    run_cell "$RS" "$RS" "rust<->rust stream"        "''${STREAM[@]}"
+    run_cell "$C"  "$RS" "c-sink/rust-source stream" "''${STREAM[@]}"
+    run_cell "$RS" "$C"  "rust-sink/c-source stream" "''${STREAM[@]}"
+
     # sendzc evidence probe: SKIP with the eopnotsupp evidence line is the
     # expected outcome on AF_UNIX; a BENCH_FAIL is not.
     rm -f "$SOCK"

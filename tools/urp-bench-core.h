@@ -214,6 +214,18 @@ enum bench_verify {
 	BENCH_VERIFY_FULL,
 };
 
+/*
+ * App protocol, orthogonal to the io_uring mode (§34.4). ECHO is the
+ * symmetric RTT reflector (default, unchanged). STREAM is one-way bulk:
+ * the --connect side is the source (blast, never echo, no RTT), the
+ * --listen side is the sink (drain + count, never echo); goodput is
+ * measured at the sink.
+ */
+enum bench_pattern {
+	BENCH_PATTERN_ECHO,
+	BENCH_PATTERN_STREAM,
+};
+
 #define BENCH_BATCH_MAX		1024
 #define BENCH_ROLE_NONE		0
 #define BENCH_ROLE_LISTEN	1
@@ -224,6 +236,7 @@ struct bench_config {
 	uint16_t id;
 	enum bench_mode mode;
 	enum bench_verify verify;
+	enum bench_pattern pattern;	/* ECHO (default) or STREAM (§34.4) */
 	uint32_t msg_size;	/* total wire bytes incl. header */
 	uint32_t batch;
 	uint64_t count;		/* 0 = use duration */
@@ -234,8 +247,10 @@ struct bench_config {
 /* -BENCH_EINVAL on unknown string. */
 int bench_mode_parse(const char *s, enum bench_mode *out);
 int bench_verify_parse(const char *s, enum bench_verify *out);
+int bench_pattern_parse(const char *s, enum bench_pattern *out);
 const char *bench_mode_str(enum bench_mode m);
 const char *bench_verify_str(enum bench_verify v);
+const char *bench_pattern_str(enum bench_pattern p);
 
 int bench_config_validate(const struct bench_config *c);
 
