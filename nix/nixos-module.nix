@@ -13,6 +13,24 @@
 #     bind = "10.10.2.1:4791";
 #   };
 #
+# Optional design-33 Phase-3 control plane (deterministic cold-boot bring-up):
+#   services.urp.control.enable = true;
+#   services.urp.control.passwordFile = "/run/credentials/urp-ctl.psk";
+# For each endpoint this adds, on the same host, `urp-control-serve-<name>`
+# (acceptor side) and/or `urp-control-connect-<name>` (initiator side). The
+# initiator unit is Type=notify and fires sd_notify(READY=1) once the peer
+# reports ready. gRPC-OK is only a HINT — the kernel's Phase-1 retry stays the
+# safety net; the control plane never touches /run/urp.sock.
+#
+# APP ORDERING (not auto-generated — the app unit is out of this module's scope):
+# order your application/bench unit After + Wants the initiator control unit so
+# it starts behind the readiness gate, e.g.
+#   systemd.services.my-app = {
+#     after = [ "urp-control-connect-pair_initiator.service" ];
+#     wants = [ "urp-control-connect-pair_initiator.service" ];
+#   };
+# The app's own UDS connect then fires the Phase-2 lazy RDMA dial.
+#
 # This module is system-agnostic and therefore lives OUTSIDE the flake's
 # `flake-utils.eachDefaultSystem` wrapper; it receives `self` so it can resolve
 # the per-system `self.lib.<sys>.buildUrpKo` and `self.packages.<sys>.urp-cli`.
@@ -26,6 +44,12 @@ let
   # urp.ko built against the host kernel, and the netlink CLI, from this flake.
   urpKo = self.lib.${system}.buildUrpKo config.boot.kernelPackages;
   urpCli = self.packages.${system}.urp-cli;
+  urpControl = self.packages.${system}.urp-control;
+
+  # "10.10.2.1:4791" -> "10.10.2.1". The control plane rides the same L2/L3 as
+  # the RDMA data fabric (design 33 §33.6.3), so the acceptor's own bind IP /
+  # the initiator's peer IP is exactly the private control interface to use.
+  hostOf = hostPort: lib.head (lib.splitString ":" hostPort);
 
   endpointOpts = { name, config, ... }: {
     options = {
@@ -134,6 +158,78 @@ let
       urp remove ${ep.name} || true
     '';
   };
+
+  ctl = cfg.control;
+
+  # Acceptor control unit: serve Rendezvous/Heartbeat once the local endpoint
+  # is up. Plain long-running service (it never signals sd_notify READY — the
+  # *initiator* is the one that gates the app). The PSK is delivered via a
+  # systemd credential and passed as a FILE PATH, never on argv.
+  mkServeUnit = ep:
+    let
+      ip = if ctl.listenAddress != null then ctl.listenAddress else hostOf ep.bind;
+      listen = "${ip}:${toString ctl.port}";
+    in
+    lib.nameValuePair "urp-control-serve-${ep.name}" {
+      description = "urp-control acceptor (serve) for ${ep.name}";
+      # After the endpoint so it can read its own state to answer `ready`.
+      after = [ "urp-endpoint-${ep.name}.service" ];
+      requires = [ "urp-endpoint-${ep.name}.service" ];
+      wantedBy = [ "multi-user.target" ];
+      path = [ urpControl ];
+      serviceConfig = {
+        Type = "simple";
+        Restart = "on-failure";
+        RestartSec = 2;
+        LoadCredential = [ "psk:${toString ctl.passwordFile}" ];
+      };
+      script = ''
+        exec urp-control serve \
+          --endpoint ${ep.name} \
+          --listen ${listen} \
+          --session-cap ${toString ctl.sessionCap} \
+          --local-id ${ep.name} \
+          --password-file "$CREDENTIALS_DIRECTORY/psk"
+      '';
+    };
+
+  # Initiator control unit: dial the peer acceptor and gate the app on the peer
+  # reporting ready. Type=notify + sd_notify(READY=1) on gate-open; the app unit
+  # orders After/Wants this unit (see the module header). TimeoutStartSec is
+  # infinite so a slow-to-appear peer makes the daemon keep backing off/redialing
+  # (its own retry loop) rather than systemd killing it for missing READY.
+  mkConnectUnit = ep:
+    let
+      target = "http://${hostOf ep.peer}:${toString ctl.port}";
+    in
+    lib.nameValuePair "urp-control-connect-${ep.name}" {
+      description = "urp-control initiator (connect) for ${ep.name}";
+      after = [ "urp-endpoint-${ep.name}.service" ];
+      requires = [ "urp-endpoint-${ep.name}.service" ];
+      wantedBy = [ "multi-user.target" ];
+      path = [ urpControl ];
+      serviceConfig = {
+        Type = "notify";
+        NotifyAccess = "main";
+        TimeoutStartSec = "infinity";
+        Restart = "on-failure";
+        RestartSec = 2;
+        LoadCredential = [ "psk:${toString ctl.passwordFile}" ];
+      };
+      script = ''
+        exec urp-control connect \
+          --endpoint ${ep.name} \
+          --target ${target} \
+          --local-id ${ep.name} \
+          --heartbeat-ms ${toString ctl.heartbeatMs} \
+          --jitter-frac ${toString ctl.jitterFrac} \
+          --poll-ms ${toString ctl.pollIntervalMs} \
+          --password-file "$CREDENTIALS_DIRECTORY/psk"
+      '';
+    };
+
+  acceptorEndpoints = lib.filter (ep: ep.role == "acceptor") (lib.attrValues cfg.endpoints);
+  initiatorEndpoints = lib.filter (ep: ep.role == "initiator") (lib.attrValues cfg.endpoints);
 in
 {
   options.services.urp = {
@@ -156,22 +252,96 @@ in
       default = [ pkgs.rdma-core ];
       description = "Extra userspace packages (default: rdma-core for ibv_devices/show_gids).";
     };
+
+    control = {
+      enable = lib.mkEnableOption ''
+        the urp-control gRPC control plane (design 33 Phase 3). For each declared
+        endpoint it runs, on the same host, an acceptor `serve` unit and/or an
+        initiator `connect` unit. The initiator gates the application on the peer
+        reporting ready (systemd Type=notify), giving deterministic cold-boot
+        bring-up on top of the kernel's Phase-1 retry safety net
+      '';
+
+      port = lib.mkOption {
+        type = lib.types.port;
+        default = 50051;
+        description = "TCP port for the control plane (acceptor listens, initiator dials).";
+      };
+
+      passwordFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        description = ''
+          Path to the control-plane PSK file. Delivered to the units via a systemd
+          credential (`LoadCredential`) and passed to the daemon as a FILE PATH
+          (`--password-file`), never on argv/env. Hashed (SHA-256) in-process and
+          constant-time compared. Distinct from an endpoint's own `passwordFile`.
+        '';
+      };
+
+      listenAddress = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "10.10.2.1";
+        description = ''
+          Address the acceptor `serve` binds. When null (default) it is derived
+          per-endpoint as the IP of that endpoint's `bind` — the private control
+          fabric — so the control plane is NEVER exposed on 0.0.0.0 in a
+          deployment. Set explicitly only to override that derivation.
+        '';
+      };
+
+      sessionCap = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = 256;
+        description = "Max concurrent Heartbeat streams the acceptor admits (0 = unbounded).";
+      };
+
+      pollIntervalMs = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 1000;
+        description = "Initiator kernel-state poll interval feeding the RDMA-failure probe (ms).";
+      };
+
+      heartbeatMs = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 60000;
+        description = "Initiator base heartbeat cadence (ms), jittered by jitterFrac.";
+      };
+
+      jitterFrac = lib.mkOption {
+        type = lib.types.float;
+        default = 0.10;
+        description = "Heartbeat jitter fraction (0.10 = +/-10%) to desync many hosts.";
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
-    assertions = lib.mapAttrsToList (n: ep: {
+    assertions = (lib.mapAttrsToList (n: ep: {
       assertion =
         if ep.role == "acceptor"
         then ep.connectPath != null && ep.bind != null
         else ep.listenPath != null && ep.peer != null;
       message = "services.urp.endpoints.${n}: acceptor needs connectPath+bind; initiator needs listenPath+peer.";
-    }) cfg.endpoints;
+    }) cfg.endpoints)
+    ++ [
+      {
+        assertion = !cfg.control.enable || cfg.control.passwordFile != null;
+        message = "services.urp.control.enable requires services.urp.control.passwordFile (the gRPC PSK).";
+      }
+    ];
 
     boot.extraModulePackages = [ urpKo ];
     boot.kernelModules = cfg.rdmaKernelModules ++ [ "urp" ];
 
     environment.systemPackages = [ urpCli ] ++ cfg.extraPackages;
 
-    systemd.services = lib.mapAttrs' (_: ep: mkUnit ep) cfg.endpoints;
+    systemd.services =
+      (lib.mapAttrs' (_: ep: mkUnit ep) cfg.endpoints)
+      // lib.optionalAttrs cfg.control.enable (lib.listToAttrs (
+        (map mkServeUnit acceptorEndpoints)
+        ++ (map mkConnectUnit initiatorEndpoints)
+      ));
   };
 }

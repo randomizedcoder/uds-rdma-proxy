@@ -18,7 +18,7 @@ drop self-heal. Phases 2–3 not started.)
 | 0 | [Compounding recovery bugs](#phase-0-compounding-recovery-bugs) | Done — code + kernel matrix + hp1/hp3 hw verified | 4/4 |
 | 1 | [Bounded kernel connect-retry + backoff](#phase-1-bounded-kernel-connect-retry--backoff) | Done — code + CI + hp1/hp3 hw verified (incl. Phase 1.5 probe→retry for silent drops) | 6/6 |
 | 2 | [Lazy connect on first UDS accept](#phase-2-lazy-connect-on-first-uds-accept) | Done — code + CI + hp1/hp3 hw verified (128/128 matrix + 5 lazy scenarios) | 5/5 |
-| 3 | [Userland gRPC control plane](#phase-3-userland-grpc-control-plane) | Not started | 0/5 |
+| 3 | [Userland gRPC control plane](#phase-3-userland-grpc-control-plane) | Code done; hp1/hp3 verify pending | 4/5 |
 
 Legend: **Not started** / **In progress** / **Done** / **Blocked**.
 
@@ -291,43 +291,59 @@ module `urp_lazy_connect_start` symbol confirmed in the loaded ko before test.
 
 ## Phase 3: Userland gRPC control plane
 
-**Status**: Not started.
+**Status**: Code complete + sandbox-verified across three merged PRs
+(#46 netlink lib, #47 proto + daemon, #48 auth hardening) plus this deploy PR;
+hp1/hp3 cold-boot verify pending.
 
-A small userland rendezvous over IP (RoCEv2 already implies L3 reachability) that,
-on success, triggers the initiator's UDS connect → (via Phase 2) the kernel dials
-RDMA. Committed to protobuf + gRPC as an extensible control plane
-(design [§33.6](33-initiator-connection-bringup.md)).
+A userland gRPC control plane: the acceptor serves `Rendezvous` (unary) +
+`Heartbeat` (bidi) once its endpoint is up; the initiator dials it and, on the
+peer reporting ready, opens a monotonic readiness gate (`sd_notify READY=1`) the
+application starts behind. Its UDS connect then triggers the Phase-2 lazy dial.
+gRPC-OK is a hint, not a RoCEv2 guarantee — the Phase-1 kernel retry stays the
+safety net (design [§33.6](33-initiator-connection-bringup.md)).
 
 ### Definition of done
 
-- [ ] New Rust crate `urp-control/` (tonic/prost, matching `urp-cli`), wired into
-      the workspace `Cargo.toml` + nix `packages` (mindful of the
-      `microvms.packages`/`redpandaUdsTest` follows caveat).
-- [ ] `proto/urp_control/v1/control.proto`: `UrpControl.Rendezvous`
-      (RendezvousRequest/Reply) with reserved numbers for
-      `NegotiateParams`/`Heartbeat`/`DrainStream`/`GetStats`; additive-only
-      versioning discipline documented.
-- [ ] Asymmetric topology: acceptor serves the RPC once `rdma_listen`-ing;
-      initiator calls it, and on `peer_ready` connects its local UDS → triggers
-      Phase-2 lazy connect. Control address from the endpoint's peer IP:port.
-- [ ] NixOS: optional `services.urp.control = { enable; port; }` in
-      `nix/nixos-module.nix`; acceptor server unit ordered before `urp add`;
-      initiator `urp add` gated behind a client-side `Rendezvous`.
-- [ ] Tests: Rust unit tests (proto round-trip, peer-ready gating,
-      retry-until-ready); a VM/hw integration proving cold simultaneous boot →
-      rendezvous → lazy connect → `established` → BENCH_OK, zero manual steps.
+- [x] New Rust crate `urp-control/` (tonic/prost, matching `urp-cli`), wired into
+      the workspace `Cargo.toml` + nix `packages`. Shares generic-netlink with
+      `urp-cli` via the extracted `urp-netlink` lib (PR #46).
+- [x] `proto/urp_control/v1/control.proto`: `UrpControl.Rendezvous` +
+      `Heartbeat` (monotonic seq, jittered ~60s cadence, event-driven
+      `PROBE_RDMA_FAILURE`), PSK `auth_token=4`, `reserved 5..15`,
+      `NegotiateParams`/`DrainStream`/`GetStats` reserved; additive-only
+      discipline documented (PR #47).
+- [x] Asymmetric topology: acceptor `serve` reads its own endpoint state to
+      answer `ready`; initiator `connect` gates the app on peer-ready → its UDS
+      connect triggers Phase-2 lazy connect. Control target = the endpoint's
+      peer IP + control port. Server overload (`RESOURCE_EXHAUSTED`/BUSY) +
+      constant-time PSK auth-before-slot (PR #48).
+- [x] NixOS: `services.urp.control = { enable; port; passwordFile; listenAddress;
+      sessionCap; pollIntervalMs; heartbeatMs; jitterFrac; }` in
+      `nix/nixos-module.nix` — per-endpoint `urp-control-serve-<name>` (Type=simple,
+      After its endpoint) + `urp-control-connect-<name>` (Type=notify,
+      TimeoutStartSec=infinity, After its endpoint). PSK via `LoadCredential`
+      (file path, never argv); serve binds the derived private fabric IP, never
+      0.0.0.0. App-ordering contract documented in the module header (this PR).
+- [ ] hp1/hp3 integration: cold simultaneous boot → rendezvous → gate → lazy
+      connect → `established` → BENCH_OK, zero manual steps (+ bad-PSK
+      gate-closed, acceptor-restart no-bounce, RDMA-failure probe).
 
 ### Verification
 
-- [ ] `cargo test` for `urp-control` green; `nix run .#ci-local` GREEN.
+- [x] `cargo test -p urp-control` green (19 unit + 6 loopback over 127.0.0.1);
+      `nix run .#ci-local` GREEN 11/11 + fuzz 4/0. NixOS module `nix eval` builds
+      both control units with the expected serviceConfig + derived private bind.
 - [ ] Cold simultaneous boot on hp1/hp3 reaches BENCH_OK with no manual steps.
 
 ### Notes
 
-- One-shot for v1 (bring-up only), structured so a persistent
-  heartbeat/liveness/reconnect mode is an additive follow-up. gRPC-OK is a hint,
-  not a RoCEv2 guarantee (the control channel shares L2/L3/ARP but not L4/QoS/PFC),
-  so it is always paired with the Phase-1 retry safety-net.
+- v1 ships both bring-up (`Rendezvous`) and a persistent liveness session
+  (`Heartbeat`), so the reconnect/probe layer is not a follow-up. gRPC-OK is a
+  hint, not a RoCEv2 guarantee (the control channel shares L2/L3/ARP but not
+  L4/QoS/PFC), so it is always paired with the Phase-1 retry safety-net.
+- Cleartext-PSK replay is the accepted v1 posture (private RoCEv2 control
+  fabric); mTLS (design 17 tier 2) is the roadmapped additive upgrade over the
+  reserved auth surface.
 
 ### Results
 
