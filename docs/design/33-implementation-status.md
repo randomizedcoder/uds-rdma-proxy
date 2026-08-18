@@ -17,7 +17,7 @@ drop self-heal. Phases 2–3 not started.)
 |---|-------|--------|------------|
 | 0 | [Compounding recovery bugs](#phase-0-compounding-recovery-bugs) | Done — code + kernel matrix + hp1/hp3 hw verified | 4/4 |
 | 1 | [Bounded kernel connect-retry + backoff](#phase-1-bounded-kernel-connect-retry--backoff) | Done — code + CI + hp1/hp3 hw verified (incl. Phase 1.5 probe→retry for silent drops) | 6/6 |
-| 2 | [Lazy connect on first UDS accept](#phase-2-lazy-connect-on-first-uds-accept) | In progress — code complete; CI + hp1/hp3 hw verification pending | 5/5 |
+| 2 | [Lazy connect on first UDS accept](#phase-2-lazy-connect-on-first-uds-accept) | Done — code + CI + hp1/hp3 hw verified (128/128 matrix + 5 lazy scenarios) | 5/5 |
 | 3 | [Userland gRPC control plane](#phase-3-userland-grpc-control-plane) | Not started | 0/5 |
 
 Legend: **Not started** / **In progress** / **Done** / **Blocked**.
@@ -224,8 +224,8 @@ one-shot bridge from "silent" to "CM-visible".
 
 ## Phase 2: Lazy connect on first UDS accept
 
-**Status**: In progress — code complete (branch `design-33-lazy-connect`);
-CI + hp1/hp3 hardware verification pending.
+**Status**: Done — code complete + `nix run .#ci-local` GREEN + **hp1/hp3
+hardware-verified** (all 6 scenarios below, real RoCEv2, both kernel 7.1.8).
 
 Dial RDMA on the first UDS accept, not at `urp add` — an idle endpoint holds no
 RDMA resources, and bring-up mirrors `connect()`-on-first-use (the TCP-socket
@@ -258,13 +258,28 @@ analogy, design R4).
 
 ### Verification
 
-- [ ] Idle initiator shows no QP/CM/PD until first UDS client (`urp show`); first
-      client triggers connect → `established` → BENCH_OK.
-- [ ] Clean `drain`+`remove` of a never-connected endpoint leaves no stuck kthread.
-- [ ] Boot-race safety-net: first client while acceptor is down → lazy dial fails →
-      Phase-1 retry → `established` once acceptor is up (no manual restart).
-- [ ] Fail-fast: exhaust the retry budget with the acceptor down → late client
-      rejected immediately (not hung); recovers only after `urp remove`/`add`.
+hp1 (acceptor) ↔ hp3 (initiator), ConnectX-4 Lx 25GbE RoCEv2, both kernel 7.1.8,
+module `urp_lazy_connect_start` symbol confirmed in the loaded ko before test.
+
+- [x] **Idle = no RDMA** — hp3 boots to `initiator deferring RDMA dial to first
+      UDS accept` + `listening on UDS`, `connected: no`, no resolve/route/
+      established for 60 s until a client connects; hp1 listening.
+- [x] **First client triggers connect** — the matrix's first bench client at
+      t≈84.6 s fires `first client connect -> dialing RDMA` → resolved → route →
+      `all 1 QPs established`; **128/128 BENCH_OK verify=full** (full C×C×Rust
+      matrix, matching the design-32 baseline through the lazy path).
+- [x] **Clean drain of a never-connected endpoint** — fresh initiator (deferring,
+      1 parked `urp-accept` kthread), `systemctl stop` returns immediately (no 45 s
+      hang), 0 kthreads after, `removed stale socket`, no leaked cm_id.
+- [x] **Boot-race safety-net** — client triggers the one-shot dial while the
+      acceptor is down → Phase-1 retry cycles (6→12, backoff to 2000 ms ceil, client
+      already gone) → acceptor up mid-retry → auto-`established` at retry 12 with
+      **no hp3 restart**.
+- [x] **Fail-fast after exhaustion** — with `connect_max_attempts=3` and the
+      acceptor down, client1 exhausts (retry 1→3, terminal `CM down: rejected`) and
+      is released; client2 is **rejected in 4 ms** (`RDMA connect terminally
+      failed (8); rejecting client`), no re-dial; stays dead even after the acceptor
+      returns; recovers only after a service restart (= `urp remove`/`add`).
 
 ### Notes
 
