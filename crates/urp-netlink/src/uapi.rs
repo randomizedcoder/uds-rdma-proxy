@@ -145,6 +145,17 @@ impl UrpEndpointState {
             Self::Stopped => "stopped",
         }
     }
+    /// Inverse of [`as_str`]; maps a decoded state string (as carried on
+    /// [`crate::format::Endpoint::state`]) back to the enum. Unknown -> None.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "creating" => Some(Self::Creating),
+            "active" => Some(Self::Active),
+            "draining" => Some(Self::Draining),
+            "stopped" => Some(Self::Stopped),
+            _ => None,
+        }
+    }
 }
 
 // --- enum urp_qp_state ---

@@ -2,12 +2,12 @@ use std::net::SocketAddr;
 
 use clap::Args;
 
-use crate::attr::AttrBuf;
+use urp_netlink::attr::AttrBuf;
 use crate::commands::num_qps_parser;
-use crate::error::UrpError;
-use crate::format::encode_sockaddr_in6;
-use crate::netlink::UrpSocket;
-use crate::uapi::{UrpAttr, UrpCmd, UrpEndpointAttr, URP_EP_MODE_K0, URP_EP_MODE_MULTISTREAM};
+use urp_netlink::error::UrpError;
+use urp_netlink::format::encode_sockaddr_in6;
+use urp_netlink::netlink::UrpSocket;
+use urp_netlink::uapi::{UrpAttr, UrpCmd, UrpEndpointAttr, URP_EP_MODE_K0, URP_EP_MODE_MULTISTREAM};
 
 /// Endpoint operating mode (mirrors kernel `enum urp_ep_mode`).
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Default, clap::ValueEnum)]

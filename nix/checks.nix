@@ -23,6 +23,7 @@ let
         baseName == "uds-rdma-protocol-ffi" ||
         baseName == "urp-bench" ||
         baseName == "urp-cli" ||
+        baseName == "urp-netlink" ||
         baseName == "src" ||
         baseName == "commands"
       )) ||
@@ -159,6 +160,30 @@ in
 
     cargoBuildFlags = [ "-p" "urp-bench" ];
     cargoTestFlags  = [ "-p" "urp-bench" ];
+
+    installPhase = ''
+      runHook preInstall
+      mkdir -p $out
+      touch $out/passed
+      runHook postInstall
+    '';
+  };
+
+  # urp-netlink lib tests (design 33 Phase 3 PR1). Same sentinel pattern;
+  # covers the uapi<->kernel-header mirror test (moved here from urp-cli)
+  # plus the attr/format codecs and the is_endpoint_ready predicate. The
+  # crate is dependency-free (libc/thiserror/serde), so this runs fully
+  # sandboxed. Also builds urp-cli's tests, which now depend on the lib.
+  urp-netlink-tests = pkgs.rustPlatform.buildRustPackage {
+    pname = "urp-netlink-tests";
+    version = "0.1.0";
+    inherit src;
+
+    cargoLock.lockFile = ../Cargo.lock;
+    nativeBuildInputs = [ rustToolchain ];
+
+    cargoBuildFlags = [ "-p" "urp-netlink" "-p" "urp-cli" ];
+    cargoTestFlags  = [ "-p" "urp-netlink" "-p" "urp-cli" ];
 
     installPhase = ''
       runHook preInstall

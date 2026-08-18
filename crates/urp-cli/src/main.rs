@@ -1,15 +1,10 @@
 //! `urp` -- CLI for the urp generic-netlink family.
 
-mod attr;
 mod commands;
-mod error;
-mod format;
-mod netlink;
-mod uapi;
 
 use clap::{Parser, Subcommand};
 
-use crate::error::UrpError;
+use urp_netlink::UrpError;
 
 #[derive(Parser, Debug)]
 #[command(name = "urp", version, about = "UDS-RDMA Proxy control CLI")]

@@ -47,6 +47,9 @@ jobs:
       - name: urp-bench Rust twin tests (design 30 B5)
         run: nix build -L .#checks.x86_64-linux.urp-bench-rs-tests
 
+      - name: urp-netlink lib tests (design 33 Phase 3)
+        run: nix build -L .#checks.x86_64-linux.urp-netlink-tests
+
       - name: urp-fast command validators (design 31 trust boundary)
         run: nix build -L .#checks.x86_64-linux.urp-fast-validate-units
 

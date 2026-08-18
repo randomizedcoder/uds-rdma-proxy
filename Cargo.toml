@@ -5,6 +5,7 @@ members = [
     "crates/uds-rdma-protocol-ffi",
     "crates/urp-bench",
     "crates/urp-cli",
+    "crates/urp-netlink",
 ]
 
 # The FFI staticlib must abort on panic (no unwinder in the kernel) and
