@@ -5,6 +5,7 @@
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status, Streaming};
@@ -15,6 +16,11 @@ use crate::logic::{
 use crate::pb::urp_control_server::UrpControl;
 use crate::pb::{HeartbeatPing, HeartbeatPong, RendezvousReply, RendezvousRequest};
 use crate::state::EndpointStateSource;
+
+/// Max time to wait for a peer's first ping before authenticating it. Bounds a
+/// slowloris open (stream opened, nothing ever sent) so it cannot pin a session
+/// slot while unauthenticated.
+const FIRST_PING_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Shared server state. `session_cap == 0` disables the cap (unbounded).
 pub struct ControlService<S: EndpointStateSource> {
@@ -70,9 +76,26 @@ impl<S: EndpointStateSource + 'static> UrpControl for ControlService<S> {
         &self,
         request: Request<Streaming<HeartbeatPing>>,
     ) -> Result<Response<Self::HeartbeatStream>, Status> {
-        // Overload: shed a *new* stream when at/over the session cap. The
-        // gate load is checked against the current count before we admit this
-        // one ("I'm too busy -- go away" => RESOURCE_EXHAUSTED).
+        let mut inbound = request.into_inner();
+
+        // Authenticate the FIRST ping BEFORE committing a session slot. The old
+        // order (reserve slot, then auth per-ping) let an unauthenticated peer
+        // exhaust the cap: opening `session_cap` streams -- or one that sends
+        // nothing at all -- pinned every slot with no PSK. The bounded wait also
+        // evicts a slowloris open that never sends a ping.
+        let first = match tokio::time::timeout(FIRST_PING_TIMEOUT, inbound.message()).await {
+            Ok(Ok(Some(ping))) => ping,
+            Ok(Ok(None)) => return Err(Status::unauthenticated("stream closed before any ping")),
+            Ok(Err(status)) => return Err(status),
+            Err(_) => return Err(Status::deadline_exceeded("no ping within first-ping timeout")),
+        };
+        if let AuthOutcome::Unauthenticated = authenticate(&first.auth_token, &self.expected_token) {
+            return Err(Status::unauthenticated("bad psk"));
+        }
+
+        // Authenticated -- only now admit against the session cap ("I'm too busy
+        // -- go away" => RESOURCE_EXHAUSTED). Shedding only authenticated peers
+        // means a flood of anonymous opens can no longer deny legitimate ones.
         let current = self.active.load(Ordering::SeqCst);
         if should_shed(current, self.session_cap) {
             return Err(Status::resource_exhausted("server at session capacity"));
@@ -82,10 +105,13 @@ impl<S: EndpointStateSource + 'static> UrpControl for ControlService<S> {
 
         let source = self.source.clone();
         let expected = self.expected_token.clone();
-        let mut inbound = request.into_inner();
 
         let out = async_stream::try_stream! {
             let _guard = guard; // dropped when the stream ends
+            // Answer the first ping (already authenticated above).
+            let snap = source.snapshot(&first.endpoint_name).await;
+            yield build_pong(first.seq, &snap, false, MIN_BACKOFF_MS);
+            // Subsequent pings re-auth per message (stateless server auth).
             while let Some(ping) = inbound.message().await? {
                 if let AuthOutcome::Unauthenticated = authenticate(&ping.auth_token, &expected) {
                     Err(Status::unauthenticated("bad psk"))?;

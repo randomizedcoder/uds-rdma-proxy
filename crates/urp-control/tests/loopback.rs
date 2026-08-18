@@ -307,16 +307,86 @@ async fn server_sheds_new_stream_at_cap() {
     // Pull one pong so we know the handler is running (active == 1).
     let _ = stream1.message().await.unwrap();
 
-    // Second stream: at cap -> RESOURCE_EXHAUSTED.
-    let (_tx2, rx2) = mpsc::channel::<HeartbeatPing>(4);
+    // Second stream: sends a VALID first ping (shed now happens after auth), so
+    // it authenticates and is then rejected at the cap -> RESOURCE_EXHAUSTED.
+    let (tx2, rx2) = mpsc::channel::<HeartbeatPing>(4);
+    tx2.send(HeartbeatPing {
+        endpoint_name: "pair".into(),
+        auth_token: token.to_vec(),
+        seq: 0,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
     let err = client
         .heartbeat(ReceiverStream::new(rx2))
         .await
         .expect_err("second stream should be shed at cap");
     assert_eq!(err.code(), tonic::Code::ResourceExhausted, "got: {err:?}");
 
-    // Keep tx1 alive until here so stream1 stayed open.
+    // Keep the senders alive until here so both streams stayed open.
     drop(tx1);
+    drop(tx2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn silent_open_does_not_consume_cap() {
+    // Regression (security): a peer that opens a Heartbeat stream and never
+    // sends a ping must NOT pin a session slot. Under the old admit-then-auth
+    // order this unauthenticated slowloris open exhausted the cap; now the slot
+    // is only reserved after the first ping authenticates.
+    let token = compute_token(b"cap-test");
+    let source = Arc::new(FakeSource::new(EndpointSnapshot {
+        present: true,
+        state: Some(UrpEndpointState::Active),
+        num_qps: 1,
+        buffer_size: 4096,
+        peer_id: "acc".into(),
+    }));
+    let svc = ControlService::new(source, token, 1); // cap = 1
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = TcpListenerStream::new(listener);
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(UrpControlServer::new(svc))
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+    let target = format!("http://127.0.0.1:{}", addr.port());
+
+    let mut client = UrpControlClient::connect(target).await.unwrap();
+
+    // A silent open in flight: the server is blocked awaiting its first ping and
+    // has reserved no slot. Hold `_silent_tx` so the request stream stays open.
+    let mut c_silent = client.clone();
+    let (_silent_tx, silent_rx) = mpsc::channel::<HeartbeatPing>(4);
+    tokio::spawn(async move {
+        let _ = c_silent.heartbeat(ReceiverStream::new(silent_rx)).await;
+    });
+    // Let the silent open reach the server (would have pinned the slot before).
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // A legitimate stream must still be admitted despite the silent open.
+    let (tx, rx) = mpsc::channel::<HeartbeatPing>(4);
+    tx.send(HeartbeatPing {
+        endpoint_name: "pair".into(),
+        auth_token: token.to_vec(),
+        seq: 0,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let mut good = client
+        .heartbeat(ReceiverStream::new(rx))
+        .await
+        .expect("legit stream must be admitted; silent open must not consume the cap")
+        .into_inner();
+    let pong = good.message().await.unwrap().expect("a pong");
+    assert!(pong.ready, "admitted stream should get a ready pong");
+    drop(tx);
 }
 
 /// build_pong is exercised indirectly above; assert the shape once here too so a
