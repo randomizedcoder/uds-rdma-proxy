@@ -7,7 +7,10 @@ use crate::commands::num_qps_parser;
 use urp_netlink::error::UrpError;
 use urp_netlink::format::encode_sockaddr_in6;
 use urp_netlink::netlink::UrpSocket;
-use urp_netlink::uapi::{UrpAttr, UrpCmd, UrpEndpointAttr, URP_EP_MODE_K0, URP_EP_MODE_MULTISTREAM};
+use urp_netlink::uapi::{
+    UrpAttr, UrpCmd, UrpEndpointAttr, URP_EP_KIND_FAST, URP_EP_KIND_UDS, URP_EP_MODE_K0,
+    URP_EP_MODE_MULTISTREAM,
+};
 
 /// Endpoint operating mode (mirrors kernel `enum urp_ep_mode`).
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Default, clap::ValueEnum)]
@@ -24,6 +27,26 @@ impl EpMode {
         match self {
             EpMode::Multistream => URP_EP_MODE_MULTISTREAM,
             EpMode::K0 => URP_EP_MODE_K0,
+        }
+    }
+}
+
+/// Endpoint data path (mirrors kernel `enum urp_ep_kind`).
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Default, clap::ValueEnum)]
+pub enum EpKind {
+    /// Copy path: the kernel runs an AF_UNIX pump (default; unmodified apps).
+    #[default]
+    Uds,
+    /// Zero-copy path: the app drives the QP over /dev/urp (design 31; the module
+    /// must be built with CONFIG_URP_FAST, else the kernel rejects with EOPNOTSUPP).
+    Fast,
+}
+
+impl EpKind {
+    fn as_u8(self) -> u8 {
+        match self {
+            EpKind::Uds => URP_EP_KIND_UDS,
+            EpKind::Fast => URP_EP_KIND_FAST,
         }
     }
 }
@@ -72,6 +95,10 @@ pub struct AddArgs {
     /// Endpoint mode: `multistream` (default) or `k0` (legacy single connection).
     #[arg(long, value_enum, default_value_t = EpMode::Multistream)]
     pub mode: EpMode,
+
+    /// Endpoint kind: `uds` (default, copy path) or `fast` (zero-copy, design 31).
+    #[arg(long, value_enum, default_value_t = EpKind::Uds)]
+    pub kind: EpKind,
 }
 
 pub fn build_payload(args: &AddArgs) -> Vec<u8> {
@@ -110,6 +137,12 @@ pub fn build_payload(args: &AddArgs) -> Vec<u8> {
          * kernel defaults an absent attr to multistream). */
         if args.mode != EpMode::Multistream {
             ep.put_u8(UrpEndpointAttr::Mode as u16, args.mode.as_u8());
+        }
+        /* Same forward-compat rule for kind: only send the attr for the
+         * non-default (fast) path so a newer CLI keeps working against an older
+         * module for the common uds case (absent attr defaults to uds). */
+        if args.kind != EpKind::Uds {
+            ep.put_u8(UrpEndpointAttr::Kind as u16, args.kind.as_u8());
         }
     });
     top.into_bytes()

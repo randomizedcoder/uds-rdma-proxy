@@ -33,13 +33,15 @@
 /*
  * The fast-path char device leans on modern io_uring plumbing: the split-out
  * <linux/io_uring/cmd.h> header (6.7) and the 4-argument pin_user_pages (the
- * vmas parameter was dropped in 6.5). Gate the whole device on >= 6.8 -- the
- * same boundary urp.h already uses -- and stub the register/unregister hooks
- * on older LTS kernels so those compile-only CI gates stay green. The pure
- * validators in urp_cmd_validate.c compile on every supported kernel, so
- * KUnit and the userspace check exercise the trust boundary regardless.
+ * vmas parameter was dropped in 6.5). Gate the whole device on URP_FAST_ENABLED
+ * (urp.h) -- CONFIG_URP_FAST && >= 6.8 -- and stub the register/unregister hooks
+ * otherwise (older LTS, or a deliberate CONFIG_URP_FAST=n build) so those
+ * compile-only CI gates stay green and the zero-copy path can be excluded
+ * wholesale. The pure validators in urp_cmd_validate.c compile on every
+ * supported kernel, so KUnit and the userspace check exercise the trust
+ * boundary regardless.
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+#if URP_FAST_ENABLED
 
 #include <linux/miscdevice.h>
 #include <linux/fs.h>
@@ -412,15 +414,17 @@ void urp_cmd_dev_unregister(void)
 	misc_deregister(&urp_cmd_misc);
 }
 
-#else /* LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0) */
+#else /* !URP_FAST_ENABLED */
 
 /*
- * Older LTS kernels lack the modern uring_cmd / pin_user_pages plumbing. The
- * fast path is simply absent there; the rest of the module is unaffected.
+ * The fast path is absent: either the kernel predates the modern uring_cmd /
+ * pin_user_pages plumbing (< 6.8) or the module was built CONFIG_URP_FAST=n to
+ * exclude the zero-copy path. Either way /dev/urp is not registered and the rest
+ * of the module is unaffected; a `fast` endpoint is refused at the control plane.
  */
 int urp_cmd_dev_register(void)
 {
-	pr_info("fast-path char device needs kernel >= 6.8; disabled\n");
+	pr_info("fast-path char device disabled (needs CONFIG_URP_FAST and kernel >= 6.8)\n");
 	return 0;
 }
 
@@ -428,4 +432,4 @@ void urp_cmd_dev_unregister(void)
 {
 }
 
-#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0) */
+#endif /* URP_FAST_ENABLED */

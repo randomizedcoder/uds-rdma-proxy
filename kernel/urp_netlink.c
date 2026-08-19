@@ -67,6 +67,7 @@ static const struct nla_policy urp_endpoint_policy[URP_ENDPOINT_A_MAX + 1] = {
 					    .len  = URP_PASSWORD_MAX - 1 },
 	[URP_ENDPOINT_A_STATE]		= NLA_POLICY_RANGE(NLA_U8, 0, URP_STATE_MAX),
 	[URP_ENDPOINT_A_MODE]		= NLA_POLICY_RANGE(NLA_U8, 0, URP_EP_MODE_MAX),
+	[URP_ENDPOINT_A_KIND]		= NLA_POLICY_RANGE(NLA_U8, 0, URP_EP_KIND_MAX),
 };
 
 /* Top-level policy: only URP_A_ENDPOINT is accepted at the outer level */
@@ -458,6 +459,8 @@ static int urp_new_endpoint_doit(struct sk_buff *skb, struct genl_info *info)
 		cfg->buffer_size = nla_get_u32(tb[URP_ENDPOINT_A_BUFFER_SIZE]);
 	if (tb[URP_ENDPOINT_A_MODE])
 		cfg->mode = nla_get_u8(tb[URP_ENDPOINT_A_MODE]);
+	if (tb[URP_ENDPOINT_A_KIND])
+		cfg->kind = nla_get_u8(tb[URP_ENDPOINT_A_KIND]);
 
 	if (tb[URP_ENDPOINT_A_PASSWORD]) {
 		nla_strscpy((char *)cfg->password,

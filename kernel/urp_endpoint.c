@@ -11,6 +11,7 @@
  */
 
 #include "urp.h"
+#include "urp_lazy_plan.h"	/* urp_should_start_lazy_connect (design 33 P2) */
 #include <linux/inet.h>
 #include <linux/slab.h>
 #include <crypto/sha2.h>
@@ -152,6 +153,16 @@ int urp_endpoint_create(struct urp_endpoint *cfg, struct urp_endpoint **out)
 	if (!initiator && !cfg->has_bind_addr)
 		return -EINVAL;
 
+	/*
+	 * A fast (zero-copy) endpoint needs the /dev/urp uring_cmd device, which
+	 * exists only when the module is built with CONFIG_URP_FAST on a >= 6.8
+	 * kernel (URP_FAST_ENABLED). Reject it at the control plane otherwise so
+	 * the "supported / not-supported" boundary is explicit rather than a
+	 * silently-degraded endpoint that can never bind an app pool.
+	 */
+	if (cfg->kind == URP_EP_KIND_FAST && !URP_FAST_ENABLED)
+		return -EOPNOTSUPP;
+
 	ep = kzalloc(sizeof(*ep), GFP_KERNEL);
 	if (!ep)
 		return -ENOMEM;
@@ -167,6 +178,14 @@ int urp_endpoint_create(struct urp_endpoint *cfg, struct urp_endpoint **out)
 	ep->num_qps      = cfg->num_qps      ? cfg->num_qps      : URP_NUM_QPS_DEFAULT;
 	ep->buffer_count = cfg->buffer_count ? cfg->buffer_count : URP_BUFFER_COUNT_DEFAULT;
 	ep->buffer_size  = cfg->buffer_size  ? cfg->buffer_size  : URP_BUFFER_SIZE_DEFAULT;
+	/*
+	 * mode/kind are immutable config selected at `urp add`. mode gates the
+	 * acceptor's eager backend connect (urp_rdma.c); kind selects the copy
+	 * (uds) vs zero-copy (fast) data path (design 31). Both were previously
+	 * left at 0 here -- copy them from cfg so a non-default selection sticks.
+	 */
+	ep->mode         = cfg->mode;
+	ep->kind         = cfg->kind;
 	ep->has_password = cfg->has_password;
 	if (cfg->has_password) {
 		/*
@@ -288,6 +307,19 @@ int urp_endpoint_activate(struct urp_endpoint *ep)
 	ep->state = URP_STATE_ACTIVE;
 	urp_probe_work_start(ep);
 	mutex_unlock(&ep->lock);
+
+	/*
+	 * A fast initiator has no accept thread to fire the one-shot lazy RDMA
+	 * dial (design 33 Phase 2), so dial eagerly now: a fast endpoint is
+	 * explicitly provisioned and has no UDS client to wait on. Mirror the
+	 * accept-thread latch (cmpxchg 0->1) so no later path can double-dial.
+	 * A fast acceptor dials passively via the CM (rdma_accept), same as uds.
+	 */
+	if (urp_ep_is_fast(ep) && ep->is_initiator &&
+	    urp_should_start_lazy_connect(ep->is_initiator,
+		atomic_cmpxchg(&ep->connect_started, 0, 1) != 0))
+		urp_lazy_connect_start(ep);
+
 	urp_send_event(ep);
 	return 0;
 

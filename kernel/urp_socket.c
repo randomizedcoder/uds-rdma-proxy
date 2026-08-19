@@ -358,6 +358,19 @@ int urp_socket_init(struct urp_endpoint *ep, const char *path)
 		return -ENAMETOOLONG;
 	}
 
+	/*
+	 * A fast (zero-copy) endpoint has no UDS pump: the aware app drives the
+	 * QP directly over /dev/urp (design 31). Skip the listen socket + accept
+	 * thread entirely -- there is no per-stream TX pump to feed. The RDMA
+	 * dial is fired at activate for a fast initiator (urp_endpoint_activate);
+	 * a fast acceptor dials passively via the CM like the uds acceptor.
+	 */
+	if (urp_ep_is_fast(ep)) {
+		pr_info("%s: fast endpoint -- no UDS pump (app-driven over /dev/urp)\n",
+			ep->name);
+		return 0;
+	}
+
 	if (ep->is_initiator)
 		return urp_listen_uds(ep, path);
 

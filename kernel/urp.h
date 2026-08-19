@@ -66,6 +66,22 @@ typedef struct sockaddr urp_sockaddr_t;
 #endif
 
 /*
+ * urp-fast zero-copy data path (design 31). Gated by the build-level
+ * CONFIG_URP_FAST (default y in Kbuild; set =n to exclude the whole zero-copy
+ * path for cert / attack-surface reasons) AND the >= 6.8 io_uring floor the
+ * /dev/urp uring_cmd device needs (split <linux/io_uring/cmd.h>, 4-arg
+ * pin_user_pages). URP_FAST_ENABLED is 1 only when both hold; the control plane
+ * rejects a `fast` endpoint (-ENOTSUPP) otherwise, and urp_cmd.c stubs the
+ * device. This is a compile-time "supported / not-supported" boundary, NOT a
+ * runtime behavioral flag -- the copy (uds) path never depends on it.
+ */
+#if defined(CONFIG_URP_FAST) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+#define URP_FAST_ENABLED 1
+#else
+#define URP_FAST_ENABLED 0
+#endif
+
+/*
  * Buffer pool sizing. The pool depth is per-endpoint (ep->num_bufs, resolved
  * from buffer_count at activation); CQ/SQ/SRQ depths and the credit window are
  * all derived from it at setup time (see urp_endpoint_setup_shared). URP_BUF_SIZE
@@ -359,6 +375,11 @@ struct urp_endpoint {
 	 * urp_conn_plan.h / urp_acceptor_should_eager_connect().
 	 */
 	enum urp_ep_mode	mode;
+	/* enum urp_ep_kind: uds copy path (default) vs fast zero-copy path.
+	 * A fast endpoint suppresses the UDS pump and is driven by the app over
+	 * /dev/urp (io_uring_cmd); design 31. Rejected without CONFIG_URP_FAST.
+	 */
+	enum urp_ep_kind	kind;
 	/* raw PSK input from netlink; used at cfg time only */
 	u8			password[URP_PASSWORD_MAX];
 	bool			has_password;
@@ -473,6 +494,17 @@ struct urp_endpoint {
 	/* /proc/urp/<name>/stats entry (set by urp_endpoint_proc_create) */
 	struct proc_dir_entry	*proc_dir;
 };
+
+/*
+ * True for a zero-copy (fast) endpoint: no UDS pump, driven by the app over
+ * /dev/urp (design 31). Suppresses the accept thread, the acceptor eager
+ * backend connect, and (initiator) selects the dial-at-activate path. Always
+ * false when URP_FAST_ENABLED is 0 -- such an endpoint is refused at create.
+ */
+static inline bool urp_ep_is_fast(const struct urp_endpoint *ep)
+{
+	return ep->kind == URP_EP_KIND_FAST;
+}
 
 /* Module-global endpoint store (defined in urp_endpoint.c) */
 extern struct rhashtable	urp_endpoints;
