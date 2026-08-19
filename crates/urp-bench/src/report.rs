@@ -72,7 +72,7 @@ impl Report<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Mode, Role, Verify};
+    use crate::config::{Mode, Pattern, Role, Verify};
 
     #[test]
     fn golden_line() {
@@ -83,6 +83,7 @@ mod tests {
             id: 1,
             mode: Mode::UringFixed,
             verify: Verify::Header,
+            pattern: Pattern::Echo,
             msg_size: 4076,
             batch: 32,
             count: 100_000,

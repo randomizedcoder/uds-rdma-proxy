@@ -463,6 +463,38 @@ int bench_verify_parse(const char *s, enum bench_verify *out)
 	return -BENCH_EINVAL;
 }
 
+static const struct {
+	const char *name;
+	enum bench_pattern pattern;
+} pattern_names[] = {
+	{ "echo", BENCH_PATTERN_ECHO },
+	{ "stream", BENCH_PATTERN_STREAM },
+};
+
+int bench_pattern_parse(const char *s, enum bench_pattern *out)
+{
+	size_t i;
+
+	for (i = 0; i < sizeof(pattern_names) / sizeof(pattern_names[0]); i++) {
+		if (strcmp(s, pattern_names[i].name) == 0) {
+			*out = pattern_names[i].pattern;
+			return 0;
+		}
+	}
+	return -BENCH_EINVAL;
+}
+
+const char *bench_pattern_str(enum bench_pattern p)
+{
+	size_t i;
+
+	for (i = 0; i < sizeof(pattern_names) / sizeof(pattern_names[0]); i++) {
+		if (pattern_names[i].pattern == p)
+			return pattern_names[i].name;
+	}
+	return "?";
+}
+
 const char *bench_verify_str(enum bench_verify v)
 {
 	size_t i;

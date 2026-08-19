@@ -3,7 +3,7 @@
 //! stays in the sibling modules; this module owns progress/counters and
 //! the message-classification step both event loops share.
 
-use urp_bench::config::{Config, Verify};
+use urp_bench::config::{Config, Pattern, Role, Verify};
 use urp_bench::frame::{self, Hdr, HDR_SIZE};
 use urp_bench::stats::Stats;
 use urp_bench::tracker::Tracker;
@@ -75,6 +75,17 @@ pub struct Shell {
     pub msgs_rx_total: u64,
     pub zc_copied: u64,
     pub zc_sends: u64,
+
+    /// --pattern stream (§34.4). `do_generate`: this side sources traffic
+    /// (echo, or the connect side of a stream). `do_echo`: reflect peer
+    /// originals (echo pattern only).
+    pub do_generate: bool,
+    pub do_echo: bool,
+    pub tx_wire_bytes: u64, // stream source: wire bytes handed to the socket
+    pub rx_data_bytes: u64, // stream sink: wire bytes of data delivered
+    pub rx_data_msgs: u64,  // stream sink: data frames delivered
+    pub t_first_rx_ns: u64, // stream sink: first data frame (goodput window)
+    pub t_stream_end_ns: u64, // stream sink: peer FIN seen
 }
 
 impl Shell {
@@ -86,6 +97,11 @@ impl Shell {
             0
         };
         let batch = cfg.batch;
+        // Role split (§34.4): echo sides both source+reflect; a stream
+        // source (connect) only sources, a stream sink (listen) only drains.
+        let do_generate =
+            cfg.pattern == Pattern::Echo || cfg.role == Some(Role::Connect);
+        let do_echo = cfg.pattern == Pattern::Echo;
         Shell {
             cfg,
             tracker: Tracker::new(batch),
@@ -104,6 +120,13 @@ impl Shell {
             msgs_rx_total: 0,
             zc_copied: 0,
             zc_sends: 0,
+            do_generate,
+            do_echo,
+            tx_wire_bytes: 0,
+            rx_data_bytes: 0,
+            rx_data_msgs: 0,
+            t_first_rx_ns: 0,
+            t_stream_end_ns: 0,
         }
     }
 
@@ -143,11 +166,30 @@ impl Shell {
             return Ok(EchoAction::None);
         }
 
-        if hdr.flags & frame::FLAG_FIN != 0 {
-            self.peer_fin_seen = true;
-        }
+        // a peer original
         if self.cfg.verify == Verify::Full {
             frame::verify_payload(payload, hdr.origin_id, hdr.seq)?;
+        }
+
+        if !self.do_echo {
+            // stream sink: count delivered bytes, never echo. Goodput is
+            // measured from the first data frame to the peer's FIN.
+            if hdr.flags & frame::FLAG_FIN != 0 {
+                self.peer_fin_seen = true;
+                self.t_stream_end_ns = now_ns();
+            } else {
+                if self.t_first_rx_ns == 0 {
+                    self.t_first_rx_ns = now_ns();
+                }
+                self.rx_data_bytes += (HDR_SIZE as u32 + hdr.payload_len) as u64;
+                self.rx_data_msgs += 1;
+            }
+            return Ok(EchoAction::None);
+        }
+
+        // echo pattern: reflect it back
+        if hdr.flags & frame::FLAG_FIN != 0 {
+            self.peer_fin_seen = true;
         }
         Ok(match chunk_off {
             Some(off) if hdr.payload_len > 0 => EchoAction::InPlace {
@@ -186,13 +228,18 @@ impl Shell {
                 h.seq,
             );
         }
-        self.tracker.sent(h.seq, t).ok()?;
+        // In stream mode there are no echoes to clear the RTT window, so the
+        // tracker is not the pacing gate (socket/carry backpressure is).
+        if self.cfg.pattern == Pattern::Echo {
+            self.tracker.sent(h.seq, t).ok()?;
+        }
         if fin {
             self.own_fin_sent = true;
             self.own_fin_seq = h.seq;
         }
         self.next_seq = self.next_seq.wrapping_add(1);
         self.sent_originals += 1;
+        self.tx_wire_bytes += (HDR_SIZE as u32 + payload_len) as u64;
         Some(h)
     }
 
@@ -216,6 +263,15 @@ impl Shell {
     }
 
     pub fn done_core(&self) -> bool {
+        if self.cfg.pattern == Pattern::Stream {
+            if self.do_generate {
+                // source: FIN sent (the caller's loop also waits for the
+                // carry to drain before exiting).
+                return self.own_fin_sent;
+            }
+            // sink: drain until the source's FIN (or it closes).
+            return self.peer_fin_seen || self.peer_closed;
+        }
         self.peer_closed
             || (self.own_fin_echoed && self.peer_fin_seen && self.tracker.inflight_count == 0)
     }

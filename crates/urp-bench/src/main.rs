@@ -6,7 +6,7 @@
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 
-use urp_bench::config::{Config, Mode, Role, Verify};
+use urp_bench::config::{Config, Mode, Pattern, Role, Verify};
 use urp_bench::deframe::Deframer;
 use urp_bench::frame::HDR_SIZE;
 use urp_bench::report::Report;
@@ -23,8 +23,9 @@ fn usage() -> ! {
          \x20 --mode {{blocking,uring-rw,uring-fixed,uring-bufring,\n\
          \x20         uring-sqpoll,uring-sendzc}}\n\
          \x20 --msg-size BYTES --batch N (--count N | --duration S)\n\
-         \x20 [--verify {{none,header,full}}] [--defer-taskrun]\n\
-         \x20 [--memcpy-baseline]"
+         \x20 [--verify {{none,header,full}}] [--pattern {{echo,stream}}]\n\
+         \x20 [--defer-taskrun] [--memcpy-baseline]\n\
+         \x20 (pattern stream: connect=source, listen=sink; blocking mode)"
     );
     std::process::exit(2);
 }
@@ -129,20 +130,45 @@ fn run_blocking(shell: &mut Shell, stream: &UnixStream) -> Result<u64, i32> {
     let mut echoes: Vec<PendingEcho> = Vec::new();
 
     while !shell.done_core() || !carry.buf.is_empty() {
-        // top-up (None = slot backpressure after out-of-order echoes:
-        // stop for this iteration, not an error)
-        let (n, fin) = shell.plan();
-        for _ in 0..n {
-            match shell.next_original(&mut slot, false) {
-                Some(_) => {}
-                None => break,
+        // top-up: the echo pattern and the stream *source* generate; the
+        // stream *sink* (do_generate == false) never sources traffic.
+        if shell.do_generate && shell.cfg.pattern == Pattern::Stream {
+            // Blast while the socket accepts: carry empty means the last
+            // write fully drained, so keep feeding; a partial write leaves
+            // the carry non-empty and we fall through to poll POLLOUT. No
+            // RTT tracker window here (§34.4).
+            while !shell.own_fin_sent && carry.buf.is_empty() {
+                let remaining = if shell.deadline_ns != 0 && now_ns() >= shell.deadline_ns {
+                    0
+                } else {
+                    shell.goal.saturating_sub(shell.sent_originals)
+                };
+                let fin = remaining == 0;
+                if shell.next_original(&mut slot, fin).is_some() {
+                    let n = if fin { HDR_SIZE } else { msg_size };
+                    let s = slot[..n].to_vec();
+                    carry.queue(shell, fd, &s)?;
+                }
+                if fin {
+                    break; // FIN queued
+                }
             }
-            let s = slot[..msg_size].to_vec(); // borrow untangling only
-            carry.queue(shell, fd, &s)?;
-        }
-        if fin && shell.next_original(&mut slot, true).is_some() {
-            let s = slot[..HDR_SIZE].to_vec();
-            carry.queue(shell, fd, &s)?;
+        } else if shell.do_generate {
+            // echo pattern: tracker-windowed generation. (None = slot
+            // backpressure after out-of-order echoes: stop this iteration.)
+            let (n, fin) = shell.plan();
+            for _ in 0..n {
+                match shell.next_original(&mut slot, false) {
+                    Some(_) => {}
+                    None => break,
+                }
+                let s = slot[..msg_size].to_vec(); // borrow untangling only
+                carry.queue(shell, fd, &s)?;
+            }
+            if fin && shell.next_original(&mut slot, true).is_some() {
+                let s = slot[..HDR_SIZE].to_vec();
+                carry.queue(shell, fd, &s)?;
+            }
         }
 
         let mut pfd = libc::pollfd {
@@ -237,6 +263,7 @@ fn main() {
         id: 0,
         mode: Mode::UringRw,
         verify: Verify::Header,
+        pattern: Pattern::Echo,
         msg_size: 4076,
         batch: 32,
         count: 0,
@@ -289,6 +316,10 @@ fn main() {
                 cfg.verify = need(i).parse().unwrap_or_else(|_| usage());
                 i += 1;
             }
+            "--pattern" => {
+                cfg.pattern = need(i).parse().unwrap_or_else(|_| usage());
+                i += 1;
+            }
             "--defer-taskrun" => cfg.defer_taskrun = true,
             "--memcpy-baseline" => do_memcpy = true,
             _ => usage(),
@@ -327,7 +358,14 @@ fn main() {
     let t0 = now_ns();
     let reassembled = match cfg.mode {
         Mode::Blocking => run_blocking(&mut shell, &stream),
-        _ => uring::run(&mut shell, stream.as_raw_fd()),
+        _ => {
+            // The one-way stream pattern is implemented on the blocking
+            // backend only for now (§34.4).
+            if cfg.pattern == Pattern::Stream {
+                shell::skip(&cfg, "stream_mode_todo");
+            }
+            uring::run(&mut shell, stream.as_raw_fd())
+        }
     };
     let t1 = now_ns();
     let cpu1 = cpu_ns();
@@ -336,12 +374,24 @@ fn main() {
         Ok(v) => v,
         Err(e) => fail(&cfg, "run", e),
     };
-    if shell.peer_closed && !(shell.own_fin_echoed && shell.peer_fin_seen) {
-        fail(&cfg, "peer_closed_early", 0);
+    match cfg.pattern {
+        Pattern::Echo => {
+            if shell.peer_closed && !(shell.own_fin_echoed && shell.peer_fin_seen) {
+                fail(&cfg, "peer_closed_early", 0);
+            }
+        }
+        Pattern::Stream => {
+            // stream sink: peer closed before its FIN => truncated.
+            if cfg.role == Some(Role::Listen) && shell.peer_closed && !shell.peer_fin_seen {
+                fail(&cfg, "peer_closed_early", 0);
+            }
+        }
     }
     let rtt = match shell.stats.finalize() {
         Ok(r) => r,
-        Err(_) if cfg.count > 0 => fail(&cfg, "no_samples", 0),
+        Err(_) if cfg.count > 0 && cfg.pattern == Pattern::Echo => {
+            fail(&cfg, "no_samples", 0)
+        }
         Err(_) => urp_bench::stats::StatsResult {
             min_ns: 0,
             max_ns: 0,
@@ -351,7 +401,7 @@ fn main() {
         },
     };
 
-    let rep = Report {
+    let mut rep = Report {
         lang: "rust",
         cfg: &cfg,
         rtt,
@@ -363,6 +413,23 @@ fn main() {
         reassembled,
         msgs_rx_total: shell.msgs_rx_total,
     };
+    if cfg.pattern == Pattern::Stream {
+        if cfg.role == Some(Role::Listen) {
+            // sink: authoritative goodput = bytes delivered over the
+            // first-frame..FIN window.
+            let win = if shell.t_stream_end_ns > shell.t_first_rx_ns {
+                shell.t_stream_end_ns - shell.t_first_rx_ns
+            } else {
+                t1 - t0
+            };
+            rep.msgs = shell.rx_data_msgs;
+            rep.bytes = shell.rx_data_bytes;
+            rep.elapsed_ns = win;
+        } else {
+            // source: bytes handed to the socket (secondary).
+            rep.bytes = shell.tx_wire_bytes;
+        }
+    }
     println!("{}", rep.format());
     if cfg.mode == Mode::UringSendzc {
         println!(

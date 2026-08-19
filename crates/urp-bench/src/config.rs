@@ -75,6 +75,36 @@ impl FromStr for Verify {
     }
 }
 
+/// App protocol, orthogonal to [`Mode`] (§34.4). `Echo` is the symmetric RTT
+/// reflector (default); `Stream` is one-way bulk — the connect side sources,
+/// the listen side sinks, and goodput is measured at the sink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pattern {
+    Echo,
+    Stream,
+}
+
+impl Pattern {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Pattern::Echo => "echo",
+            Pattern::Stream => "stream",
+        }
+    }
+}
+
+impl FromStr for Pattern {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Error> {
+        match s {
+            "echo" => Ok(Pattern::Echo),
+            "stream" => Ok(Pattern::Stream),
+            _ => Err(Error::Invalid),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Listen,
@@ -88,6 +118,8 @@ pub struct Config {
     pub id: u16,
     pub mode: Mode,
     pub verify: Verify,
+    /// `Echo` (default) or `Stream` (§34.4).
+    pub pattern: Pattern,
     /// Total wire bytes including the header.
     pub msg_size: u32,
     pub batch: u32,
@@ -129,6 +161,7 @@ mod tests {
             id: 1,
             mode: Mode::UringRw,
             verify: Verify::Header,
+            pattern: Pattern::Echo,
             msg_size: 4076,
             batch: 32,
             count: 1000,
@@ -218,5 +251,24 @@ mod tests {
         assert_eq!("header".parse::<Verify>(), Ok(Verify::Header));
         assert_eq!("full".parse::<Verify>(), Ok(Verify::Full));
         assert_eq!("nope".parse::<Verify>(), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn pattern_parse_table() {
+        // Mirror of C test_pattern_parse: P/N/B/C.
+        let cases: &[(&str, Result<Pattern, Error>)] = &[
+            ("echo", Ok(Pattern::Echo)),
+            ("stream", Ok(Pattern::Stream)),
+            ("bogus", Err(Error::Invalid)),
+            ("", Err(Error::Invalid)),
+            ("STREAM", Err(Error::Invalid)), // case-sensitive
+        ];
+        for (s, want) in cases {
+            let got = s.parse::<Pattern>();
+            assert_eq!(&got, want, "pattern {s:?}");
+            if let Ok(p) = got {
+                assert_eq!(p.as_str(), *s, "pattern {s:?} str roundtrip");
+            }
+        }
     }
 }

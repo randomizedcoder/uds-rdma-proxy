@@ -89,6 +89,9 @@
         # Real-hardware client matrix (design 32): ssh-driven C/Rust interop
         # sweep over a standing RoCEv2 session. `nix run .#urp-hw-matrix`.
         urpHwMatrix = import ./nix/urp-hw-matrix.nix { inherit pkgs; };
+        # One-way bulk-throughput runner (design 34): sink-measured goodput +
+        # iperf2/ib_write_bw baselines. `nix run .#urp-bw-matrix`.
+        urpBwMatrix = import ./nix/urp-bw-matrix.nix { inherit pkgs; };
         urpFastPoc = import ./nix/urp-fast-poc.nix { inherit pkgs; };
         ciLocal = import ./nix/ci-local.nix {
           inherit pkgs fuzz;
@@ -219,6 +222,9 @@
           # Real-hardware interop matrix over RoCEv2 (design 32; needs the boxes):
           #   nix run .#urp-hw-matrix -- <acceptor> <initiator> <acceptor-ip>
           urp-hw-matrix = urpHwMatrix;
+          # Bulk-throughput sweep (design 34):
+          #   nix run .#urp-bw-matrix -- <acceptor> <initiator> <acceptor-ip>
+          urp-bw-matrix = urpBwMatrix;
           urp-fast-poc = urpFastPoc;
           # Local reproduction of the every-push CI: `nix run .#ci-local`
           # (for hosts without a GitHub runner). Builds the 9 nix-checks
