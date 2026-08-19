@@ -133,6 +133,13 @@ enum urp_endpoint_attr {
 	 */
 	URP_ENDPOINT_A_MODE		= 15,
 
+	/* NLA_U8 -- enum urp_ep_kind; optional config, immutable, default uds
+	 * (the copy path). "fast" selects the zero-copy alternative path, which
+	 * suppresses the UDS pump and is driven by the app over /dev/urp
+	 * (io_uring_cmd). Requires CONFIG_URP_FAST; rejected otherwise.
+	 */
+	URP_ENDPOINT_A_KIND		= 16,
+
 	__URP_ENDPOINT_A_MAX,
 };
 
@@ -207,6 +214,29 @@ enum urp_ep_mode {
 };
 
 #define URP_EP_MODE_MAX (__URP_EP_MODE_MAX - 1)
+
+/*
+ * Endpoint kind (per-endpoint, immutable, set at `urp add`).
+ *
+ * Selects the data path an endpoint uses:
+ *   UDS (default) -- the copy path. The kernel runs an AF_UNIX pump; unaware
+ *      apps talk to the listen/connect UDS socket and the kernel copies each
+ *      frame into a registered pool buffer before posting it. Always available.
+ *   FAST -- the zero-copy alternative path (design 31, urp-fast). No UDS pump;
+ *      an aware app hands its own pinned buffer pool to the module over
+ *      /dev/urp (io_uring_cmd) and the NIC DMAs straight into/out of the app
+ *      pages. Requires CONFIG_URP_FAST; the control plane rejects a fast
+ *      endpoint (-ENOTSUPP) when the module is built without it.
+ *
+ * `kind` is orthogonal to `mode` (multistream vs k0 backend wiring).
+ */
+enum urp_ep_kind {
+	URP_EP_KIND_UDS		= 0,	/* copy path via the AF_UNIX pump (default) */
+	URP_EP_KIND_FAST	= 1,	/* zero-copy path via /dev/urp (io_uring_cmd) */
+	__URP_EP_KIND_MAX,
+};
+
+#define URP_EP_KIND_MAX (__URP_EP_KIND_MAX - 1)
 
 /* Endpoint lifecycle states */
 enum urp_endpoint_state {

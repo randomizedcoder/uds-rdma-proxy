@@ -29,4 +29,19 @@ endif
 
 urp-$(CONFIG_KUNIT) += urp_test.o
 
+# urp-fast zero-copy data path (design 31). CONFIG_URP_FAST defaults to y and
+# selects the /dev/urp uring_cmd device + fast handlers in urp_cmd.c. Build with
+# CONFIG_URP_FAST=n to exclude the whole zero-copy path (cert / attack-surface):
+# urp_cmd.c then compiles to stubs (URP_FAST_ENABLED == 0, see urp.h) and the
+# control plane rejects `--kind fast` with -EOPNOTSUPP. The copy (uds) path never
+# depends on this. There is no in-tree Kconfig here (out-of-tree module), so the
+# symbol is a make/ccflags variable, mirroring CONFIG_URP_REORDER_RUST above.
+# urp_cmd.o / urp_cmd_validate.o stay in the build either way: the pure
+# validators feed KUnit + the userspace check regardless, and the device body is
+# gated internally by the preprocessor so kbuild's object list is stable.
+CONFIG_URP_FAST ?= y
+ifeq ($(CONFIG_URP_FAST),y)
+ccflags-y += -DCONFIG_URP_FAST=1
+endif
+
 ccflags-y += -I$(src)/include

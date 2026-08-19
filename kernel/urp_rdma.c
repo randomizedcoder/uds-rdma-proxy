@@ -882,7 +882,7 @@ static int urp_cm_accept_one(struct rdma_cm_id *child, struct urp_endpoint *ep,
 	 * connection a single-accept backend offers, refusing the real stream's
 	 * connect (ECONNREFUSED) and stalling the data path. See urp_conn_plan.h.
 	 */
-	if (qp_index == 0 &&
+	if (qp_index == 0 && !urp_ep_is_fast(ep) &&
 	    urp_acceptor_should_eager_connect(ep->mode, ep->connect_path[0] != '\0')) {
 		urp_socket_conn_cleanup(ep);
 		ret = urp_connect_uds(ep, ep->connect_path);

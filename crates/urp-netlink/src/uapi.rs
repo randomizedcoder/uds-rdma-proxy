@@ -66,11 +66,18 @@ pub enum UrpEndpointAttr {
     Streams = 13,
     Stats = 14,
     Mode = 15,
+    Kind = 16,
 }
 
 /// enum urp_ep_mode -- endpoint operating mode (URP_ENDPOINT_A_MODE payload).
 pub const URP_EP_MODE_MULTISTREAM: u8 = 0;
 pub const URP_EP_MODE_K0: u8 = 1;
+
+/// enum urp_ep_kind -- endpoint data path (URP_ENDPOINT_A_KIND payload).
+/// uds = the copy path (AF_UNIX pump, default); fast = the zero-copy path
+/// driven by the app over /dev/urp (design 31, requires CONFIG_URP_FAST).
+pub const URP_EP_KIND_UDS: u8 = 0;
+pub const URP_EP_KIND_FAST: u8 = 1;
 
 // --- enum urp_qp_attr ---
 #[repr(u16)]
