@@ -324,6 +324,12 @@ the bench backend that measures it, then fuzz/analysis wiring.
 
 ### 31.9.1 Implementation status
 
+> **Live tracker:** [31-implementation-status.md](31-implementation-status.md) —
+> the phased plan for the remaining data-plane work (PR3 SEND, PR4 RECV, PR5
+> clients + bench T3, PR6 fuzz/measurement, PR7 Seastar) with the cross-cutting
+> design decisions (async completion, header placement, ownership SM, `fast`
+> endpoint kind). The table below is the summary.
+
 Kernel-first phasing (so the client has a real target to integration-test
 against). Each PR is independently green and microVM-verified.
 
