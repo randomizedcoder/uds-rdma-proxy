@@ -336,6 +336,11 @@ but they are pointless until the flood/drop is fenced by C.
 
 ## 35.9 Relation to other docs
 
+- [design 36](36-congestion-control-cubic.md) — **EXPERIMENTAL** congestion-control
+  layer. This doc's `window_bytes` is the *flow-control* window (**rwnd**); design 36
+  adds a loss-based CUBIC congestion window (**cwnd**) on top, so the sender gate's
+  limit becomes `min(cwnd, rwnd)`. Design 36 is design-only and default-off; it only
+  *binds* after §35.4 (pump, done) + §35.5 (F2) make us congestion-bound.
 - [design 34](34-bulk-throughput.md) — the measurement that motivates this; §34.6
   is the summary this doc expands. The option ladder (§34.3) names B/C/D/E/F.
 - [design 33](33-connection-bringup.md) — the connection handshake this doc
