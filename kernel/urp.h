@@ -25,6 +25,7 @@
 #include <linux/atomic.h>
 #include <linux/workqueue.h>
 #include <linux/completion.h>
+#include <linux/wait.h>
 #include <linux/mutex.h>
 #include <linux/rhashtable.h>
 #include <linux/rcupdate.h>
@@ -435,6 +436,12 @@ struct urp_endpoint {
 	struct list_head	recv_free;
 	spinlock_t		send_lock;	/* protects send_free */
 	spinlock_t		recv_lock;	/* protects recv_free */
+	/*
+	 * TX pumps block here when the send pool is empty instead of the old
+	 * 1 ms poll; urp_buf_free_send() wakes it on every buffer return
+	 * (send completion or error path). Design 35 §35.4 (Option B, phase 1).
+	 */
+	wait_queue_head_t	send_wq;
 
 	/* Runtime state */
 	struct urp_stats	stats;
