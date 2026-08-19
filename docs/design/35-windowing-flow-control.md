@@ -254,6 +254,9 @@ runner from design 34, which already report goodput in MB/s + Mb/s + % of 25 GbE
 
 1. **Pump completion waitqueue** (Option B core) — kill the 1 ms poll; expect the
    large-frame frame rate to jump well above ~1000 fps. *No wire change.*
+   **DONE (2026-08-18) — see §35.7.1;** poll floor removed (fresh 4 KB hit 3631
+   fps), but the win is regime-specific and it exposed the flood/drop instability
+   that argues for reordering C ahead of the rest of B.
 2. **Selective signaling + multi-WR + coalesced reads** — the rest of B. *No wire
    change.*
 3. **Byte windowing** (this doc §35.3) — the blocking gate, cumulative-absolute
@@ -274,6 +277,44 @@ Verification gates:
 - **Hardware** (hp1↔hp3): each phase re-runs the design-34 sweep; the phase-3 gate
   is *reliable completion at 0 drops*, and the phase-4 gate is *aggregate goodput
   as a % of 25 GbE and of `ib_write_bw`* once that baseline is available.
+
+### 35.7.1 Phase 1 measured results (2026-08-18)
+
+Phase 1 (the completion waitqueue, §35.4's headline change) is implemented and
+hardware-verified on hp1 (sink) ↔ hp3 (source), 25 GbE RoCEv2, `qps=1`, 10 s per
+point, sink-measured goodput, `reorder_drops=0` throughout. Two runs (buffer-size
+order varied to decouple the endpoint-churn wedge of §34.5.1):
+
+| frame | Phase 0 (poll) | Phase 1 (waitqueue) | notes |
+|-------|----------------|---------------------|-------|
+| 65516 | ~980 fps / 52.7 MB/s | 981–990 fps / 51.2–51.3 MB/s | flat |
+| 16384 | ~900–1240 fps / 9.4–10.9 MB/s | 704–708 fps / 9.2–9.3 MB/s | stable |
+| 4096  | ~900–1240 fps / 3.7–9.7 MB/s | **3631 fps / 12.4 MB/s** (fresh) → 1085 fps / 1.9 MB/s (churned) | high variance |
+
+**Verdict — Phase 1 does its scoped job and no more:**
+
+1. **The 1 ms poll floor is removed — proven.** A fresh 4 KB run reached **3631
+   fps**, physically impossible under the old design (a 1 ms sleep on every
+   pool-empty caps iteration near ~1000/s). The prediction in §35.7 step 1 ("jump
+   well above ~1000 fps") holds — but *only* where the pump was actually idling on
+   an empty pool.
+2. **It does not raise sustained goodput by itself.** Large frames (64 KB) are
+   flat at ~51 MB/s: at that size the pump rarely sits pool-empty, so the poll was
+   never the limiter. The large-frame wall is per-frame copy (`cpu_us_per_msg`
+   16.98 @64 KB vs 2.23 @4 KB) + single-kthread serialization + per-frame CQE —
+   i.e. §35.4 steps 1–3 (selective signaling, multi-WR, coalesced reads) + §35.5
+   (F2), not the poll.
+3. **Removing the poll exposed the flood/drop instability underneath.** The 4 KB
+   point swings 1.9 ↔ 12.4 MB/s purely on endpoint freshness, with `credit_stalls`
+   384–762 and ~3 % of frames dropped (reassembled 96.6 %). Without real windowing
+   the source floods, credits stall, buffers churn, delivered goodput collapses.
+
+**Consequence for phasing:** finding 3 strengthens the §35.1 correctness argument
+and suggests **pulling Option C (byte windowing, phase 3) ahead of the rest of
+Option B (phase 2)** — the missing flow control, not the large-frame copy wall, is
+now the dominant source of instability and small-frame goodput loss. The large-frame
+copy/serialization work (phase 2) and F2 (phase 4) remain the levers for raw peak,
+but they are pointless until the flood/drop is fenced by C.
 
 ## 35.8 Risks
 

@@ -21,6 +21,14 @@
 #include <linux/timekeeping.h>
 
 /*
+ * Upper bound on how long a TX pump sleeps waiting for a send buffer when the
+ * pool is empty (design 35 §35.4, phase 1). In steady state urp_buf_free_send()
+ * wakes the pump within microseconds of a completion; this timeout only bounds
+ * the damage of a missed wakeup, so it is generous rather than tuned.
+ */
+#define URP_SEND_WAIT_MAX_MS	100
+
+/*
  * DMA-sync and post one framed send buffer (@len bytes including the
  * header) on @qp. On failure the buffer is returned to the send pool;
  * the caller must not touch @buf after this call.
@@ -228,8 +236,25 @@ static int urp_stream_tx_fn(void *data)
 
 		buf = urp_buf_alloc_send(ep);
 		if (!buf) {
-			schedule_timeout_interruptible(msecs_to_jiffies(1));
-			continue;
+			/*
+			 * Send pool empty: block until a completion
+			 * (urp_send_done) or an error path returns a buffer and
+			 * wakes ep->send_wq, instead of the old 1 ms poll
+			 * (design 35 §35.4, phase 1). wait_event evaluates the
+			 * condition in this thread's context, so the
+			 * alloc-in-predicate keeps the buffer it grabs. The
+			 * bounded timeout is a safety net: kthread_stop() wakes
+			 * this task directly (re-checked here and at the loop
+			 * top), while a UDS close has no wakeup of its own and is
+			 * caught within one timeout, then broken out of up top.
+			 */
+			wait_event_interruptible_timeout(ep->send_wq,
+				(buf = urp_buf_alloc_send(ep)) != NULL ||
+					kthread_should_stop() ||
+					!stream->uds_sock,
+				msecs_to_jiffies(URP_SEND_WAIT_MAX_MS));
+			if (!buf)
+				continue;
 		}
 
 		iov.iov_base = buf->data + URP_FRAME_HEADER_SIZE;

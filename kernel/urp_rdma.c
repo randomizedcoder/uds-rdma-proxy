@@ -102,6 +102,7 @@ static int urp_bufs_init(struct urp_endpoint *ep, struct ib_device *dev)
 	INIT_LIST_HEAD(&ep->recv_free);
 	spin_lock_init(&ep->send_lock);
 	spin_lock_init(&ep->recv_lock);
+	init_waitqueue_head(&ep->send_wq);
 
 	/* ep->num_bufs is resolved (and bounds-clamped) in urp_endpoint_activate */
 	ep->bufs = kcalloc(ep->num_bufs, sizeof(*ep->bufs), GFP_KERNEL);
@@ -219,6 +220,16 @@ void urp_buf_free_send(struct urp_endpoint *ep, struct urp_buffer *buf)
 	spin_lock_irqsave(&ep->send_lock, flags);
 	list_add_tail(&buf->list, &ep->send_free);
 	spin_unlock_irqrestore(&ep->send_lock, flags);
+
+	/*
+	 * A send buffer is back in the pool -- wake any TX pump blocked waiting
+	 * for one (design 35 §35.4, phase 1: replaces the 1 ms pool-empty poll
+	 * with completion-driven wakeups). This runs on the send-CQ workqueue
+	 * (urp_send_done) and on the pump's own error paths; wake_up on an empty
+	 * queue is cheap. The wait side re-checks under send_lock, so a wakeup
+	 * that races the enqueue is harmless.
+	 */
+	wake_up_interruptible(&ep->send_wq);
 }
 
 struct urp_buffer *urp_buf_alloc_recv(struct urp_endpoint *ep)
