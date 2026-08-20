@@ -59,7 +59,13 @@ int urp_cmd_validate_data(u32 cmd_op, const struct urp_cmd_data *in,
 	if (in->buf_index >= geom->count)
 		return -ERANGE;
 
-	if (in->len > geom->buf_size)
+	/*
+	 * @len is PAYLOAD bytes. The in-place header (design 31 D3) reserves the
+	 * first URP_CMD_HEADER_RESV bytes of the buffer, so the usable payload is
+	 * buf_size - header. buf_size >= URP_CMD_BUF_SIZE_MIN (64) > header, so the
+	 * subtraction never underflows.
+	 */
+	if (in->len > geom->buf_size - URP_CMD_HEADER_RESV)
 		return -EMSGSIZE;
 
 	out->op		= cmd_op;

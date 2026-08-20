@@ -17,6 +17,7 @@
 #include "urp_cmd_compat.h"
 #include "include/uapi/linux/urp_cmd.h"
 #include "urp_cmd.h"
+#include "urp_cmd_own.h"
 
 static int failures;
 static int checks;
@@ -51,9 +52,10 @@ static void test_validate_data(void)
 		/* valid */
 		{ URP_CMD_SEND, 0, 100, 7, 0, 0, 4, 4096, 0 },
 		{ URP_CMD_SEND, 0, 100, 7, URP_CMD_F_FIN, 0, 4, 4096, 0 },
-		{ URP_CMD_RECV, 3, 4096, 0, 0, 0, 4, 4096, 0 },
+		/* max payload = buf_size - header (design 31 D3 in-place header) */
+		{ URP_CMD_RECV, 3, 4096 - URP_CMD_HEADER_RESV, 0, 0, 0, 4, 4096, 0 },
 		/* boundaries */
-		{ URP_CMD_SEND, 3, 4096, 0, 0, 0, 4, 4096, 0 },
+		{ URP_CMD_SEND, 3, 4096 - URP_CMD_HEADER_RESV, 0, 0, 0, 4, 4096, 0 },
 		{ URP_CMD_RECV, 0, 1, 0, 0, 0, 4, 4096, 0 },
 		/* opcode gate */
 		{ URP_CMD_REGISTER, 0, 100, 0, 0, 0, 4, 4096, -EOPNOTSUPP },
@@ -63,9 +65,14 @@ static void test_validate_data(void)
 		{ URP_CMD_SEND, 0, 100, 0, 0, 1, 4, 4096, -EINVAL },
 		{ URP_CMD_RECV, 0, 100, 0, URP_CMD_F_FIN, 0, 4, 4096, -EINVAL },
 		{ URP_CMD_SEND, 0, 100, 0, (1 << 5), 0, 4, 4096, -EINVAL },
-		/* length */
+		/* length: 0 rejected; payload > buf_size - header rejected */
 		{ URP_CMD_SEND, 0, 0, 0, 0, 0, 4, 4096, -EINVAL },
+		{ URP_CMD_SEND, 0, 4096 - URP_CMD_HEADER_RESV + 1, 0, 0, 0, 4, 4096,
+		  -EMSGSIZE },
 		{ URP_CMD_SEND, 0, 4097, 0, 0, 0, 4, 4096, -EMSGSIZE },
+		/* smallest pool buffer: 64 - 20 = 44 payload max */
+		{ URP_CMD_SEND, 0, 44, 1, 0, 0, 4, 64, 0 },
+		{ URP_CMD_SEND, 0, 45, 1, 0, 0, 4, 64, -EMSGSIZE },
 		/* pool / index */
 		{ URP_CMD_SEND, 0, 100, 0, 0, 0, 0, 4096, -ENXIO },
 		{ URP_CMD_SEND, 4, 100, 0, 0, 0, 4, 4096, -ERANGE },
@@ -154,10 +161,55 @@ static void test_validate_reg(void)
 	}
 }
 
+/*
+ * Per-buffer ownership state machine (urp_cmd_own.h, design 31 section 31.2).
+ * The kernel serialises these with a spinlock; here they run single-threaded,
+ * which is exactly the transition logic KUnit re-checks in-kernel.
+ */
+static void test_own_sm(void)
+{
+	/* 130 buffers -> spans 3 x 64-bit words, exercising the word math. */
+	enum { COUNT = 130 };
+	unsigned long own[3] = { 0, 0, 0 };
+
+	CHECK_EQ(urp_own_words(COUNT), 3, "own_words(130)");
+	CHECK_EQ(urp_own_any_kernel(own, COUNT), 0, "fresh pool: none in flight");
+
+	/* claim: APP -> KERNEL */
+	CHECK_EQ(urp_own_claim(own, COUNT, 0), 0, "claim 0");
+	CHECK_EQ(urp_own_claim(own, COUNT, 65), 0, "claim 65 (word 1)");
+	CHECK_EQ(urp_own_claim(own, COUNT, 129), 0, "claim 129 (word 2, last)");
+	CHECK_EQ(urp_own_any_kernel(own, COUNT), 1, "in flight after claims");
+
+	/* double submit of an in-flight buffer -> -EBUSY */
+	CHECK_EQ(urp_own_claim(own, COUNT, 65), -EBUSY, "double claim 65");
+
+	/* out of range */
+	CHECK_EQ(urp_own_claim(own, COUNT, COUNT), -ERANGE, "claim == count");
+	CHECK_EQ(urp_own_claim(own, COUNT, 0xffffffffu), -ERANGE, "claim huge");
+	CHECK_EQ(urp_own_release(own, COUNT, COUNT), -ERANGE, "release == count");
+
+	/* release: KERNEL -> APP */
+	CHECK_EQ(urp_own_release(own, COUNT, 0), 0, "release 0");
+	CHECK_EQ(urp_own_release(own, COUNT, 65), 0, "release 65");
+	/* double release / completion for an app-owned buffer -> -EINVAL */
+	CHECK_EQ(urp_own_release(own, COUNT, 0), -EINVAL, "double release 0");
+	CHECK_EQ(urp_own_release(own, COUNT, 42), -EINVAL, "release never-claimed");
+
+	/* one still in flight (129) keeps any_kernel true; releasing clears it */
+	CHECK_EQ(urp_own_any_kernel(own, COUNT), 1, "129 still in flight");
+	CHECK_EQ(urp_own_release(own, COUNT, 129), 0, "release 129");
+	CHECK_EQ(urp_own_any_kernel(own, COUNT), 0, "all reaped");
+
+	/* re-claim after release is allowed (buffer cycles) */
+	CHECK_EQ(urp_own_claim(own, COUNT, 0), 0, "re-claim 0");
+}
+
 int main(void)
 {
 	test_validate_data();
 	test_validate_reg();
+	test_own_sm();
 
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;

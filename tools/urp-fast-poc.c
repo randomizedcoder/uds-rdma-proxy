@@ -155,17 +155,28 @@ int main(int argc, char **argv)
 	expect("REGISTER_DUP", do_cmd(&ring, fd, URP_CMD_REGISTER, &reg_sqe,
 				      sizeof(reg_sqe)), -EEXIST);
 
-	/* --- SEND path reaches the validator, then reports not-yet-implemented --- */
+	/*
+	 * --- SEND validation (design 31 PR3b) ---
+	 *
+	 * The SEND data path is live now: a valid SEND posts a zero-copy frame on
+	 * the endpoint's QP and completes asynchronously. This standalone PoC has
+	 * no peer to ACK an RC send, so it exercises only the synchronous
+	 * validation edges here; the full fast->uds / fast->fast round trip that
+	 * asserts delivered bytes is the VM pair-test (Phase 10i) with a live
+	 * acceptor. A stream_id of 0 is reserved (streams are app-assigned,
+	 * non-zero) and an out-of-range buffer index is rejected before any post.
+	 */
 	memset(&data, 0, sizeof(data));
 	data.buf_index = 0;
 	data.len = 64;
-	expect("SEND_ENOSYS", do_cmd(&ring, fd, URP_CMD_SEND, &data,
-				     sizeof(data)), -ENOSYS);
+	data.stream_id = 0;
+	expect("SEND_STREAM0", do_cmd(&ring, fd, URP_CMD_SEND, &data,
+				      sizeof(data)), -EINVAL);
 
-	/* --- SEND with an out-of-range buffer index is rejected by validation --- */
 	memset(&data, 0, sizeof(data));
 	data.buf_index = count;		/* one past the end */
 	data.len = 64;
+	data.stream_id = 1;
 	expect("SEND_ERANGE", do_cmd(&ring, fd, URP_CMD_SEND, &data,
 				     sizeof(data)), -ERANGE);
 

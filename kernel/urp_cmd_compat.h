@@ -14,6 +14,7 @@
 #define URP_CMD_COMPAT_H
 
 #include <stdint.h>
+#include <stdbool.h>	/* bool/true/false for the ownership SM (urp_cmd_own.h) */
 #include <errno.h>
 
 typedef uint8_t  u8;

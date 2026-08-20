@@ -52,6 +52,17 @@ enum urp_cmd_op {
 #define URP_CMD_BUF_SIZE_MAX	(1u << 20)	/* 1 MiB, matches BENCH_PAYLOAD_MAX */
 #define URP_CMD_POOL_COUNT_MAX	65536u		/* index fits u16 stream demux headroom */
 
+/*
+ * Bytes reserved at the front of every pool buffer for the in-place frame
+ * header (design 31 D3): the app writes its payload at offset URP_CMD_HEADER_RESV
+ * and the kernel encodes the 20-byte wire header into the same buffer, so a
+ * SEND posts one SGE with no payload copy. MUST equal URP_FRAME_HEADER_SIZE in
+ * <uapi/linux/urp.h>; urp_cmd.c asserts this with a BUILD_BUG_ON. The usable
+ * payload of a buffer is therefore buf_size - URP_CMD_HEADER_RESV (and
+ * URP_CMD_BUF_SIZE_MIN = 64 > 20 guarantees this never underflows).
+ */
+#define URP_CMD_HEADER_RESV	20u
+
 /* Endpoint-name field width (matches URP_NAME_MAX in <uapi/linux/urp.h>). */
 #define URP_CMD_NAME_MAX	16
 
