@@ -6,7 +6,7 @@
  * ->uring_cmd. An aware application drives the zero-copy fast path over
  * IORING_OP_URING_CMD submissions on this fd:
  *
- *   URP_CMD_REGISTER    pin an app buffer pool once (pin_user_pages,
+ *   URP_CMD_REGISTER    pin an app buffer pool once (pin_user_pages_fast,
  *                       FOLL_LONGTERM) -- the "malloc at startup, then flat
  *                       memory pressure" phase the design centers on.
  *   URP_CMD_UNREGISTER  unpin it.
@@ -32,8 +32,8 @@
 
 /*
  * The fast-path char device leans on modern io_uring plumbing: the split-out
- * <linux/io_uring/cmd.h> header (6.7) and the 4-argument pin_user_pages (the
- * vmas parameter was dropped in 6.5). Gate the whole device on URP_FAST_ENABLED
+ * <linux/io_uring/cmd.h> header (6.7) and the 4-argument pin_user_pages_fast.
+ * Gate the whole device on URP_FAST_ENABLED
  * (urp.h) -- CONFIG_URP_FAST && >= 6.8 -- and stub the register/unregister hooks
  * otherwise (older LTS, or a deliberate CONFIG_URP_FAST=n build) so those
  * compile-only CI gates stay green and the zero-copy path can be excluded
@@ -522,9 +522,18 @@ static int urp_cmd_do_register(struct urp_cmd_ctx *ctx,
 	 * (FOLL_LONGTERM). FOLL_WRITE because RX buffers are DMA *write*
 	 * targets. Runs in the submitting task's mm; the io-wq punt below
 	 * keeps that true even when io_uring offloads this blocking op.
+	 *
+	 * pin_user_pages_fast(), not the bare pin_user_pages(): the latter
+	 * requires the caller to already hold mmap_read_lock -- it does
+	 * mmap_assert_locked() and walks the VMA tree (find_vma) without taking
+	 * the lock itself. We hold no such lock in this io-wq issue context, so
+	 * the plain variant trips a rwsem "lock not held" WARN in find_vma().
+	 * The _fast variant manages mmap_lock internally (lockless fast path,
+	 * slow-path fallback takes the lock) and is the same API io_uring uses
+	 * to pin its own fixed buffers. nr_pages <= 1 GiB/PAGE_SIZE fits int.
 	 */
-	pinned = pin_user_pages(reg.base, nr_pages,
-				FOLL_LONGTERM | FOLL_WRITE, pages);
+	pinned = pin_user_pages_fast(reg.base, (int)nr_pages,
+				     FOLL_LONGTERM | FOLL_WRITE, pages);
 	if (pinned < 0) {
 		ret = (int)pinned;
 		kvfree(pages);

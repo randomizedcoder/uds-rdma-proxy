@@ -489,11 +489,18 @@ over 25 GbE RoCEv2 (a fast endpoint on one host, a uds endpoint on the other):
    incoming frame yields an IB **local length error**. In practice: size the
    fast consumer's pool ≥ the uds peer's `buffer_size`.
 
-**Known follow-up (pre-existing, unrelated to interop):** with REGISTER now
-succeeding repeatedly on the fast acceptor, the fast REGISTER path trips a
-`rwsem.h:81` WARN inside `pin_user_pages` (`urp_uring_cmd` → `__gup_longterm_locked`)
-— non-fatal (data flows), but the pin path should acquire `mmap_lock` correctly.
-Tracked separately from design 31 D1.
+**Resolved follow-up (pre-existing, unrelated to interop):** with REGISTER now
+succeeding repeatedly on the fast acceptor, the fast REGISTER path tripped a
+`rwsem.h:81` WARN inside `pin_user_pages` (`urp_uring_cmd` → `__gup_longterm_locked`
+→ `find_vma`) — non-fatal (data flowed), but wrong. Root cause: the bare
+`pin_user_pages()` requires the caller to already hold `mmap_read_lock` — it does
+`mmap_assert_locked()` and walks the VMA tree without taking the lock itself. The
+REGISTER hook runs in io-wq issue context holding no such lock, so `find_vma`
+asserted "lock not held." **Fixed** by switching to `pin_user_pages_fast()`
+(`kernel/urp_cmd.c`), which manages `mmap_lock` internally (lockless fast path,
+slow-path fallback takes the lock) and is the same API io_uring uses to pin its
+own fixed buffers. `FOLL_LONGTERM | FOLL_WRITE` are preserved; pool page count
+(≤ 1 GiB / PAGE_SIZE) fits the `int nr_pages` argument.
 
 ## 34.6 The windowing function (designed; built in a later phase)
 
