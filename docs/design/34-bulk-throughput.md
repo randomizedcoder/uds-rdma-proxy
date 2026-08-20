@@ -455,6 +455,46 @@ lever for the large-frame (Redpanda/Kafka replication) workload — while window
 (§34.6 / Option C) remains the orthogonal fix for *reliable completion* on both
 paths.
 
+## 34.5.3 Mixed-kind interop — copy ⇄ zero-copy on one RC session (design 31 D1)
+
+The copy (uds) and zero-copy (fast) paths are **wire-compatible**: a fast SEND
+reuses the same `urp_frame_encode` + `struct urp_stream` (SYN/seq) as the pump,
+so their frames are indistinguishable. Both directions were verified on hp1↔hp3
+over 25 GbE RoCEv2 (a fast endpoint on one host, a uds endpoint on the other):
+
+- **fast source → uds/copy sink** (the deployment-relevant direction — a
+  zero-copy producer feeding a legacy consumer): a uds acceptor reassembled a
+  fast sender's frames byte-exact (`BENCH_OK verify=full`, `reorder-drops = 0`).
+  Needs no special handling: the uds acceptor doesn't probe and the fast
+  initiator's own probe is gated off.
+- **uds/copy source → fast sink**: `BENCH_OK verify=full` both sides — but only
+  after two fixes.
+
+**Two issues surfaced on the uds→fast leg, both now handled:**
+
+1. **Probe-churn (fixed).** A uds *initiator* emits design-33 keepalive PINGs; a
+   pumpless fast *acceptor* can't answer them before its app finishes
+   REGISTER + arms recvs, so the initiator hit 3 missed PONGs (~1 s), declared a
+   silent drop, and re-dialed in a self-reinforcing loop — REGISTER against the
+   fast acceptor never stabilized (`-EIO`/`-ENOTCONN`). Fixed by a **peer-kind CM
+   handshake**: a fast endpoint advertises `kind=fast` in a `private_data`
+   trailer (appended after the optional PSK auth bytes, so uds↔uds and the auth
+   memcmp are byte-unchanged); the initiator reads it at ESTABLISHED and
+   **suppresses probing a fast peer** (whose liveness is RC + app-completion
+   driven). Confirmed on hardware: the initiator no longer demotes/re-dials. A
+   recv-path PONG answer (`urp_fast_rx_disposition`) is kept as defense-in-depth.
+2. **Recv-buffer sizing (a requirement, not a bug).** The uds pump coalesces
+   bench frames up to its `buffer_size`, so the fast consumer must donate recv
+   buffers at least that large; a fast recv posted with `sink_len` below the
+   incoming frame yields an IB **local length error**. In practice: size the
+   fast consumer's pool ≥ the uds peer's `buffer_size`.
+
+**Known follow-up (pre-existing, unrelated to interop):** with REGISTER now
+succeeding repeatedly on the fast acceptor, the fast REGISTER path trips a
+`rwsem.h:81` WARN inside `pin_user_pages` (`urp_uring_cmd` → `__gup_longterm_locked`)
+— non-fatal (data flows), but the pin path should acquire `mmap_lock` correctly.
+Tracked separately from design 31 D1.
+
 ## 34.6 The windowing function (designed; built in a later phase)
 
 > **Implementation-ready spec: [design 35](35-windowing-flow-control.md).** That
