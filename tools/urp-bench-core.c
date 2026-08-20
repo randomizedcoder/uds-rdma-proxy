@@ -415,6 +415,7 @@ static const struct {
 	{ "uring-bufring", BENCH_MODE_URING_BUFRING },
 	{ "uring-sqpoll", BENCH_MODE_URING_SQPOLL },
 	{ "uring-sendzc", BENCH_MODE_URING_SENDZC },
+	{ "uring-cmd", BENCH_MODE_URING_CMD },
 };
 
 static const struct {

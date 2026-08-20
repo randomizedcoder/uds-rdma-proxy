@@ -605,6 +605,7 @@ static void test_mode_verify_parse(void)
 		{ "uring-bufring", 0, BENCH_MODE_URING_BUFRING },
 		{ "uring-sqpoll", 0, BENCH_MODE_URING_SQPOLL },
 		{ "uring-sendzc", 0, BENCH_MODE_URING_SENDZC },
+		{ "uring-cmd", 0, BENCH_MODE_URING_CMD },
 		{ "bogus", -BENCH_EINVAL, 0 },
 		{ "", -BENCH_EINVAL, 0 },
 		{ "URING-RW", -BENCH_EINVAL, 0 },	/* case-sensitive */

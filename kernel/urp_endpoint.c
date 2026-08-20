@@ -305,7 +305,18 @@ int urp_endpoint_activate(struct urp_endpoint *ep)
 		goto err_rdma;
 
 	ep->state = URP_STATE_ACTIVE;
-	urp_probe_work_start(ep);
+	/*
+	 * The health probe (design 33 Phase 1.5) posts PING frames from the pump
+	 * send pool and relies on the peer's pump recv path to echo a PONG. A
+	 * fast endpoint (design 31) suppresses the pump entirely -- the app drives
+	 * the QP over /dev/urp -- so its peer never PONGs, and a single-QP fast
+	 * INITIATOR (which probes as a silent-drop keepalive) would demote its own
+	 * QP to DRAINING on the missed PONGs, breaking REGISTER/SEND/RECV on it
+	 * (REG_MR on a draining QP fails -EIO). Suppress probing for fast: the app
+	 * owns liveness through its op completions and RC's own reliability.
+	 */
+	if (!urp_ep_is_fast(ep))
+		urp_probe_work_start(ep);
 	mutex_unlock(&ep->lock);
 
 	/*
