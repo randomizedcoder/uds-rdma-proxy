@@ -92,6 +92,11 @@
         # One-way bulk-throughput runner (design 34): sink-measured goodput +
         # iperf2/ib_write_bw baselines. `nix run .#urp-bw-matrix`.
         urpBwMatrix = import ./nix/urp-bw-matrix.nix { inherit pkgs; };
+        # Zero-copy fast-path twins of the two matrices above (design 31 PR5b):
+        # dedicated `--kind fast` endpoint pair, `urp-bench --mode uring-cmd`.
+        #   .#urp-fast-bw-matrix (goodput), .#urp-fast-hw-matrix (RTT).
+        urpFastBwMatrix = import ./nix/urp-fast-bw-matrix.nix { inherit pkgs; };
+        urpFastHwMatrix = import ./nix/urp-fast-hw-matrix.nix { inherit pkgs; };
         urpFastPoc = import ./nix/urp-fast-poc.nix { inherit pkgs; };
         ciLocal = import ./nix/ci-local.nix {
           inherit pkgs fuzz;
@@ -225,6 +230,11 @@
           # Bulk-throughput sweep (design 34):
           #   nix run .#urp-bw-matrix -- <acceptor> <initiator> <acceptor-ip>
           urp-bw-matrix = urpBwMatrix;
+          # Zero-copy fast-path twins (design 31 PR5b; needs the boxes):
+          #   nix run .#urp-fast-bw-matrix -- <acceptor> <initiator> <acceptor-ip>
+          #   nix run .#urp-fast-hw-matrix -- <acceptor> <initiator> <acceptor-ip>
+          urp-fast-bw-matrix = urpFastBwMatrix;
+          urp-fast-hw-matrix = urpFastHwMatrix;
           urp-fast-poc = urpFastPoc;
           # Local reproduction of the every-push CI: `nix run .#ci-local`
           # (for hosts without a GitHub runner). Builds the 9 nix-checks
