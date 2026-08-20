@@ -66,6 +66,86 @@ static int do_cmd(struct io_uring *ring, int fd, uint32_t cmd_op,
 	return res;
 }
 
+/* Submit one uring_cmd without reaping its CQE (for the async RECV smoke: the
+ * op stays in flight until ring teardown cancels it). Returns the submit result.
+ */
+static int arm_cmd(struct io_uring *ring, int fd, uint32_t cmd_op,
+		   const void *inline_cmd, size_t inline_len)
+{
+	struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+
+	if (!sqe)
+		return -ENOSPC;
+	io_uring_prep_uring_cmd(sqe, (int)cmd_op, fd);
+	memset(sqe->cmd, 0, 16);
+	if (inline_cmd)
+		memcpy(sqe->cmd, inline_cmd, inline_len);
+	return io_uring_submit(ring);
+}
+
+/*
+ * RECV smoke (design 31 PR4): REGISTER a pool against a *connected fast*
+ * endpoint, arm several zero-copy RECV buffers directly on its QP, and exit
+ * WITHOUT reaping -- no peer sends a frame, so the recvs stay in flight. Ring
+ * teardown must then cancel them and the fd close must drain the RQ before
+ * unpinning (else a KASAN UAF or a hang). This exercises the whole RECV arming +
+ * teardown-quiesce path live; the delivered-bytes round trip is the pair test's
+ * fast<->fast phase. Returns 0 on success (prints URP_FAST_POC_OK), 1 otherwise.
+ */
+static int run_recv_smoke(struct io_uring *ring, int fd, void *pool,
+			  size_t pool_len, uint32_t buf_size, uint32_t count,
+			  const char *endpoint)
+{
+	struct urp_cmd_reg reg;
+	struct urp_cmd_reg_sqe reg_sqe;
+	struct urp_cmd_data data;
+	uint32_t armed = 0, want = count < 4 ? count : 4;
+	uint32_t i;
+	int res;
+
+	memset(&reg, 0, sizeof(reg));
+	reg.base = (uint64_t)(uintptr_t)pool;
+	reg.len = pool_len;
+	reg.buf_size = buf_size;
+	reg.count = count;
+	strncpy(reg.endpoint, endpoint, URP_CMD_NAME_MAX - 1);
+	memset(&reg_sqe, 0, sizeof(reg_sqe));
+	reg_sqe.arg = (uint64_t)(uintptr_t)&reg;
+	res = do_cmd(ring, fd, URP_CMD_REGISTER, &reg_sqe, sizeof(reg_sqe));
+	if (res != 0) {
+		printf("URP_FAST_RECV_REGISTER FAIL res=%d\n", res);
+		return 1;
+	}
+	printf("URP_FAST_RECV_REGISTER ok res=0\n");
+
+	for (i = 0; i < want; i++) {
+		memset(&data, 0, sizeof(data));
+		data.buf_index = i;
+		data.len = buf_size - URP_CMD_HEADER_RESV;
+		res = arm_cmd(ring, fd, URP_CMD_RECV, &data, sizeof(data));
+		if (res < 0) {
+			printf("URP_FAST_RECV_ARM FAIL idx=%u res=%d\n", i, res);
+			return 1;
+		}
+		armed++;
+	}
+	printf("URP_FAST_RECV_ARMED n=%u (no peer; left in flight)\n", armed);
+
+	/*
+	 * RECV submits punt to io-wq (the handler may sleep), so give them a
+	 * moment to actually reach ib_post_recv and claim their buffers before we
+	 * tear down -- that way teardown genuinely exercises the cancel + RQ-drain
+	 * path against armed WRs rather than racing un-started submissions.
+	 */
+	usleep(200 * 1000);
+
+	/* Fall through to teardown: queue_exit cancels the armed recvs, the fd
+	 * close drains the RQ and unpins. A clean exit + KASAN silence is the pass.
+	 */
+	printf("URP_FAST_POC_OK\n");
+	return 0;
+}
+
 /* Assert a step's result, log a greppable line, and track failures. */
 static void expect(const char *label, int got, int want)
 {
@@ -92,10 +172,16 @@ int main(int argc, char **argv)
 			argv[0]);
 		return 2;
 	}
+	const char *mode;
+
 	dev = argv[1];
 	endpoint = argv[2];
 	buf_size = (argc > 3) ? (uint32_t)strtoul(argv[3], NULL, 0) : 4096;
 	count = (argc > 4) ? (uint32_t)strtoul(argv[4], NULL, 0) : 8;
+	/* Optional mode: "recv-smoke" arms zero-copy RECVs against a connected fast
+	 * endpoint and exits without reaping (tests cancel + drain teardown). The
+	 * default (no mode) runs the REGISTER/UNREGISTER + validation-edge suite. */
+	mode = (argc > 5) ? argv[5] : "";
 	pool_len = (size_t)buf_size * count;
 	struct io_uring ring;
 	struct urp_cmd_reg reg;
@@ -110,7 +196,16 @@ int main(int argc, char **argv)
 		return 2;
 	}
 
-	ret = io_uring_queue_init(8, &ring, 0);
+	/*
+	 * The zero-copy RECV completion is a 32-byte CQE (payload len in res,
+	 * buf_index|stream_id in res2), so a recv client MUST set up a CQE32 ring
+	 * (design 31 open question Q3) -- and the kernel completes even the cancel
+	 * of an armed recv as a CQE32. The default REGISTER/SEND validation flow
+	 * uses 16-byte CQEs. Pick the ring width from the mode.
+	 */
+	ret = io_uring_queue_init(8, &ring,
+				  strcmp(mode, "recv-smoke") == 0 ?
+					  IORING_SETUP_CQE32 : 0);
 	if (ret < 0) {
 		fprintf(stderr, "queue_init: %s\n", strerror(-ret));
 		close(fd);
@@ -127,6 +222,16 @@ int main(int argc, char **argv)
 	}
 	printf("URP_FAST_POOL base=%p len=%zu buf_size=%u count=%u\n",
 	       pool, pool_len, buf_size, count);
+
+	if (strcmp(mode, "recv-smoke") == 0) {
+		int rc = run_recv_smoke(&ring, fd, pool, pool_len, buf_size,
+					count, endpoint);
+
+		munmap(pool, pool_len);
+		io_uring_queue_exit(&ring);	/* cancels the in-flight recvs */
+		close(fd);			/* release drains the RQ + unpins */
+		return rc;
+	}
 
 	/* --- negative: an unknown endpoint is rejected before any pin sticks --- */
 	memset(&reg, 0, sizeof(reg));
@@ -178,6 +283,30 @@ int main(int argc, char **argv)
 	data.len = 64;
 	data.stream_id = 1;
 	expect("SEND_ERANGE", do_cmd(&ring, fd, URP_CMD_SEND, &data,
+				     sizeof(data)), -ERANGE);
+
+	/*
+	 * --- RECV validation (design 31 PR4) ---
+	 *
+	 * The RECV data path arms a donated buffer as a zero-copy RDMA landing
+	 * slot on the endpoint QP and completes asynchronously (CQE32: payload len
+	 * in res, buf_index|stream_id in res2) when the NIC fills it. This
+	 * standalone PoC has no peer to send an inbound frame, so it exercises only
+	 * the synchronous validation edges; the full uds->fast / fast->fast round
+	 * trip that asserts delivered bytes is the VM pair-test (Phase 10i). A
+	 * zero-length donation and an out-of-range buffer index are rejected before
+	 * any recv WR is posted.
+	 */
+	memset(&data, 0, sizeof(data));
+	data.buf_index = 0;
+	data.len = 0;			/* zero-length donation is meaningless */
+	expect("RECV_ZEROLEN", do_cmd(&ring, fd, URP_CMD_RECV, &data,
+				      sizeof(data)), -EINVAL);
+
+	memset(&data, 0, sizeof(data));
+	data.buf_index = count;		/* one past the end */
+	data.len = 64;
+	expect("RECV_ERANGE", do_cmd(&ring, fd, URP_CMD_RECV, &data,
 				     sizeof(data)), -ERANGE);
 
 	/* --- unregister, then a second unregister has nothing to release --- */

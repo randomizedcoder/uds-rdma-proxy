@@ -56,6 +56,31 @@ int urp_post_frame_raw(struct ib_qp *qp, u64 addr, u32 len, u32 lkey,
 }
 
 /*
+ * Post one recv WR of @len bytes landing at DMA/MR address @addr with local key
+ * @lkey on @qp, completing through @cqe. The urp-fast zero-copy RECV path
+ * (design 31 PR4) arms an app-donated pool buffer directly on the endpoint QP
+ * (no SRQ), so each completion maps back to the donating op via @cqe. A single
+ * SGE covers the whole frame (header + payload) through the pool-wide MR. Does
+ * no bookkeeping -- the caller owns the ownership state machine. Returns the
+ * ib_post_recv result.
+ */
+int urp_post_recv_raw(struct ib_qp *qp, u64 addr, u32 len, u32 lkey,
+		      struct ib_cqe *cqe)
+{
+	struct ib_recv_wr wr = {};
+	struct ib_sge sge = {};
+
+	sge.addr = addr;
+	sge.length = len;
+	sge.lkey = lkey;
+	wr.wr_cqe = cqe;
+	wr.sg_list = &sge;
+	wr.num_sge = 1;
+
+	return ib_post_recv(qp, &wr, NULL);
+}
+
+/*
  * DMA-sync and post one framed send buffer (@len bytes including the
  * header) on @qp. On failure the buffer is returned to the send pool;
  * the caller must not touch @buf after this call.

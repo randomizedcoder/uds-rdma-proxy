@@ -352,10 +352,17 @@ static int urp_endpoint_setup_shared(struct urp_endpoint *ep,
 		goto err_send_cq;
 	}
 
-	/* SRQ shared across all QPs (Step 3). */
-	ret = urp_srq_create(ep);
-	if (ret)
-		goto err_recv_cq;
+	/*
+	 * SRQ shared across all QPs (Step 3) -- copy-path endpoints only. A fast
+	 * endpoint (design 31 PR4) posts app-donated recv buffers directly on its
+	 * QPs so completions carry a per-op wr_cqe; it has no SRQ and its QPs are
+	 * created with a real RQ instead (urp_qp_create_on_cm_id).
+	 */
+	if (!urp_ep_is_fast(ep)) {
+		ret = urp_srq_create(ep);
+		if (ret)
+			goto err_recv_cq;
+	}
 
 	return 0;
 
@@ -387,11 +394,28 @@ static int urp_qp_create_on_cm_id(struct urp_endpoint *ep,
 
 	attr.send_cq = ep->send_cq;
 	attr.recv_cq = ep->recv_cq;
-	attr.srq = ep->srq;			/* Step 3: shared RQ */
 	/* SQ deep enough for the send half of the pool; never past HW limit. */
 	attr.cap.max_send_wr = min_t(u32, ep->num_bufs,
 				     (u32)ep->ib_dev->attrs.max_qp_wr);
-	attr.cap.max_recv_wr = 0;		/* recvs flow through SRQ */
+	if (urp_ep_is_fast(ep)) {
+		/*
+		 * Zero-copy fast endpoint (design 31 PR4): the app donates its
+		 * own pinned pages as RX landing space and posts them directly
+		 * on this QP (urp_cmd.c), so the QP needs a real receive queue
+		 * and no SRQ -- each recv completion must map back to the
+		 * donating op's wr_cqe, which a shared SRQ cannot express. Size
+		 * the RQ to the endpoint's buffer_count (the natural bound on
+		 * concurrently donated recvs); the app under-donating just runs
+		 * the RQ down to RNR (the design's explicit backpressure), and
+		 * over-donating past the RQ depth fails the post as -ENOMEM.
+		 */
+		attr.srq = NULL;
+		attr.cap.max_recv_wr = min_t(u32, ep->num_bufs,
+					     (u32)ep->ib_dev->attrs.max_qp_wr);
+	} else {
+		attr.srq = ep->srq;		/* Step 3: shared RQ */
+		attr.cap.max_recv_wr = 0;	/* recvs flow through SRQ */
+	}
 	attr.cap.max_send_sge = 1;
 	attr.cap.max_recv_sge = 1;
 	attr.qp_type = IB_QPT_RC;

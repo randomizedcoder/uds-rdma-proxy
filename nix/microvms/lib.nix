@@ -988,6 +988,68 @@ in rec {
       echo ""
 
       # -----------------------------------------------------------------
+      # Phase 10i — urp-fast zero-copy RECV arming + teardown quiesce
+      # (design 31, PR4). Stand up a dedicated *fast*-kind endpoint pair
+      # (fast_acc on vm1, fast_init on vm2). A fast endpoint suppresses the
+      # UDS pump entirely -- the app drives the QP over /dev/urp -- and its
+      # QP is created with a real receive queue and NO SRQ so each recv
+      # completion carries the donating op's wr_cqe (urp_qp_create_on_cm_id).
+      # This phase exercises exactly that path: once the pair reaches
+      # ESTABLISHED, urp-fast-poc REGISTERs a pool against fast_acc and arms
+      # several zero-copy RECV buffers directly on the fast RQ, then exits
+      # WITHOUT reaping (no peer sends a frame). Ring teardown must cancel the
+      # in-flight recvs and the fd close must drain the RQ before unpinning --
+      # the teardown-quiesce that stops the NIC racing unpin_user_pages. The
+      # sanitizer kernel's Phase 11b KASAN/KMEMLEAK sweep is the oracle for a
+      # clean cancel+drain; URP_FAST_POC_OK is the functional gate. The full
+      # delivered-bytes round trip (uds->fast / fast<->fast) is a follow-up.
+      #
+      # Retry the poc until REGISTER succeeds: the fast pair connects
+      # asynchronously (initiator dials at activate), and a successful smoke
+      # drains fast_acc's QP to ERR, so exactly one run can succeed.
+      # -----------------------------------------------------------------
+      echo "--- Phase 10i: urp-fast zero-copy RECV arming + drain (design 31 PR4) ---"
+      fport=4795
+      # A fast endpoint drives its data path over /dev/urp and creates no UDS
+      # socket, but endpoint role is still derived from the path attr
+      # (listen-path => initiator, connect-path => acceptor). Pass dummy paths
+      # purely as the role marker; the fast path suppresses the UDS socket/pump
+      # so nothing binds or dials them (urp_socket_init skips it for fast, and a
+      # fast acceptor never eager-connects -- urp_rdma.c).
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+        "urp add fast_acc --kind fast --connect-path /tmp/urp-fast-acc.sock --bind $VM1_IP:$fport --buffer-count 16 --buffer-size 4096" "$T_URP" \
+        > "$RUNDIR/diag/vm1.fast-add.txt" 2>&1
+      vm_run "$VM2_VIRTIO" "$VM2_PROC" \
+        "urp add fast_init --kind fast --listen-path /tmp/urp-fast-init.sock --peer $VM1_IP:$fport --buffer-count 16 --buffer-size 4096" "$T_URP" \
+        > "$RUNDIR/diag/vm2.fast-add.txt" 2>&1
+      if ! grep -q "ok:" "$RUNDIR/diag/vm1.fast-add.txt" || ! grep -q "ok:" "$RUNDIR/diag/vm2.fast-add.txt"; then
+        awk '{print "    vm1: "$0}' "$RUNDIR/diag/vm1.fast-add.txt"
+        awk '{print "    vm2: "$0}' "$RUNDIR/diag/vm2.fast-add.txt"
+        fail "fast endpoint pair add failed"
+      fi
+      fastrecv="$RUNDIR/diag/vm1.fast-recv-smoke.txt"
+      recv_ok=0
+      for _try in $(seq 1 12); do
+        sleep "$POLL"
+        vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+          "urp-fast-poc /dev/urp fast_acc 4096 8 recv-smoke 2>&1" "$T_BENCH" \
+          > "$fastrecv" 2>&1 || true
+        if grep -q URP_FAST_POC_OK "$fastrecv"; then recv_ok=1; break; fi
+      done
+      scan_splat "$fastrecv" "urp-fast recv smoke"
+      if [ "$recv_ok" = 1 ]; then
+        pass "urp-fast zero-copy RECV armed on fast RQ + cancel/drain teardown (design 31 PR4)"
+        awk '/^URP_FAST_/ {print "    "$0}' "$fastrecv"
+      else
+        awk '{print "    "$0}' "$fastrecv"
+        fail "urp-fast recv smoke: no URP_FAST_POC_OK (see $fastrecv)"
+      fi
+      # Remove the fast pair (its QP is already ERR after the smoke drain).
+      vm_run "$VM2_VIRTIO" "$VM2_PROC" "urp remove fast_init 2>/dev/null; echo FGONE2" 15 >/dev/null 2>&1 || true
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" "urp remove fast_acc 2>/dev/null; echo FGONE1" 15 >/dev/null 2>&1 || true
+      echo ""
+
+      # -----------------------------------------------------------------
       # Phase 11 — teardown (drain, remove, rmmod), each step timed
       # so the slow command pops out of the verdict table.
       # -----------------------------------------------------------------

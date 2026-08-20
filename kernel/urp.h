@@ -647,6 +647,12 @@ void urp_probe_work_stop(struct urp_endpoint *ep);
  */
 int  urp_post_frame_raw(struct ib_qp *qp, u64 addr, u32 len, u32 lkey,
 			struct ib_cqe *cqe);
+/* Post one single-SGE recv WR at @addr/@lkey (frame landing space) completing
+ * through @cqe. The urp-fast zero-copy RECV path (design 31) arms an app pool
+ * buffer directly on the endpoint QP; caller owns the ownership bookkeeping.
+ */
+int  urp_post_recv_raw(struct ib_qp *qp, u64 addr, u32 len, u32 lkey,
+		       struct ib_cqe *cqe);
 
 /* CQ completion callbacks (urp_rdma.c) -- used by pump when posting sends */
 void urp_send_done(struct ib_cq *cq, struct ib_wc *wc);
