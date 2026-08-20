@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -40,6 +41,7 @@
 #include <unistd.h>
 
 #include "urp-bench-core.h"
+#include "include/uapi/linux/urp_cmd.h"	/* fast (uring-cmd) ABI, design 31 */
 
 #define RECV_BUF_SZ	65536u
 #define ECHO_SCRATCH_SZ	(BENCH_HDR_SIZE + BENCH_PAYLOAD_MAX)
@@ -86,6 +88,9 @@ struct run {
 	int use_fixed;		/* fixed buffers registered */
 	int use_sendzc;
 	int use_bufring;	/* provided buffer ring + multishot recv */
+	int use_fast;		/* uring-cmd zero-copy fast path (design 31) */
+	void *fast;		/* struct fast_ctx * — reflect path reaches it via on_msg */
+	const char *fast_endpoint;	/* urp `--kind fast` endpoint to REGISTER against */
 
 	/* provided-buffer ring (bufring mode) */
 	struct io_uring_buf_ring *br;
@@ -231,6 +236,9 @@ static void queue_echo_uring(struct run *r, struct msg_ctx *mc,
 static void queue_echo_blocking(struct run *r, struct msg_ctx *mc,
 				const struct bench_hdr *hdr,
 				const uint8_t *payload);
+static void queue_echo_fast(struct run *r, struct msg_ctx *mc,
+			    const struct bench_hdr *hdr,
+			    const uint8_t *payload);
 static void recycle_provided(struct run *r, uint32_t buf_id);
 
 static int on_msg(void *ctx, const struct bench_hdr *hdr,
@@ -284,7 +292,9 @@ static int on_msg(void *ctx, const struct bench_hdr *hdr,
 	/* echo pattern: reflect it back */
 	if (hdr->flags & BENCH_FLAG_FIN)
 		r->peer_fin_seen = 1;
-	if (r->use_uring)
+	if (r->use_fast)
+		queue_echo_fast(r, mc, hdr, payload);
+	else if (r->use_uring)
 		queue_echo_uring(r, mc, hdr, payload);
 	else
 		queue_echo_blocking(r, mc, hdr, payload);
@@ -1128,6 +1138,436 @@ static int run_blocking(struct run *r)
 	return r->rc < 0 ? (int)r->rc : 0;
 }
 
+/* ---- fast (uring-cmd / zero-copy) backend ------------------------------ */
+
+/*
+ * The fast path (design 31) is not a socket transport: the app hands urp.ko a
+ * pinned buffer pool over io_uring_cmd on /dev/urp and the NIC DMAs straight
+ * into/out of those pages. urp-bench drives it by NESTING its own 24-byte frame
+ * (bench_hdr + payload) inside the urp payload — the app writes the bench frame
+ * at buf+URP_CMD_HEADER_RESV and the kernel prepends the 20-byte wire header, so
+ * one SEND posts a single SGE with no payload copy. The pure core
+ * (framing/deframe/tracker/stats) is reused unchanged. Roles (pattern x role):
+ *
+ *   stream connect  source     blast SENDs, then one bench FIN, drain
+ *   stream listen   sink       arm RECVs, count delivered bytes to the FIN
+ *   echo   connect  pinger     windowed SEND-original + RECV-echo -> RTT
+ *   echo   listen   reflector  RECV + in-place zero-copy reflect (flip ECHO)
+ *
+ * The socket echo is a symmetric peer echo; the fast echo is an asymmetric
+ * ping-pong (connect measures RTT, listen only reflects). The hw matrix scrapes
+ * the connect side's BENCH_OK, so the reported RTT is identical in meaning.
+ */
+
+enum fast_bstate {
+	FB_FREE,	/* app owns the buffer, idle */
+	FB_SEND,	/* a SEND is in flight from this buffer */
+	FB_RECV,	/* a RECV is armed on this buffer */
+};
+
+struct fast_ctx {
+	struct run *r;
+	uint8_t *pool;		/* mmap'd buffer pool */
+	size_t pool_len;
+	uint32_t buf_size;	/* per-buffer bytes (page multiple) */
+	uint32_t count;		/* pool buffers */
+	uint32_t msg_size;	/* urp payload == nested bench wire size */
+	uint32_t send_lo;	/* send-pool is [send_lo, send_lo + send_n) */
+	uint32_t send_n;
+	uint16_t stream_id;	/* app-assigned, non-zero (0 is reserved) */
+	uint8_t *bstate;	/* [count] enum fast_bstate */
+	uint8_t *recv_pool;	/* [count] 1 == buffer is (re)armed as RECV */
+};
+
+/* First byte of buffer @idx's nested bench frame — past the 20-byte urp header
+ * the kernel writes at +0. */
+static uint8_t *fast_frame(struct fast_ctx *f, uint32_t idx)
+{
+	return f->pool + (size_t)idx * f->buf_size + URP_CMD_HEADER_RESV;
+}
+
+static uint32_t fast_state_count(struct fast_ctx *f, int state)
+{
+	uint32_t i, n = 0;
+
+	for (i = 0; i < f->count; i++)
+		if (f->bstate[i] == (uint8_t)state)
+			n++;
+	return n;
+}
+
+/* Post a SEND of @len urp-payload bytes (== nested bench wire bytes) from
+ * buffer @idx; the bench frame must already be written at fast_frame(idx). */
+static void fast_post_send(struct fast_ctx *f, uint32_t idx, uint32_t len)
+{
+	struct io_uring_sqe *sqe = get_sqe(f->r);
+	struct urp_cmd_data d;
+
+	if (!sqe)
+		return;
+	memset(&d, 0, sizeof(d));
+	d.buf_index = idx;
+	d.len = len;
+	d.stream_id = f->stream_id;
+	io_uring_prep_uring_cmd(sqe, URP_CMD_SEND, f->r->fd);
+	memset(sqe->cmd, 0, 16);
+	memcpy(sqe->cmd, &d, sizeof(d));
+	io_uring_sqe_set_data64(sqe, UD(UD_KIND_SEND, idx));
+	f->bstate[idx] = FB_SEND;
+}
+
+/* Arm buffer @idx as a zero-copy RDMA landing slot for one inbound frame. */
+static void fast_post_recv(struct fast_ctx *f, uint32_t idx)
+{
+	struct io_uring_sqe *sqe = get_sqe(f->r);
+	struct urp_cmd_data d;
+
+	if (!sqe)
+		return;
+	memset(&d, 0, sizeof(d));
+	d.buf_index = idx;
+	d.len = f->msg_size;	/* donate the whole nested-frame region */
+	io_uring_prep_uring_cmd(sqe, URP_CMD_RECV, f->r->fd);
+	memset(sqe->cmd, 0, 16);
+	memcpy(sqe->cmd, &d, sizeof(d));
+	io_uring_sqe_set_data64(sqe, UD(UD_KIND_RECV, idx));
+	f->bstate[idx] = FB_RECV;
+}
+
+/* Reflector's in-place zero-copy echo: flip the ECHO flag byte in the frame the
+ * NIC just delivered and SEND the same bytes straight back — no copy. Mirrors
+ * the socket in-place echo (queue_echo_blocking), buf_index-addressed. */
+static void queue_echo_fast(struct run *r, struct msg_ctx *mc,
+			    const struct bench_hdr *hdr,
+			    const uint8_t *payload)
+{
+	struct fast_ctx *f = r->fast;
+	uint32_t idx = (uint32_t)mc->recv_idx;
+	uint8_t *frame = fast_frame(f, idx);
+
+	(void)payload;
+	frame[5] |= BENCH_FLAG_ECHO;	/* bench_hdr.flags is byte 5 of the frame */
+	fast_post_send(f, idx, BENCH_HDR_SIZE + hdr->payload_len);
+}
+
+/* Synchronous REGISTER of the pool against the fast endpoint (cold path).
+ * Returns 0 or the CQE's negative errno. */
+static int fast_register(struct fast_ctx *f, const char *endpoint)
+{
+	struct io_uring_sqe *sqe = io_uring_get_sqe(&f->r->ring);
+	struct io_uring_cqe *cqe;
+	struct urp_cmd_reg reg;
+	struct urp_cmd_reg_sqe rs;
+	int ret, res;
+
+	if (!sqe)
+		return -BENCH_EFULL;
+	memset(&reg, 0, sizeof(reg));
+	reg.base = (uint64_t)(uintptr_t)f->pool;
+	reg.len = f->pool_len;
+	reg.buf_size = f->buf_size;
+	reg.count = f->count;
+	strncpy(reg.endpoint, endpoint, URP_CMD_NAME_MAX - 1);
+	memset(&rs, 0, sizeof(rs));
+	rs.arg = (uint64_t)(uintptr_t)&reg;
+	io_uring_prep_uring_cmd(sqe, URP_CMD_REGISTER, f->r->fd);
+	memset(sqe->cmd, 0, 16);
+	memcpy(sqe->cmd, &rs, sizeof(rs));
+	io_uring_sqe_set_data64(sqe, 0);
+	f->r->syscalls++;
+	ret = io_uring_submit_and_wait(&f->r->ring, 1);
+	if (ret < 0)
+		return ret;
+	ret = io_uring_wait_cqe(&f->r->ring, &cqe);
+	if (ret < 0)
+		return ret;
+	res = cqe->res;
+	io_uring_cqe_seen(&f->r->ring, cqe);
+	return res;
+}
+
+/* True while the source/pinger should still originate data frames. */
+static int fast_more_data(struct run *r, uint64_t now)
+{
+	if (r->cfg->count)
+		return r->sent_originals < r->cfg->count;
+	return now < r->deadline_ns;
+}
+
+/* Emit one data original from a free send-pool buffer. Returns 1 if sent. */
+static int fast_gen_one(struct fast_ctx *f, uint32_t idx, uint64_t now,
+			int pingpong)
+{
+	struct run *r = f->r;
+	const struct bench_config *cfg = r->cfg;
+	struct bench_hdr h;
+	uint8_t *frame;
+	uint32_t seq = (uint32_t)r->next_seq;
+
+	memset(&h, 0, sizeof(h));
+	h.magic = BENCH_MAGIC;
+	h.version = BENCH_VERSION;
+	h.origin_id = cfg->id;
+	h.payload_len = f->msg_size - BENCH_HDR_SIZE;
+	h.seq = seq;
+	h.t_send_ns = now;
+	/* pinger tracks each original so its returning echo yields an RTT; the
+	 * tracker window == batch, so back off if it is momentarily full. */
+	if (pingpong && bench_track_sent(&r->tracker, seq, now) < 0)
+		return 0;
+	r->next_seq++;
+	frame = fast_frame(f, idx);
+	bench_hdr_encode(&h, frame);
+	if (cfg->verify != BENCH_VERIFY_NONE)
+		bench_fill_payload(frame + BENCH_HDR_SIZE, h.payload_len,
+				   cfg->id, seq);
+	fast_post_send(f, idx, f->msg_size);
+	r->sent_originals++;
+	r->tx_wire_bytes += f->msg_size;
+	return 1;
+}
+
+/* Emit the single terminating FIN frame from a free send-pool buffer. */
+static void fast_gen_fin(struct fast_ctx *f, uint32_t idx, uint64_t now,
+			 int pingpong)
+{
+	struct run *r = f->r;
+	struct bench_hdr h;
+	uint8_t *frame;
+	uint32_t seq = (uint32_t)r->next_seq++;
+
+	memset(&h, 0, sizeof(h));
+	h.magic = BENCH_MAGIC;
+	h.version = BENCH_VERSION;
+	h.flags = BENCH_FLAG_FIN;
+	h.origin_id = r->cfg->id;
+	h.seq = seq;
+	h.t_send_ns = now;
+	frame = fast_frame(f, idx);
+	bench_hdr_encode(&h, frame);
+	if (pingpong)
+		bench_track_sent(&r->tracker, seq, now);
+	r->own_fin_sent = 1;
+	r->own_fin_seq = seq;
+	fast_post_send(f, idx, BENCH_HDR_SIZE);
+}
+
+/* Has the run reached its terminal state for this role? */
+static int fast_done(struct fast_ctx *f, int gen, int pingpong, int reflect)
+{
+	struct run *r = f->r;
+
+	if (reflect)
+		return r->peer_fin_seen && fast_state_count(f, FB_SEND) == 0;
+	if (!gen)			/* stream sink */
+		return r->peer_fin_seen;
+	if (pingpong)			/* echo pinger */
+		return r->own_fin_sent && r->own_fin_echoed &&
+		       fast_state_count(f, FB_SEND) == 0;
+	/* stream source */
+	return r->own_fin_sent && fast_state_count(f, FB_SEND) == 0;
+}
+
+static int run_fast(struct run *r)
+{
+	const struct bench_config *cfg = r->cfg;
+	long pg = sysconf(_SC_PAGESIZE);
+	struct fast_ctx f;
+	uint32_t buf_size, count, W, i;
+	unsigned entries;
+	uint64_t hard_deadline;
+	int gen, reflect, pingpong, res;
+
+	if (pg <= 0)
+		pg = 4096;
+	/* Pool buffer holds the 20-byte urp header + the nested bench frame.
+	 * Round up to a page so the pool length tiles to PAGE_SIZE for any
+	 * msg_size — REGISTER requires len % buf_size == 0 && page-aligned. */
+	buf_size = (uint32_t)(((uint64_t)URP_CMD_HEADER_RESV + cfg->msg_size +
+			       (uint64_t)pg - 1) / (uint64_t)pg * (uint64_t)pg);
+	if (buf_size > URP_CMD_BUF_SIZE_MAX)
+		skip(cfg, "msg_too_big_for_fast");
+
+	pingpong = cfg->pattern == BENCH_PATTERN_ECHO &&
+		   cfg->role == BENCH_ROLE_CONNECT;
+	reflect = cfg->pattern == BENCH_PATTERN_ECHO &&
+		  cfg->role == BENCH_ROLE_LISTEN;
+	gen = cfg->role == BENCH_ROLE_CONNECT;	/* source or pinger */
+
+	/* Outstanding window == batch (== the RTT tracker window main sized). A
+	 * pinger needs a send-pool AND a recv-pool; others need one pool. */
+	W = cfg->batch;
+	count = pingpong ? 2 * W : W;
+	if (count < 4)
+		count = 4;
+	if (count > URP_CMD_POOL_COUNT_MAX)
+		count = URP_CMD_POOL_COUNT_MAX;
+	entries = 8;
+	while (entries < count * 2u + 8u)
+		entries <<= 1;
+
+	memset(&f, 0, sizeof(f));
+	f.r = r;
+	f.buf_size = buf_size;
+	f.count = count;
+	f.msg_size = cfg->msg_size;
+	f.stream_id = 1;	/* app-assigned, non-zero (stream 0 reserved) */
+	if (pingpong) {
+		f.send_lo = 0;
+		f.send_n = W;
+	} else if (gen) {	/* stream source: every buffer sources */
+		f.send_lo = 0;
+		f.send_n = count;
+	}			/* sink / reflector: send_n stays 0 */
+	f.bstate = calloc(count, 1);
+	f.recv_pool = calloc(count, 1);
+	if (!f.bstate || !f.recv_pool)
+		fail(cfg, "oom", 0);
+	r->fast = &f;
+	r->use_fast = 1;
+
+	r->fd = open(URP_CMD_DEVICE_PATH, O_RDWR | O_CLOEXEC);
+	if (r->fd < 0)
+		fail(cfg, "open_urp", -errno);
+	/* Fast RECV completes as a 32-byte CQE (payload len in res, buf_index |
+	 * stream_id in res2). A CQE32 ring also carries SEND's 16-byte
+	 * completion safely, so one ring width serves every role. */
+	res = io_uring_queue_init(entries, &r->ring, IORING_SETUP_CQE32);
+	if (res < 0)
+		fail(cfg, "queue_init", res);
+
+	f.pool_len = (size_t)buf_size * count;
+	f.pool = mmap(NULL, f.pool_len, PROT_READ | PROT_WRITE,
+		      MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+	if (f.pool == MAP_FAILED)
+		fail(cfg, "mmap", -errno);
+
+	res = fast_register(&f, r->fast_endpoint);
+	if (res != 0)
+		fail(cfg, "register", res);
+
+	/* Recv-pool assignment + initial arming (flushed on the first submit). */
+	if (pingpong) {
+		for (i = W; i < count; i++) {
+			f.recv_pool[i] = 1;
+			fast_post_recv(&f, i);
+		}
+	} else if (!gen) {		/* sink / reflector: every buffer recvs */
+		for (i = 0; i < count; i++) {
+			f.recv_pool[i] = 1;
+			fast_post_recv(&f, i);
+		}
+	}
+
+	hard_deadline = now_ns() +
+			(FIN_TIMEOUT_S +
+			 (r->deadline_ns ? (uint64_t)cfg->duration_s :
+					   cfg->count / 100000 + 30)) *
+				1000000000ull;
+
+	while (!fast_done(&f, gen, pingpong, reflect) && r->rc >= 0) {
+		struct io_uring_cqe *cqe;
+		unsigned head, seen = 0;
+		uint64_t now = now_ns();
+
+		/* --- originate (source / pinger) --- */
+		if (gen) {
+			for (i = f.send_lo; i < f.send_lo + f.send_n; i++) {
+				if (f.bstate[i] != FB_FREE)
+					continue;
+				if (!fast_more_data(r, now))
+					break;
+				/* pinger: never exceed the RTT tracker window. */
+				if (pingpong && r->tracker.inflight_count >= W)
+					break;
+				if (!fast_gen_one(&f, i, now, pingpong))
+					break;	/* tracker momentarily full */
+			}
+			/* All data delivered (send completions drained — RC ACK
+			 * means the peer's RQ already has every frame, so a FIN
+			 * posted now cannot overtake data even across QPs) and,
+			 * for a pinger, every echo home: emit the FIN. */
+			if (!r->own_fin_sent && !fast_more_data(r, now) &&
+			    fast_state_count(&f, FB_SEND) == 0 &&
+			    (!pingpong || r->tracker.inflight_count == 0)) {
+				for (i = f.send_lo; i < f.send_lo + f.send_n;
+				     i++) {
+					if (f.bstate[i] != FB_FREE)
+						continue;
+					fast_gen_fin(&f, i, now, pingpong);
+					break;
+				}
+			}
+		}
+
+		r->syscalls++;
+		res = io_uring_submit_and_wait(&r->ring, 1);
+		if (res < 0 && res != -EINTR) {
+			r->rc = res;
+			break;
+		}
+		io_uring_for_each_cqe(&r->ring, head, cqe) {
+			uint32_t idx = UD_IDX(cqe->user_data);
+			int kind = UD_KIND(cqe->user_data);
+			int32_t cres = cqe->res;
+
+			seen++;
+			if (idx >= count)
+				continue;
+			if (kind == UD_KIND_SEND) {
+				if (cres < 0) {
+					r->rc = cres;
+					continue;
+				}
+				if (f.recv_pool[idx])
+					fast_post_recv(&f, idx);  /* reflection */
+				else
+					f.bstate[idx] = FB_FREE;  /* original */
+			} else {		/* UD_KIND_RECV */
+				struct msg_ctx mc;
+				uint8_t *frame;
+
+				if (cres < 0) {
+					/* RX starvation / RNR / drain surfaces
+					 * here rather than silently dropping. */
+					r->rc = cres;
+					f.bstate[idx] = FB_FREE;
+					continue;
+				}
+				frame = fast_frame(&f, idx);
+				mc.r = r;
+				mc.chunk = frame;
+				mc.chunk_len = (size_t)cres;
+				mc.recv_idx = (int)idx;
+				/* tentatively free; on_msg's reflect flips to
+				 * FB_SEND, so re-arm only if it did not. */
+				f.bstate[idx] = FB_FREE;
+				res = bench_deframe_feed(&r->df, frame,
+							 (size_t)cres, on_msg,
+							 &mc);
+				if (res < 0) {
+					r->rc = res;
+					continue;
+				}
+				if (f.bstate[idx] == FB_FREE)
+					fast_post_recv(&f, idx);
+			}
+		}
+		io_uring_cq_advance(&r->ring, seen);
+
+		if (now_ns() > hard_deadline)
+			fail(cfg, "timeout", 0);
+	}
+
+	munmap(f.pool, f.pool_len);
+	io_uring_queue_exit(&r->ring);	/* cancels in-flight recvs */
+	close(r->fd);			/* release drains the RQ + unpins */
+	free(f.bstate);
+	free(f.recv_pool);
+	r->fast = NULL;
+	return r->rc < 0 ? (int)r->rc : 0;
+}
+
 /* ---- memcpy yardstick -------------------------------------------------- */
 
 static void memcpy_baseline(uint32_t msg_size)
@@ -1158,10 +1598,13 @@ static void usage(void)
 	fprintf(stderr,
 		"usage: urp-bench (--listen PATH | --connect PATH) --id N\n"
 		"  --mode {blocking,uring-rw,uring-fixed,uring-bufring,\n"
-		"          uring-sqpoll,uring-sendzc}\n"
+		"          uring-sqpoll,uring-sendzc,uring-cmd}\n"
 		"  --msg-size BYTES --batch N (--count N | --duration S)\n"
 		"  [--verify {none,header,full}] [--pattern {echo,stream}]\n"
 		"  [--defer-taskrun] [--memcpy-baseline] [--quiet-zc]\n"
+		"  [--fast-endpoint NAME]  (mode uring-cmd: zero-copy fast path,\n"
+		"    design 31; REGISTERs a pool against the `urp add --kind fast`\n"
+		"    endpoint NAME on /dev/urp; --listen/--connect select role only)\n"
 		"  (pattern stream: connect=source, listen=sink; blocking mode)\n");
 	exit(2);
 }
@@ -1175,6 +1618,7 @@ int main(int argc, char **argv)
 		.batch = 32,
 	};
 	const char *path = NULL;
+	const char *fast_endpoint = NULL;
 	int do_memcpy = 0;
 	struct run r = { 0 };
 	struct rusage ru0, ru1;
@@ -1217,6 +1661,8 @@ int main(int argc, char **argv)
 		} else if (!strcmp(s, "--pattern") && a + 1 < argc) {
 			if (bench_pattern_parse(argv[++a], &cfg.pattern) < 0)
 				usage();
+		} else if (!strcmp(s, "--fast-endpoint") && a + 1 < argc) {
+			fast_endpoint = argv[++a];
 		} else if (!strcmp(s, "--defer-taskrun")) {
 			cfg.defer_taskrun = 1;
 		} else if (!strcmp(s, "--memcpy-baseline")) {
@@ -1230,15 +1676,29 @@ int main(int argc, char **argv)
 		memcpy_baseline(cfg.msg_size);
 		return 0;
 	}
-	if (bench_config_validate(&cfg) < 0 || !path)
+	if (bench_config_validate(&cfg) < 0)
+		usage();
+	/* The fast path is addressed by endpoint name (--fast-endpoint), the
+	 * socket paths by --listen/--connect; --listen/--connect still select
+	 * the role for fast (their path arg is unused). */
+	if (cfg.mode == BENCH_MODE_URING_CMD ? !fast_endpoint : !path)
 		usage();
 
 	r.cfg = &cfg;
+	r.fast_endpoint = fast_endpoint;
 	/* Role split (§34.4): echo sides both source+reflect; a stream source
 	 * (connect) only sources, a stream sink (listen) only drains. */
 	r.do_generate = cfg.pattern == BENCH_PATTERN_ECHO ||
 			cfg.role == BENCH_ROLE_CONNECT;
 	r.do_echo = cfg.pattern == BENCH_PATTERN_ECHO;
+	/* The fast echo is an asymmetric ping-pong (design 31): the connect side
+	 * pings and measures RTT, the listen side only reflects — unlike the
+	 * socket's symmetric peer echo, where both sides generate and reflect. */
+	if (cfg.mode == BENCH_MODE_URING_CMD) {
+		r.do_generate = cfg.role == BENCH_ROLE_CONNECT;
+		r.do_echo = cfg.pattern == BENCH_PATTERN_ECHO &&
+			    cfg.role == BENCH_ROLE_LISTEN;
+	}
 	r.src_carry_empty = 1;
 	r.goal = cfg.count ? cfg.count : ~0ull;
 	r.n_rbufs = cfg.batch * 2 < 4 ? 4 : (cfg.batch * 2 > 64 ? 64 :
@@ -1287,23 +1747,37 @@ int main(int argc, char **argv)
 	bench_deframer_init(&r.df, r.asm_buf, cfg.msg_size,
 			    cfg.msg_size - BENCH_HDR_SIZE);
 
-	r.fd = cfg.role == BENCH_ROLE_LISTEN ? uds_listen_accept(path) :
-					       uds_connect(path);
-	if (r.fd < 0)
-		fail(&cfg, "socket", -errno);
-	if (cfg.mode == BENCH_MODE_BLOCKING &&
-	    fcntl(r.fd, F_SETFL, O_NONBLOCK) < 0)
-		fail(&cfg, "nonblock", -errno);
-	if (cfg.duration_s)
-		r.deadline_ns = now_ns() + (uint64_t)cfg.duration_s *
-					   1000000000ull;
+	if (cfg.mode == BENCH_MODE_URING_CMD) {
+		/* run_fast opens /dev/urp and REGISTERs its own pool; there is
+		 * no socket. The endpoint's RC connection is already up (fast
+		 * initiator dials eagerly at activate). */
+		if (cfg.duration_s)
+			r.deadline_ns = now_ns() + (uint64_t)cfg.duration_s *
+						   1000000000ull;
+		getrusage(RUSAGE_SELF, &ru0);
+		t0 = now_ns();
+		ret = run_fast(&r);
+		t1 = now_ns();
+		getrusage(RUSAGE_SELF, &ru1);
+	} else {
+		r.fd = cfg.role == BENCH_ROLE_LISTEN ? uds_listen_accept(path) :
+						       uds_connect(path);
+		if (r.fd < 0)
+			fail(&cfg, "socket", -errno);
+		if (cfg.mode == BENCH_MODE_BLOCKING &&
+		    fcntl(r.fd, F_SETFL, O_NONBLOCK) < 0)
+			fail(&cfg, "nonblock", -errno);
+		if (cfg.duration_s)
+			r.deadline_ns = now_ns() + (uint64_t)cfg.duration_s *
+						   1000000000ull;
 
-	getrusage(RUSAGE_SELF, &ru0);
-	t0 = now_ns();
-	ret = cfg.mode == BENCH_MODE_BLOCKING ? run_blocking(&r) :
-						run_uring(&r);
-	t1 = now_ns();
-	getrusage(RUSAGE_SELF, &ru1);
+		getrusage(RUSAGE_SELF, &ru0);
+		t0 = now_ns();
+		ret = cfg.mode == BENCH_MODE_BLOCKING ? run_blocking(&r) :
+							run_uring(&r);
+		t1 = now_ns();
+		getrusage(RUSAGE_SELF, &ru1);
+	}
 
 	if (ret < 0)
 		fail(&cfg, "run", ret);

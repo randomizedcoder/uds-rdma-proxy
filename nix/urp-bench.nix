@@ -14,6 +14,10 @@ pkgs.stdenv.mkDerivation {
       ../tools/urp-bench.c
       ../tools/urp-bench-core.c
       ../tools/urp-bench-core.h
+      # Shared fast-path ABI (design 31): urp-bench.c's uring-cmd backend
+      # includes "include/uapi/linux/urp_cmd.h", resolved via -I kernel below,
+      # exactly as urp-fast-poc.nix and the kbuild do.
+      ../kernel/include/uapi/linux/urp_cmd.h
     ];
   };
 
@@ -21,7 +25,7 @@ pkgs.stdenv.mkDerivation {
 
   buildPhase = ''
     $CC -Wall -Wextra -Werror -O2 \
-      -I tools \
+      -I tools -I kernel \
       -o urp-bench tools/urp-bench.c tools/urp-bench-core.c \
       -luring
   '';

@@ -206,6 +206,13 @@ enum bench_mode {
 	BENCH_MODE_URING_BUFRING,
 	BENCH_MODE_URING_SQPOLL,
 	BENCH_MODE_URING_SENDZC,
+	/*
+	 * Zero-copy fast path (design 31): io_uring_cmd on /dev/urp against a
+	 * `urp add --kind fast` endpoint. Not a socket transport — the shell
+	 * (urp-bench.c run_fast) drives REGISTER/SEND/RECV and nests the bench
+	 * frame inside the urp payload; the pure core here is untouched.
+	 */
+	BENCH_MODE_URING_CMD,
 };
 
 enum bench_verify {

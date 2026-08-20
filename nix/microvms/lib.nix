@@ -1050,6 +1050,162 @@ in rec {
       echo ""
 
       # -----------------------------------------------------------------
+      # Phase 10j — urp-fast zero-copy DELIVERY (design 31, PR5a). Where
+      # 10i only armed recvs and tore down, this drives a real end-to-end
+      # transfer over the fast path and asserts EXACT bytes: urp-bench in
+      # its new `--mode uring-cmd` backend REGISTERs a pinned pool on each
+      # side and NESTS its 24-byte frame inside the urp payload, so the NIC
+      # DMAs straight into/out of the app pages (zero software copy). vm2 is
+      # the stream SOURCE (--connect selects role; blasts --count frames then
+      # a bench FIN), vm1 the stream SINK (--listen; drains + counts + FULL-
+      # verifies every payload to the FIN). BENCH_OK on both, with the sink's
+      # verify=full, is the first proof the fast path delivers correct bytes
+      # (the copy path's Phase 10g is the yardstick). A fresh fast pair on a
+      # new port keeps this independent of 10i's now-drained QPs.
+      # -----------------------------------------------------------------
+      echo "--- Phase 10j: urp-fast zero-copy delivery + verify=full (design 31 PR5a) ---"
+      f2port=4796
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+        "urp add fast_acc2 --kind fast --connect-path /tmp/urp-fast-acc2.sock --bind $VM1_IP:$f2port --buffer-count 16 --buffer-size 4096" "$T_URP" \
+        > "$RUNDIR/diag/vm1.fast2-add.txt" 2>&1
+      vm_run "$VM2_VIRTIO" "$VM2_PROC" \
+        "urp add fast_init2 --kind fast --listen-path /tmp/urp-fast-init2.sock --peer $VM1_IP:$f2port --buffer-count 16 --buffer-size 4096" "$T_URP" \
+        > "$RUNDIR/diag/vm2.fast2-add.txt" 2>&1
+      if ! grep -q "ok:" "$RUNDIR/diag/vm1.fast2-add.txt" || ! grep -q "ok:" "$RUNDIR/diag/vm2.fast2-add.txt"; then
+        awk '{print "    vm1: "$0}' "$RUNDIR/diag/vm1.fast2-add.txt"
+        awk '{print "    vm2: "$0}' "$RUNDIR/diag/vm2.fast2-add.txt"
+        fail "fast delivery endpoint pair add failed"
+      fi
+      # Readiness: the fast pair connects asynchronously (initiator dials at
+      # activate). Poll with the NON-destructive default urp-fast-poc probe
+      # (REGISTER + validation edges + UNREGISTER; it arms no recv WR, so it
+      # never drains the QP) until it succeeds on BOTH sides — that proves the
+      # RC session is ESTABLISHED and the pool DMA-maps on each endpoint. Probe
+      # the INITIATOR (vm2/fast_init2) as well as the acceptor: REGISTER against
+      # a fast initiator is exercised here for the first time (10i only did the
+      # acceptor), and the FRWR REG_MR posts on its own qp[0].
+      fast2_ready=0
+      for _try in $(seq 1 12); do
+        sleep "$POLL"
+        vm_run "$VM2_VIRTIO" "$VM2_PROC" \
+          "urp-fast-poc /dev/urp fast_init2 4096 8 2>&1" "$T_BENCH" \
+          > "$RUNDIR/diag/vm2.fast2-ready.txt" 2>&1 || true
+        vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+          "urp-fast-poc /dev/urp fast_acc2 4096 8 2>&1" "$T_BENCH" \
+          > "$RUNDIR/diag/vm1.fast2-ready.txt" 2>&1 || true
+        if grep -q URP_FAST_POC_OK "$RUNDIR/diag/vm2.fast2-ready.txt" && \
+           grep -q URP_FAST_POC_OK "$RUNDIR/diag/vm1.fast2-ready.txt"; then
+          fast2_ready=1; break
+        fi
+      done
+      if [ "$fast2_ready" != 1 ]; then
+        echo "    initiator (vm2/fast_init2):"; awk '{print "      "$0}' "$RUNDIR/diag/vm2.fast2-ready.txt"
+        echo "    acceptor  (vm1/fast_acc2):"; awk '{print "      "$0}' "$RUNDIR/diag/vm1.fast2-ready.txt"
+        vm_run "$VM2_VIRTIO" "$VM2_PROC" "urp show; urp stats fast_init2; dmesg | tail -30" 10 \
+          > "$RUNDIR/diag/vm2.fast2-ready-fail.txt" 2>&1 || true
+        fail "fast delivery: a side never reached a REGISTER-ready state (initiator REG_MR?)"
+      fi
+      fcli="$RUNDIR/diag/vm2.fast-bench-src.txt"
+      flst="$RUNDIR/diag/vm1.fast-bench-sink.txt"
+      # Sink in the background (blocks draining until the source's FIN), then
+      # the source foreground. A dummy --listen/--connect path only marks the
+      # role for the fast backend; data rides /dev/urp, not the socket.
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+        "pkill -f 'urp-bench --listen' 2>/dev/null; nohup urp-bench --listen /tmp/urp-fast-sink.sock --id 2 --mode uring-cmd --fast-endpoint fast_acc2 --pattern stream --msg-size 4076 --batch 8 --duration 20 --verify full >/tmp/urp-fast-bench-l.out 2>&1 & sleep 0.3; echo FAST_L_UP" 10 \
+        >/dev/null 2>&1 || true
+      vm_run "$VM2_VIRTIO" "$VM2_PROC" \
+        "urp-bench --connect /tmp/urp-fast-src.sock --id 1 --mode uring-cmd --fast-endpoint fast_init2 --pattern stream --msg-size 4076 --batch 8 --count 500 --verify full 2>&1" "$T_BENCH" \
+        > "$fcli" 2>&1 || true
+      scan_splat "$fcli" "fast bench source"
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" "cat /tmp/urp-fast-bench-l.out" 10 > "$flst" 2>&1 || true
+      scan_splat "$flst" "fast bench sink"
+      if grep -q BENCH_OK "$fcli" && grep -q BENCH_OK "$flst"; then
+        pass "urp-fast zero-copy delivery: BENCH_OK both sides, sink verify=full (design 31 PR5a)"
+        grep -h BENCH_OK "$fcli" "$flst" | awk '{print "    "$0}'
+      else
+        awk '{print "    src:  "$0}' "$fcli"
+        awk '{print "    sink: "$0}' "$flst"
+        vm_run "$VM1_VIRTIO" "$VM1_PROC" "urp show; urp stats fast_acc2; dmesg | tail -25" 10 \
+          > "$RUNDIR/diag/vm1.fast-bench-fail.txt" 2>&1 || true
+        fail "urp-fast delivery: no BENCH_OK on both sides (see $fcli / $flst)"
+      fi
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" "pkill -f 'urp-bench --listen' 2>/dev/null; echo FBGONE" 10 >/dev/null 2>&1 || true
+      vm_run "$VM2_VIRTIO" "$VM2_PROC" "urp remove fast_init2 2>/dev/null; echo FGONE2b" 15 >/dev/null 2>&1 || true
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" "urp remove fast_acc2 2>/dev/null; echo FGONE1b" 15 >/dev/null 2>&1 || true
+      echo ""
+
+      # -----------------------------------------------------------------
+      # Phase 10k — urp-fast zero-copy ECHO / RTT (design 31, PR5a). The
+      # fast echo is an ASYMMETRIC ping-pong: vm2 (--connect) is the PINGER
+      # (sends originals, tracks each, measures RTT from the returning echo),
+      # vm1 (--listen) is the REFLECTOR (flips the ECHO flag byte in-place and
+      # SENDs the same buffer straight back — zero copy). This exercises the
+      # duplex fast path (SEND + RECV interleaved on one CQE32 ring) and the
+      # RTT machinery the hw matrix reports. A non-zero p50 on the pinger's
+      # BENCH_OK is the gate. A fresh pair (a prior fast run drains the sink's
+      # QP on close) on its own port keeps it independent of 10j.
+      # -----------------------------------------------------------------
+      echo "--- Phase 10k: urp-fast zero-copy echo + RTT (design 31 PR5a) ---"
+      f3port=4797
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+        "urp add fast_acc3 --kind fast --connect-path /tmp/urp-fast-acc3.sock --bind $VM1_IP:$f3port --buffer-count 16 --buffer-size 4096" "$T_URP" \
+        > "$RUNDIR/diag/vm1.fast3-add.txt" 2>&1
+      vm_run "$VM2_VIRTIO" "$VM2_PROC" \
+        "urp add fast_init3 --kind fast --listen-path /tmp/urp-fast-init3.sock --peer $VM1_IP:$f3port --buffer-count 16 --buffer-size 4096" "$T_URP" \
+        > "$RUNDIR/diag/vm2.fast3-add.txt" 2>&1
+      if ! grep -q "ok:" "$RUNDIR/diag/vm1.fast3-add.txt" || ! grep -q "ok:" "$RUNDIR/diag/vm2.fast3-add.txt"; then
+        awk '{print "    vm1: "$0}' "$RUNDIR/diag/vm1.fast3-add.txt"
+        awk '{print "    vm2: "$0}' "$RUNDIR/diag/vm2.fast3-add.txt"
+        fail "fast echo endpoint pair add failed"
+      fi
+      fast3_ready=0
+      for _try in $(seq 1 12); do
+        sleep "$POLL"
+        vm_run "$VM2_VIRTIO" "$VM2_PROC" \
+          "urp-fast-poc /dev/urp fast_init3 4096 8 2>&1" "$T_BENCH" \
+          > "$RUNDIR/diag/vm2.fast3-ready.txt" 2>&1 || true
+        vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+          "urp-fast-poc /dev/urp fast_acc3 4096 8 2>&1" "$T_BENCH" \
+          > "$RUNDIR/diag/vm1.fast3-ready.txt" 2>&1 || true
+        if grep -q URP_FAST_POC_OK "$RUNDIR/diag/vm2.fast3-ready.txt" && \
+           grep -q URP_FAST_POC_OK "$RUNDIR/diag/vm1.fast3-ready.txt"; then
+          fast3_ready=1; break
+        fi
+      done
+      if [ "$fast3_ready" != 1 ]; then
+        echo "    initiator (vm2/fast_init3):"; awk '{print "      "$0}' "$RUNDIR/diag/vm2.fast3-ready.txt"
+        echo "    acceptor  (vm1/fast_acc3):"; awk '{print "      "$0}' "$RUNDIR/diag/vm1.fast3-ready.txt"
+        fail "fast echo: a side never reached a REGISTER-ready state"
+      fi
+      ecli="$RUNDIR/diag/vm2.fast-echo-pinger.txt"
+      elst="$RUNDIR/diag/vm1.fast-echo-reflector.txt"
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+        "pkill -f 'urp-bench --listen' 2>/dev/null; nohup urp-bench --listen /tmp/urp-fast-refl.sock --id 2 --mode uring-cmd --fast-endpoint fast_acc3 --pattern echo --msg-size 4076 --batch 8 --duration 20 --verify full >/tmp/urp-fast-echo-l.out 2>&1 & sleep 0.3; echo FAST_E_UP" 10 \
+        >/dev/null 2>&1 || true
+      vm_run "$VM2_VIRTIO" "$VM2_PROC" \
+        "urp-bench --connect /tmp/urp-fast-ping.sock --id 1 --mode uring-cmd --fast-endpoint fast_init3 --pattern echo --msg-size 4076 --batch 8 --count 300 --verify full 2>&1" "$T_BENCH" \
+        > "$ecli" 2>&1 || true
+      scan_splat "$ecli" "fast echo pinger"
+      sleep 1
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" "cat /tmp/urp-fast-echo-l.out" 10 > "$elst" 2>&1 || true
+      scan_splat "$elst" "fast echo reflector"
+      # Pinger BENCH_OK with a non-zero p50 (RTT actually measured), plus the
+      # reflector's BENCH_OK, is the gate.
+      if grep -q BENCH_OK "$ecli" && grep -q BENCH_OK "$elst" && \
+         ! grep -q 'p50_us=0.0 ' "$ecli"; then
+        pass "urp-fast zero-copy echo: pinger RTT measured, reflector BENCH_OK (design 31 PR5a)"
+        grep -h BENCH_OK "$ecli" "$elst" | awk '{print "    "$0}'
+      else
+        awk '{print "    ping: "$0}' "$ecli"
+        awk '{print "    refl: "$0}' "$elst"
+        fail "urp-fast echo: no BENCH_OK+RTT on the pinger (see $ecli / $elst)"
+      fi
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" "pkill -f 'urp-bench --listen' 2>/dev/null; echo FEGONE" 10 >/dev/null 2>&1 || true
+      vm_run "$VM2_VIRTIO" "$VM2_PROC" "urp remove fast_init3 2>/dev/null; echo FGONE2c" 15 >/dev/null 2>&1 || true
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" "urp remove fast_acc3 2>/dev/null; echo FGONE1c" 15 >/dev/null 2>&1 || true
+      echo ""
+
+      # -----------------------------------------------------------------
       # Phase 11 — teardown (drain, remove, rmmod), each step timed
       # so the slow command pops out of the verdict table.
       # -----------------------------------------------------------------
