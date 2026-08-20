@@ -384,6 +384,24 @@ against a dedicated `--kind fast` endpoint pair (NIC DMAs straight into/out of
 the app's pinned pool — 0 software copies). Runners: `.#urp-fast-bw-matrix`
 (goodput) and `.#urp-fast-hw-matrix` (RTT).
 
+**Performance summary — copy vs zero-copy (headline table).** One row per axis,
+worst→best frame size; higher is better for goodput, lower for the rest:
+
+| metric | frame | copy path | zero-copy | improvement |
+|--------|-------|-----------|-----------|-------------|
+| one-way goodput  | 4 KB  | 6.6–9.7 MB/s        | **47.5 MB/s**   | ~5–7×  |
+| one-way goodput  | 16 KB | 9.4–9.6 MB/s        | **585 MB/s**    | **~62×** |
+| one-way goodput  | 64 KB | 52.7 MB/s (1.7% line)| **2133 MB/s (68% line)** | **~40×** |
+| RTT p50          | 24 B  | 34.7 µs             | **22.9 µs**     | 1.5×   |
+| RTT p50          | 64 KB | 321 µs              | **78 µs**       | **4.1×** |
+| RTT p99          | 64 KB | 408 µs              | **95 µs**       | 4.3×   |
+| syscalls / msg   | 64 KB | 9.14                | **1.00**        | 9×     |
+| CPU µs / msg     | 64 KB | 93.0                | **4.2**         | **~22×** |
+
+The single takeaway: **at 64 KB the fast path moves ~40× the bytes at ~4× lower
+latency for ~22× less CPU per message** — and the goodput advantage grows with
+frame size (4 copies → 0, §31.7). Full per-size tables and method below.
+
 **One-way bulk goodput (`--pattern stream`, batch=16, sink-measured).** Copy
 column is §34.5.1's `--mode blocking` best; the win grows with frame size exactly
 as design 31 §31.7 predicts (4 copies → 0):
