@@ -76,6 +76,21 @@ static inline int urp_own_release(unsigned long *own, u32 count, u32 idx)
 }
 
 /*
+ * True if buffer @idx is currently KERNEL_OWNED (in flight to/from the NIC).
+ * The fast RECV cancel path (design 31 D4) reads this under @own_lock to decide
+ * whether the completion callback has already run: if the buffer is still
+ * KERNEL_OWNED the WR has not completed, so the canceller owns the io_uring
+ * completion; otherwise the completion path already claimed it. An out-of-range
+ * @idx is treated as not-owned (the caller validated it on the submit path).
+ */
+static inline bool urp_own_is_kernel(const unsigned long *own, u32 count, u32 idx)
+{
+	if (idx >= count)
+		return false;
+	return (own[idx / URP_OWN_BPW] & (1UL << (idx % URP_OWN_BPW))) != 0;
+}
+
+/*
  * True if any buffer is still KERNEL_OWNED (in flight). The teardown-quiesce
  * path (design 31 D4) uses this to refuse/drain UNREGISTER while the NIC may
  * still touch the pinned pages. Unused high bits of the final word stay clear

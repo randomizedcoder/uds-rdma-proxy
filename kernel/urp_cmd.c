@@ -213,19 +213,87 @@ static void urp_fast_send_tw(struct io_uring_cmd *ioucmd, unsigned int issue_fla
 }
 #endif
 
+/*
+ * RECV task-work body: post a 32-byte CQE carrying the payload length in res and
+ * the buffer index + demuxed stream_id in res2, so the app finds which donated
+ * buffer the NIC filled and which stream it belongs to (design 31 section 31.6,
+ * open question Q3) -- all without a copy, the bytes are already in the app page.
+ */
+static void urp_fast_recv_complete(struct io_uring_cmd *ioucmd,
+				   unsigned int issue_flags)
+{
+	struct urp_fast_op *op = *io_uring_cmd_to_pdu(ioucmd, struct urp_fast_op *);
+	u64 res2 = (u64)op->buf_index | ((u64)op->stream_id << 32);
+
+	urp_cmd_complete(ioucmd, op->res, res2, true, issue_flags);
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+static void urp_fast_recv_tw(struct io_tw_req tw_req, io_tw_token_t tw)
+{
+	urp_fast_recv_complete(io_uring_cmd_from_tw(tw_req),
+			       IO_URING_CMD_TASK_WORK_ISSUE_FLAGS);
+}
+#else
+static void urp_fast_recv_tw(struct io_uring_cmd *ioucmd, unsigned int issue_flags)
+{
+	urp_fast_recv_complete(ioucmd, issue_flags);
+}
+#endif
+
+/*
+ * Flush the endpoint's receive queues so no posted fast-RECV WR still references
+ * the pinned pool. A donated RX buffer that never received a frame -- or one
+ * whose io_uring RECV was cancelled on ring teardown -- leaves its recv WR armed
+ * on the QP with the buffer KERNEL_OWNED; draining the RQ transitions the QP to
+ * error and completes every armed WR with IB_WC_WR_FLUSH_ERR, which runs
+ * urp_fast_recv_done to release each buffer. After this returns the NIC will not
+ * DMA into the pool, so the caller may safely deregister the MR and unpin. This
+ * ends the endpoint's RDMA connection, which is correct: it is only reached when
+ * the app's control fd is closing (design 31 D4 teardown quiesce).
+ */
+static void urp_fast_recv_drain(struct urp_cmd_ctx *ctx)
+{
+	struct urp_endpoint *ep = ctx->ep;
+	u32 i;
+
+	if (!ep || !ep->qps)
+		return;
+
+	for (i = 0; i < ep->num_qps; i++)
+		if (ep->qps[i].qp)
+			ib_drain_rq(ep->qps[i].qp);
+}
+
 static void urp_cmd_pool_release(struct urp_cmd_ctx *ctx)
 {
+	bool inflight;
+
 	lockdep_assert_held(&ctx->lock);
 
 	if (!ctx->registered)
 		return;
 
 	/*
+	 * Teardown quiesce (design 31 D4): if any buffer is still KERNEL_OWNED a
+	 * recv WR may still reference the pinned pages, so drain the endpoint's
+	 * RQs before touching the MR or the pin -- otherwise the NIC could DMA
+	 * into freed memory. Only reachable on fd close: UNREGISTER refuses with
+	 * -EBUSY while any buffer is in flight, and by the time io_uring calls
+	 * ->release every -EIOCBQUEUED RECV has already been cancel-completed
+	 * (its buffer stays KERNEL_OWNED with a NULL ioucmd until this drain
+	 * flushes it). SEND completions always flip ownership back on their own.
+	 */
+	spin_lock(&ctx->own_lock);
+	inflight = urp_own_any_kernel(ctx->own, ctx->geom.count);
+	spin_unlock(&ctx->own_lock);
+	if (inflight)
+		urp_fast_recv_drain(ctx);
+
+	/*
 	 * Order: drop the per-op slab and ownership bitmap first (no NIC access
-	 * once the MR is gone), then dereg the MR, unmap the scatter table, and
-	 * finally unpin. The teardown-quiesce that refuses release while any
-	 * buffer is still KERNEL_OWNED (design 31 D4) lands with PR4's RECV; PR3b
-	 * SEND completions always flip ownership back before the app can close.
+	 * once the MR is gone and the RQ is drained), then dereg the MR, unmap the
+	 * scatter table, and finally unpin.
 	 */
 	kvfree(ctx->ops);
 	ctx->ops = NULL;
@@ -601,6 +669,32 @@ static void urp_fast_write_header(struct urp_cmd_ctx *ctx, u32 buf_index,
 }
 
 /*
+ * Read the 20-byte in-place frame header the NIC DMA'd into the app's pinned
+ * pages at the start of buffer @buf_index (the RECV mirror of
+ * urp_fast_write_header). Copies the header bytes out to @hdr so the pure
+ * classifier can decode/validate them; the payload stays untouched in the app
+ * page (zero copy). Handles a header that straddles a page boundary.
+ */
+static void urp_fast_read_header(struct urp_cmd_ctx *ctx, u32 buf_index, u8 *hdr)
+{
+	u64 off = (u64)buf_index * ctx->geom.buf_size;
+	unsigned long pg = off >> PAGE_SHIFT;
+	unsigned int poff = offset_in_page(off);
+	unsigned int n0 = min_t(unsigned int, URP_FRAME_HEADER_SIZE,
+				PAGE_SIZE - poff);
+	void *k;
+
+	k = kmap_local_page(ctx->pages[pg]);
+	memcpy(hdr, k + poff, n0);
+	kunmap_local(k);
+	if (n0 < URP_FRAME_HEADER_SIZE) {
+		k = kmap_local_page(ctx->pages[pg + 1]);
+		memcpy(hdr + n0, k, URP_FRAME_HEADER_SIZE - n0);
+		kunmap_local(k);
+	}
+}
+
+/*
  * Send completion (send CQ, IB_POLL_WORKQUEUE). Flip the buffer back to
  * APP_OWNED -- always, including the IB_WC_WR_FLUSH_ERR drain path, so a QP
  * teardown never strands a buffer or an io_uring request (mirrors
@@ -729,31 +823,212 @@ out_unlock:
 	return ret;
 }
 
-static int urp_cmd_do_data(struct urp_cmd_ctx *ctx, u32 cmd_op,
-			   const struct io_uring_sqe *sqe)
+/*
+ * Recv completion (recv CQ, IB_POLL_WORKQUEUE). The NIC DMA'd an inbound frame
+ * straight into the app's donated page; decode the in-place header to find the
+ * payload length and stream, then hand the buffer back to the app by posting its
+ * CQE. Flip the buffer back to APP_OWNED unconditionally -- including the
+ * IB_WC_WR_FLUSH_ERR drain path -- so a QP teardown never strands a buffer. If
+ * the RECV was cancelled on ring teardown the io_uring cmd was already completed
+ * (op->ioucmd cleared under own_lock by the canceller); we then only release the
+ * buffer and post no CQE, so there is exactly one completion per op.
+ */
+static void urp_fast_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 {
-	const struct urp_cmd_data *in =
-		urp_sqe_cmd(sqe, struct urp_cmd_data);
+	struct urp_fast_op *op = container_of(wc->wr_cqe, struct urp_fast_op, cqe);
+	struct urp_cmd_ctx *ctx = op->ctx;
+	struct io_uring_cmd *ioucmd;
+
+	if (wc->status == IB_WC_SUCCESS) {
+		u8 hdr[URP_FRAME_HEADER_SIZE];
+		struct urp_rx_decoded dec;
+		enum urp_rx_action action;
+
+		/*
+		 * Decode + validate the header the peer wrote into the app page.
+		 * urp_classify_frame carries every length guard (design 27 27.8
+		 * #1). Only DATA frames deliver a payload to the app; a control /
+		 * probe / malformed frame yields no bytes (the fast path is
+		 * two-sided DATA -- design 31 D1 -- so these are not expected, but
+		 * are surfaced as an error rather than a bogus length).
+		 */
+		urp_fast_read_header(ctx, op->buf_index, hdr);
+		action = urp_classify_frame(wc->byte_len, hdr, &dec);
+		if (action == URP_RX_DELIVER_STREAM ||
+		    action == URP_RX_DELIVER_LEGACY) {
+			op->res = (s32)dec.payload_len;
+			op->stream_id = (u16)dec.stream_id;
+		} else {
+			op->res = -EBADMSG;
+			op->stream_id = 0;
+		}
+	} else {
+		if (wc->status != IB_WC_WR_FLUSH_ERR)
+			pr_err_ratelimited("fast recv completion error: %s (%d)\n",
+					   ib_wc_status_msg(wc->status),
+					   wc->status);
+		op->res = -ECONNRESET;
+		op->stream_id = 0;
+	}
+
+	spin_lock(&ctx->own_lock);
+	ioucmd = op->ioucmd;		/* NULL once the canceller has claimed it */
+	urp_own_release(ctx->own, ctx->geom.count, op->buf_index);
+	spin_unlock(&ctx->own_lock);
+
+	if (ioucmd)
+		io_uring_cmd_complete_in_task(ioucmd, urp_fast_recv_tw);
+}
+
+/*
+ * URP_CMD_RECV: donate buffer @buf_index as zero-copy RDMA landing space. Claims
+ * the buffer (APP->KERNEL), marks the op cancelable so ring teardown can reclaim
+ * a buffer that never received a frame, and arms it as a recv WR directly on the
+ * endpoint QP (no SRQ -- see urp_qp_create_on_cm_id). Returns -EIOCBQUEUED: the
+ * CQE32 (payload len in res, buf_index|stream_id in res2) is posted from
+ * urp_fast_recv_done once the NIC fills the buffer. A synchronous failure returns
+ * a negative errno after releasing ownership. The app-supplied stream_id is
+ * ignored: the delivered stream is decoded from the received frame's header.
+ */
+static int urp_cmd_do_recv(struct urp_cmd_ctx *ctx, struct io_uring_cmd *ioucmd,
+			   const struct io_uring_sqe *sqe, unsigned int issue_flags)
+{
+	const struct urp_cmd_data *in = urp_sqe_cmd(sqe, struct urp_cmd_data);
 	struct urp_cmd_pool_geom geom;
-	struct urp_cmd_req op;
+	struct urp_cmd_req req;
+	struct urp_endpoint *ep;
+	struct urp_fast_op *op;
+	struct urp_qp *qp;
+	u32 sink_len;
 	int ret;
 
 	mutex_lock(&ctx->lock);
+	if (!ctx->registered) {
+		mutex_unlock(&ctx->lock);
+		return -ENXIO;
+	}
 	geom = ctx->geom;
-	mutex_unlock(&ctx->lock);
+	ep = ctx->ep;
 
-	ret = urp_cmd_validate_data(cmd_op, in, &geom, &op);
+	ret = urp_cmd_validate_data(URP_CMD_RECV, in, &geom, &req);
 	if (ret)
-		return ret;
+		goto out_unlock;
 
-	/* RECV zero-copy receive lands in PR4 (app-page recv sink + CQE32). */
-	return -ENOSYS;
+	spin_lock(&ctx->own_lock);
+	ret = urp_own_claim(ctx->own, geom.count, req.buf_index);
+	spin_unlock(&ctx->own_lock);
+	if (ret)
+		goto out_unlock;			/* -EBUSY: double donate */
+
+	qp = urp_qp_select_round_robin(ep);
+	if (!qp || !qp->qp) {
+		ret = -ENOTCONN;
+		goto err_release;
+	}
+
+	op = &ctx->ops[req.buf_index];
+	op->cqe.done	= urp_fast_recv_done;
+	op->ioucmd	= ioucmd;
+	op->ctx		= ctx;
+	op->buf_index	= req.buf_index;
+	op->len		= req.len;
+	op->stream_id	= 0;
+	op->res		= 0;
+	*io_uring_cmd_to_pdu(ioucmd, struct urp_fast_op *) = op;
+
+	/*
+	 * Landing space is the whole frame (header + payload). Post up to the
+	 * app's requested payload cap plus the header, never past the buffer.
+	 */
+	sink_len = min_t(u32, geom.buf_size, URP_FRAME_HEADER_SIZE + req.len);
+
+	/*
+	 * Mark cancelable BEFORE posting so the op is reclaimable the instant it
+	 * can complete: a fast peer could DMA a frame into this buffer immediately
+	 * after the post, and io_uring must already know the op is cancelable.
+	 */
+	io_uring_cmd_mark_cancelable(ioucmd, issue_flags);
+
+	ret = urp_post_recv_raw(qp->qp,
+				ctx->mr_iova + (u64)req.buf_index * geom.buf_size,
+				sink_len, ctx->lkey, &op->cqe);
+	if (ret) {
+		/*
+		 * The WR never armed, so no async completion will ever come --
+		 * we must finish the op here. It is already cancelable, so a
+		 * concurrent ring-exit cancel may be completing it in parallel;
+		 * coordinate through the ioucmd sentinel under own_lock so the
+		 * cmd is completed exactly once (mirrors urp_fast_recv_done).
+		 * Complete via io_uring_cmd_done (not the return value) to
+		 * un-mark the cancelable state, then return -EIOCBQUEUED.
+		 */
+		struct io_uring_cmd *ic;
+
+		spin_lock(&ctx->own_lock);
+		ic = op->ioucmd;
+		op->ioucmd = NULL;
+		urp_own_release(ctx->own, geom.count, req.buf_index);
+		spin_unlock(&ctx->own_lock);
+		mutex_unlock(&ctx->lock);
+		if (ic)
+			urp_cmd_complete(ic, ret, 0, true, issue_flags);
+		return -EIOCBQUEUED;
+	}
+
+	mutex_unlock(&ctx->lock);
+	return -EIOCBQUEUED;
+
+err_release:
+	/* Reached only before the op is marked cancelable: a plain synchronous
+	 * errno, with ownership handed back to the app.
+	 */
+	spin_lock(&ctx->own_lock);
+	urp_own_release(ctx->own, geom.count, req.buf_index);
+	spin_unlock(&ctx->own_lock);
+out_unlock:
+	mutex_unlock(&ctx->lock);
+	return ret;
+}
+
+/*
+ * io_uring is tearing down a cancelable in-flight RECV (ring exit). The recv WR
+ * is still armed on the QP; we cannot un-post a single WR, so complete the
+ * io_uring cmd here and let urp_cmd_pool_release drain the RQ (which flushes the
+ * WR and releases the buffer). Under own_lock, claim the completion only if the
+ * buffer is still KERNEL_OWNED: if urp_fast_recv_done already ran it owns the
+ * completion, so we must not double-complete. Clearing op->ioucmd tells a later
+ * flush completion to skip the (now freed) cmd.
+ */
+static int urp_cmd_recv_cancel(struct urp_cmd_ctx *ctx,
+			       struct io_uring_cmd *ioucmd,
+			       unsigned int issue_flags)
+{
+	struct urp_fast_op *op = *io_uring_cmd_to_pdu(ioucmd, struct urp_fast_op *);
+	bool complete_now;
+
+	spin_lock(&ctx->own_lock);
+	complete_now = urp_own_is_kernel(ctx->own, ctx->geom.count, op->buf_index);
+	if (complete_now)
+		op->ioucmd = NULL;
+	spin_unlock(&ctx->own_lock);
+
+	if (complete_now)
+		urp_cmd_complete(ioucmd, -ECANCELED, 0, true, issue_flags);
+	return 0;
 }
 
 static int urp_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int issue_flags)
 {
 	struct urp_cmd_ctx *ctx = ioucmd->file->private_data;
 	const struct io_uring_sqe *sqe = ioucmd->sqe;
+
+	/*
+	 * io_uring is cancelling a cancelable in-flight op (only RECV marks
+	 * itself so). Reclaim it regardless of opcode; the RQ drain on pool
+	 * release finishes freeing the buffer.
+	 */
+	if (issue_flags & IO_URING_F_CANCEL)
+		return urp_cmd_recv_cancel(ctx, ioucmd, issue_flags);
 
 	switch (ioucmd->cmd_op) {
 	case URP_CMD_REGISTER:
@@ -779,7 +1054,14 @@ static int urp_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int issue_flags)
 			return -EAGAIN;
 		return urp_cmd_do_send(ctx, ioucmd, sqe);
 	case URP_CMD_RECV:
-		return urp_cmd_do_data(ctx, ioucmd->cmd_op, sqe);
+		/*
+		 * RECV takes ctx->lock (may sleep) and marks the op cancelable,
+		 * so it needs the io-wq context like SEND. Completion is
+		 * asynchronous (-EIOCBQUEUED) once the NIC fills the buffer.
+		 */
+		if (issue_flags & IO_URING_F_NONBLOCK)
+			return -EAGAIN;
+		return urp_cmd_do_recv(ctx, ioucmd, sqe, issue_flags);
 	default:
 		return -EOPNOTSUPP;
 	}
