@@ -203,4 +203,35 @@ struct urp_rx_decoded {
 enum urp_rx_action
 urp_classify_frame(u32 byte_len, const u8 *hdr, struct urp_rx_decoded *out);
 
+/*
+ * How the zero-copy fast RECV path (urp_fast_recv_done) must dispose of a
+ * classified frame. The copy path routes everything through the pump; the fast
+ * path has no pump, so it handles the peer's liveness/flow-control protocol
+ * inline and delivers only DATA to the app. Pure so the completion handler and
+ * KUnit agree on the mapping (design 31 D1 + design 33 recv-path PONG).
+ */
+enum urp_fast_rx_disp {
+	URP_FAST_RX_DELIVER,	/* DATA: hand the payload to the app */
+	URP_FAST_RX_PONG,	/* PROBE PING: emit a PONG, then empty completion */
+	URP_FAST_RX_ABSORB,	/* PROBE PONG / CREDIT: swallow, empty completion */
+	URP_FAST_RX_REJECT,	/* malformed: surface -EBADMSG to the app */
+};
+
+static inline enum urp_fast_rx_disp
+urp_fast_rx_disposition(enum urp_rx_action action)
+{
+	switch (action) {
+	case URP_RX_DELIVER_STREAM:
+	case URP_RX_DELIVER_LEGACY:
+		return URP_FAST_RX_DELIVER;
+	case URP_RX_PROBE_PING:
+		return URP_FAST_RX_PONG;
+	case URP_RX_PROBE_PONG:
+	case URP_RX_CREDIT:
+		return URP_FAST_RX_ABSORB;
+	default:
+		return URP_FAST_RX_REJECT;
+	}
+}
+
 #endif /* _URP_FRAME_H */
