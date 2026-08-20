@@ -729,6 +729,45 @@ static void test_fast_rx_disposition(struct kunit *test)
 				    cases[i].want, "action %d", cases[i].in);
 }
 
+/*
+ * CM private_data kind-advertisement trailer (design 31 D1). A uds initiator
+ * uses the peer's advertised kind to suppress its probe against a fast acceptor,
+ * so build/parse must round-trip and, critically, a missing/old trailer must
+ * read as "not found" (caller then assumes UDS and probes as before) while the
+ * leading PSK auth bytes stay byte-for-byte intact under the appended trailer.
+ */
+static void test_conn_priv_kind_trailer(struct kunit *test)
+{
+	u8 buf[64];
+	u8 kind;
+
+	/* No auth: trailer at offset 0, len 3, round-trips to FAST. */
+	memset(buf, 0, sizeof(buf));
+	KUNIT_EXPECT_EQ(test, urp_conn_priv_build(buf, 0, URP_EP_KIND_FAST), 3);
+	KUNIT_EXPECT_TRUE(test, urp_conn_priv_peer_kind(buf, 3, 0, &kind));
+	KUNIT_EXPECT_EQ(test, kind, (u8)URP_EP_KIND_FAST);
+
+	/* 33-byte auth: trailer at offset 33; auth bytes preserved. */
+	memset(buf, 0xAB, 33);
+	KUNIT_EXPECT_EQ(test, urp_conn_priv_build(buf, 33, URP_EP_KIND_UDS), 36);
+	KUNIT_EXPECT_EQ(test, buf[0], (u8)0xAB);
+	KUNIT_EXPECT_EQ(test, buf[32], (u8)0xAB);
+	KUNIT_EXPECT_TRUE(test, urp_conn_priv_peer_kind(buf, 36, 33, &kind));
+	KUNIT_EXPECT_EQ(test, kind, (u8)URP_EP_KIND_UDS);
+
+	/* Old peer / truncated / null => not found (caller assumes UDS). */
+	kind = 0xEE;
+	KUNIT_EXPECT_FALSE(test, urp_conn_priv_peer_kind(buf, 33, 33, &kind));
+	KUNIT_EXPECT_FALSE(test, urp_conn_priv_peer_kind(NULL, 0, 0, &kind));
+	KUNIT_EXPECT_FALSE(test, urp_conn_priv_peer_kind(buf, 0, 0, &kind));
+
+	/* Corrupt magic => not found. */
+	memset(buf, 0, sizeof(buf));
+	urp_conn_priv_build(buf, 0, URP_EP_KIND_FAST);
+	buf[0] = 0x00;
+	KUNIT_EXPECT_FALSE(test, urp_conn_priv_peer_kind(buf, 3, 0, &kind));
+}
+
 /* ---- Buffer-geometry resolver tests (design 29 Gap 2) ---- */
 
 /*
@@ -1367,6 +1406,7 @@ static struct kunit_case urp_test_cases[] = {
 	/* design 28 E1: RX frame classifier */
 	KUNIT_CASE(test_classify_frame),
 	KUNIT_CASE(test_fast_rx_disposition),
+	KUNIT_CASE(test_conn_priv_kind_trailer),
 	/* design 32: acceptor connection plan (eager-connect gate) */
 	KUNIT_CASE(test_acceptor_eager_connect),
 	/* design 32: credit-grant routing (per-stream vs per-QP pool) */
