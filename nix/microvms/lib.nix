@@ -758,6 +758,17 @@ in rec {
       # RTT and MB/s are logged so the size / latency-vs-throughput tradeoff
       # is visible. Under the sanitizer kernel this also KASAN-checks the
       # high-order (>PAGE_SIZE) page_pool allocation.
+      #
+      # The acceptor is added `--mode k0`: urp-test-client's echo/bigframe
+      # path (do_echo) speaks the legacy single-connection wire format
+      # (stream_id 0, no SYN), so its frames deliver via ep->conn and echo
+      # back symmetrically through the k0 pump (stream 0, no SYN). A
+      # multistream acceptor deliberately does NOT eager-connect ep->conn
+      # (urp_acceptor_should_eager_connect gates on URP_EP_MODE_K0; connecting
+      # would steal the one backend a real stream's SYN needs), so stream-0
+      # frames would be dropped with no backend -> buffer_alloc_fails, no echo.
+      # Multistream RX is exercised by Phase 10e (reorder, stream 1 + SYN);
+      # buffer geometry is mode-independent, so k0 proves it just as well.
       # -----------------------------------------------------------------
       echo "--- Phase 10f: buffer geometry (buffer_count + buffer_size) ---"
       vm_run "$VM1_VIRTIO" "$VM1_PROC" \
@@ -779,7 +790,7 @@ in rec {
       for spec in 64:512:256 64:1024:512 64:2048:1024 64:4096:2048 32:16384:8000 64:32768:12000; do
         gc=''${spec%%:*}; grest=''${spec#*:}; gs=''${grest%%:*}; gp=''${grest##*:}
         vm_run "$VM1_VIRTIO" "$VM1_PROC" \
-          "urp add geom_acc --connect-path /tmp/urp-geom-echo.sock --bind $VM1_IP:$gport --buffer-count $gc --buffer-size $gs" "$T_URP" \
+          "urp add geom_acc --mode k0 --connect-path /tmp/urp-geom-echo.sock --bind $VM1_IP:$gport --buffer-count $gc --buffer-size $gs" "$T_URP" \
           > "$RUNDIR/diag/vm1.geom-add-$gs.txt" 2>&1
         if ! grep -q "ok:" "$RUNDIR/diag/vm1.geom-add-$gs.txt"; then
           awk '{print "    "$0}' "$RUNDIR/diag/vm1.geom-add-$gs.txt"
