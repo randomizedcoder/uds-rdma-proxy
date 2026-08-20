@@ -641,6 +641,12 @@ int  urp_emit_pong_on(struct urp_endpoint *ep, struct ib_qp *qp,
 		      const void *ping_payload);
 void urp_probe_work_start(struct urp_endpoint *ep);
 void urp_probe_work_stop(struct urp_endpoint *ep);
+/* Post one single-SGE IB_WR_SEND at @addr/@lkey (header included) completing
+ * through @cqe. Shared by the pump (pool buffers) and the urp-fast zero-copy
+ * SEND path (design 31, pool-wide MR). Caller owns DMA-sync and bookkeeping.
+ */
+int  urp_post_frame_raw(struct ib_qp *qp, u64 addr, u32 len, u32 lkey,
+			struct ib_cqe *cqe);
 
 /* CQ completion callbacks (urp_rdma.c) -- used by pump when posting sends */
 void urp_send_done(struct ib_cq *cq, struct ib_wc *wc);

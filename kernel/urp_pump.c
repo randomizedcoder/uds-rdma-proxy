@@ -29,6 +29,33 @@
 #define URP_SEND_WAIT_MAX_MS	100
 
 /*
+ * Post one IB_WR_SEND of @len bytes (header included) at DMA/MR address @addr
+ * with local key @lkey on @qp, completing through @cqe. A single SGE: the
+ * pump's pool buffers are physically contiguous compound pages, and the
+ * urp-fast zero-copy path (design 31) addresses any frame size through a
+ * pool-wide MR, so one gather entry covers the whole frame either way. Does no
+ * DMA-sync and no buffer bookkeeping -- the caller owns both. Returns the
+ * ib_post_send result.
+ */
+int urp_post_frame_raw(struct ib_qp *qp, u64 addr, u32 len, u32 lkey,
+		       struct ib_cqe *cqe)
+{
+	struct ib_send_wr wr = {};
+	struct ib_sge sge = {};
+
+	sge.addr = addr;
+	sge.length = len;
+	sge.lkey = lkey;
+	wr.wr_cqe = cqe;
+	wr.sg_list = &sge;
+	wr.num_sge = 1;
+	wr.opcode = IB_WR_SEND;
+	wr.send_flags = IB_SEND_SIGNALED;
+
+	return ib_post_send(qp, &wr, NULL);
+}
+
+/*
  * DMA-sync and post one framed send buffer (@len bytes including the
  * header) on @qp. On failure the buffer is returned to the send pool;
  * the caller must not touch @buf after this call.
@@ -36,22 +63,14 @@
 static int urp_post_frame(struct urp_endpoint *ep, struct ib_qp *qp,
 			  struct urp_buffer *buf, u32 len)
 {
-	struct ib_send_wr wr = {};
-	const struct ib_send_wr *bad_wr;
 	int ret;
 
 	ib_dma_sync_single_for_device(ep->ib_dev, buf->dma_addr, len,
 				      DMA_TO_DEVICE);
 
-	buf->sge.length = len;
 	buf->cqe.done = urp_send_done;
-	wr.wr_cqe = &buf->cqe;
-	wr.sg_list = &buf->sge;
-	wr.num_sge = 1;
-	wr.opcode = IB_WR_SEND;
-	wr.send_flags = IB_SEND_SIGNALED;
-
-	ret = ib_post_send(qp, &wr, &bad_wr);
+	ret = urp_post_frame_raw(qp, buf->dma_addr, len, buf->sge.lkey,
+				 &buf->cqe);
 	if (ret)
 		urp_buf_free_send(ep, buf);
 	return ret;

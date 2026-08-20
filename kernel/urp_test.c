@@ -9,6 +9,7 @@
 #include <kunit/test.h>
 #include "urp.h"
 #include "urp_cmd.h"
+#include "urp_cmd_own.h"
 #include "urp_conn_plan.h"
 #include "urp_credit_plan.h"
 #include "urp_retry_plan.h"
@@ -803,9 +804,9 @@ static void test_cmd_validate_data(struct kunit *test)
 		/* --- valid --- */
 		{ URP_CMD_SEND, 0, 100,  7, 0,            0, GOOD_COUNT, GOOD_BSZ, 0 },
 		{ URP_CMD_SEND, 0, 100,  7, URP_CMD_F_FIN, 0, GOOD_COUNT, GOOD_BSZ, 0 },
-		{ URP_CMD_RECV, 3, GOOD_BSZ, 0, 0,        0, GOOD_COUNT, GOOD_BSZ, 0 },
-		/* boundaries: last index, len == buf_size, len == 1 */
-		{ URP_CMD_SEND, GOOD_COUNT - 1, GOOD_BSZ, 0, 0, 0, GOOD_COUNT, GOOD_BSZ, 0 },
+		{ URP_CMD_RECV, 3, GOOD_BSZ - URP_FRAME_HEADER_SIZE, 0, 0, 0, GOOD_COUNT, GOOD_BSZ, 0 },
+		/* boundaries: last index, max payload (buf_size - header), len == 1 */
+		{ URP_CMD_SEND, GOOD_COUNT - 1, GOOD_BSZ - URP_FRAME_HEADER_SIZE, 0, 0, 0, GOOD_COUNT, GOOD_BSZ, 0 },
 		{ URP_CMD_RECV, 0, 1, 0, 0,               0, GOOD_COUNT, GOOD_BSZ, 0 },
 		/* --- opcode gate --- */
 		{ URP_CMD_REGISTER,   0, 100, 0, 0, 0, GOOD_COUNT, GOOD_BSZ, -EOPNOTSUPP },
@@ -815,8 +816,9 @@ static void test_cmd_validate_data(struct kunit *test)
 		{ URP_CMD_SEND, 0, 100, 0, 0,        1, GOOD_COUNT, GOOD_BSZ, -EINVAL },
 		{ URP_CMD_RECV, 0, 100, 0, URP_CMD_F_FIN, 0, GOOD_COUNT, GOOD_BSZ, -EINVAL },
 		{ URP_CMD_SEND, 0, 100, 0, (1 << 5), 0, GOOD_COUNT, GOOD_BSZ, -EINVAL },
-		/* --- length --- */
+		/* --- length: 0 rejected; payload > buf_size - header rejected --- */
 		{ URP_CMD_SEND, 0, 0,          0, 0, 0, GOOD_COUNT, GOOD_BSZ, -EINVAL },
+		{ URP_CMD_SEND, 0, GOOD_BSZ - URP_FRAME_HEADER_SIZE + 1, 0, 0, 0, GOOD_COUNT, GOOD_BSZ, -EMSGSIZE },
 		{ URP_CMD_SEND, 0, GOOD_BSZ+1, 0, 0, 0, GOOD_COUNT, GOOD_BSZ, -EMSGSIZE },
 		/* --- pool / index --- */
 		{ URP_CMD_SEND, 0, 100, 0, 0, 0, 0,          GOOD_BSZ, -ENXIO },
@@ -915,6 +917,44 @@ static void test_cmd_validate_reg(struct kunit *test)
 
 		KUNIT_EXPECT_EQ_MSG(test, ret, cases[i].want, "%s", cases[i].name);
 	}
+}
+
+/*
+ * urp-fast per-buffer ownership state machine (urp_cmd_own.h, design 31 §31.2).
+ * Same pure transitions the ->uring_cmd SEND path serialises under a spinlock;
+ * the userspace units (tools/urp-fast-validate-test.c) re-check them out of VM.
+ */
+static void test_cmd_own(struct kunit *test)
+{
+	enum { COUNT = 130 };	/* spans 3 x 64-bit words on the word math */
+	unsigned long own[3] = { 0, 0, 0 };
+
+	KUNIT_EXPECT_EQ(test, urp_own_words(COUNT), 3u);
+	KUNIT_EXPECT_FALSE(test, urp_own_any_kernel(own, COUNT));
+
+	/* APP -> KERNEL across word boundaries */
+	KUNIT_EXPECT_EQ(test, urp_own_claim(own, COUNT, 0), 0);
+	KUNIT_EXPECT_EQ(test, urp_own_claim(own, COUNT, 65), 0);
+	KUNIT_EXPECT_EQ(test, urp_own_claim(own, COUNT, 129), 0);
+	KUNIT_EXPECT_TRUE(test, urp_own_any_kernel(own, COUNT));
+
+	/* double submit + out of range */
+	KUNIT_EXPECT_EQ(test, urp_own_claim(own, COUNT, 65), -EBUSY);
+	KUNIT_EXPECT_EQ(test, urp_own_claim(own, COUNT, COUNT), -ERANGE);
+	KUNIT_EXPECT_EQ(test, urp_own_release(own, COUNT, COUNT), -ERANGE);
+
+	/* KERNEL -> APP, and the double-release / spurious-completion guard */
+	KUNIT_EXPECT_EQ(test, urp_own_release(own, COUNT, 0), 0);
+	KUNIT_EXPECT_EQ(test, urp_own_release(own, COUNT, 0), -EINVAL);
+	KUNIT_EXPECT_EQ(test, urp_own_release(own, COUNT, 42), -EINVAL);
+
+	KUNIT_EXPECT_TRUE(test, urp_own_any_kernel(own, COUNT));	/* 65,129 left */
+	KUNIT_EXPECT_EQ(test, urp_own_release(own, COUNT, 65), 0);
+	KUNIT_EXPECT_EQ(test, urp_own_release(own, COUNT, 129), 0);
+	KUNIT_EXPECT_FALSE(test, urp_own_any_kernel(own, COUNT));
+
+	/* buffer cycles: re-claim after release is allowed */
+	KUNIT_EXPECT_EQ(test, urp_own_claim(own, COUNT, 0), 0);
 }
 
 /*
@@ -1318,6 +1358,7 @@ static struct kunit_case urp_test_cases[] = {
 	/* design 31 section 31.10: urp-fast uring_cmd trust boundary */
 	KUNIT_CASE(test_cmd_validate_data),
 	KUNIT_CASE(test_cmd_validate_reg),
+	KUNIT_CASE(test_cmd_own),
 	{}
 };
 

@@ -48,8 +48,21 @@
 #include <linux/mm.h>
 #include <linux/slab.h>
 #include <linux/mutex.h>
+#include <linux/spinlock.h>
+#include <linux/scatterlist.h>
+#include <linux/highmem.h>	/* kmap_local_page */
 #include <linux/uaccess.h>
 #include <linux/io_uring/cmd.h>
+
+#include "urp_cmd_own.h"	/* pure per-buffer ownership state machine */
+
+/*
+ * The in-place header reservation (design 31 D3) is the wire header size. The
+ * ABI mirrors it as URP_CMD_HEADER_RESV so the dual-compiled validator stays
+ * self-contained; assert the two never drift.
+ */
+static_assert(URP_CMD_HEADER_RESV == URP_FRAME_HEADER_SIZE,
+	      "fast-path header reservation must equal the wire header size");
 
 /*
  * Typed accessor for the 16-byte inline SQE command area.
@@ -82,6 +95,8 @@
 /* Per-open context: one registered pool per fd (PR1).                     */
 /* ----------------------------------------------------------------------- */
 
+struct urp_fast_op;	/* completion op, defined after the ctx it points back at */
+
 struct urp_cmd_ctx {
 	struct mutex		lock;		/* serialises REGISTER/UNREGISTER */
 	bool			registered;
@@ -89,36 +104,145 @@ struct urp_cmd_ctx {
 	u64			pool_len;	/* total bytes                  */
 	unsigned long		nr_pages;	/* pinned pages                 */
 	struct page		**pages;	/* FOLL_LONGTERM pin            */
-	dma_addr_t		*dma;		/* per-page DMA address (nr_pages) */
 	struct urp_cmd_pool_geom geom;		/* count + buf_size             */
 
 	/*
 	 * The endpoint the pool is registered against. We hold a kref for the
 	 * registration's lifetime; @ib_dev is cached from ep->ib_dev at REGISTER
-	 * so UNREGISTER can unmap even if the endpoint has since cleared it, and
-	 * @lkey is ep->pd->local_dma_lkey -- what the data path (PR3) posts with.
+	 * so UNREGISTER can unmap even if the endpoint has since cleared it.
+	 *
+	 * The pool is registered as ONE memory region (design 31 PR3b, Option C):
+	 * @mr addresses the whole pinned pool by virtual offset, so a SEND posts a
+	 * single SGE regardless of frame size (@lkey == mr->lkey, base == mr->iova).
+	 * @sgt is the scatter table over the pinned pages, DMA-mapped to @sg_nents
+	 * entries. This replaces PR2's per-page @dma[]/local_dma_lkey, which could
+	 * only name one page per SGE and so capped a frame at a single page.
 	 */
 	struct urp_endpoint	*ep;
 	struct ib_device	*ib_dev;
-	u32			lkey;
+	struct ib_mr		*mr;
+	u64			mr_iova;	/* == mr->iova; frame @ +buf_index*buf_size */
+	u32			lkey;		/* == mr->lkey                            */
+	struct sg_table		sgt;
+	int			sg_nents;	/* ib_dma_map_sg result (for unmap)       */
+
+	/*
+	 * Per-buffer ownership (design 31 section 31.2): bit set == KERNEL_OWNED
+	 * (in flight to/from the NIC). @own_lock serialises the pure transitions in
+	 * urp_cmd_own.h between the submit path and the completion callback.
+	 */
+	spinlock_t		own_lock;
+	unsigned long		*own;		/* bitmap[urp_own_words(geom.count)]      */
+
+	/*
+	 * One preallocated completion op per pool buffer, indexed by buf_index.
+	 * The ownership SM guarantees at most one op in flight per buffer, so no
+	 * per-op allocation is needed on the hot path (the flat-pressure invariant).
+	 */
+	struct urp_fast_op	*ops;		/* [geom.count]                           */
 };
+
+/*
+ * One in-flight SEND/RECV op. Drawn from ctx->ops[buf_index] (no per-op alloc).
+ * @cqe is the RDMA completion hook: the send CQ (IB_POLL_WORKQUEUE) dispatches
+ * to urp_fast_send_done via container_of(wc->wr_cqe). @res is filled there and
+ * read by the task-work callback that posts the io_uring CQE.
+ */
+struct urp_fast_op {
+	struct ib_cqe		cqe;
+	struct io_uring_cmd	*ioucmd;
+	struct urp_cmd_ctx	*ctx;
+	u32			buf_index;
+	u32			len;		/* payload bytes (the SEND res on success) */
+	u16			stream_id;
+	s32			res;		/* set by the CQ handler, read by task-work */
+};
+
+/*
+ * Completion ABI shims. io_uring changed both the cmd-completion call and the
+ * task-work callback signature between the 6.x LTS line and 7.0:
+ *
+ *   - 6.x: io_uring_cmd_done(cmd, ret, res2, issue_flags); the CQE size (16 vs
+ *     32) follows the ring, so one call serves both.
+ *   - 7.x: io_uring_cmd_done(cmd, ret, issue_flags) posts a 16-byte CQE and
+ *     io_uring_cmd_done32(cmd, ret, res2, issue_flags) a 32-byte one.
+ *
+ *   - 6.x task-work: void cb(struct io_uring_cmd *cmd, unsigned issue_flags).
+ *   - 7.x task-work: void cb(struct io_tw_req, io_tw_token_t); recover the cmd
+ *     with io_uring_cmd_from_tw() and complete with the fixed defer flags.
+ *
+ * urp_cmd_complete() hides the first difference (SEND passes cqe32=false,res2=0;
+ * PR4's RECV will pass cqe32=true to carry buf_index/stream_id in res2). The
+ * task-work callbacks below hide the second so their body is version-common.
+ */
+static inline void urp_cmd_complete(struct io_uring_cmd *ioucmd, s32 res,
+				    u64 res2, bool cqe32, unsigned int issue_flags)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+	if (cqe32)
+		io_uring_cmd_done32(ioucmd, res, res2, issue_flags);
+	else
+		io_uring_cmd_done(ioucmd, res, issue_flags);
+#else
+	io_uring_cmd_done(ioucmd, res, res2, issue_flags);
+#endif
+}
+
+/* Common task-work body: pull the op stashed in the cmd's inline pdu and post
+ * the io_uring CQE with the result the CQ handler recorded. SEND uses a 16-byte
+ * CQE (no res2); RECV will switch to cqe32 in PR4.
+ */
+static void urp_fast_send_complete(struct io_uring_cmd *ioucmd,
+				   unsigned int issue_flags)
+{
+	struct urp_fast_op *op = *io_uring_cmd_to_pdu(ioucmd, struct urp_fast_op *);
+
+	urp_cmd_complete(ioucmd, op->res, 0, false, issue_flags);
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+static void urp_fast_send_tw(struct io_tw_req tw_req, io_tw_token_t tw)
+{
+	urp_fast_send_complete(io_uring_cmd_from_tw(tw_req),
+			       IO_URING_CMD_TASK_WORK_ISSUE_FLAGS);
+}
+#else
+static void urp_fast_send_tw(struct io_uring_cmd *ioucmd, unsigned int issue_flags)
+{
+	urp_fast_send_complete(ioucmd, issue_flags);
+}
+#endif
 
 static void urp_cmd_pool_release(struct urp_cmd_ctx *ctx)
 {
-	unsigned long i;
-
 	lockdep_assert_held(&ctx->lock);
 
 	if (!ctx->registered)
 		return;
 
-	if (ctx->dma) {
-		for (i = 0; i < ctx->nr_pages; i++)
-			ib_dma_unmap_page(ctx->ib_dev, ctx->dma[i], PAGE_SIZE,
-					  DMA_BIDIRECTIONAL);
-		kvfree(ctx->dma);
-		ctx->dma = NULL;
+	/*
+	 * Order: drop the per-op slab and ownership bitmap first (no NIC access
+	 * once the MR is gone), then dereg the MR, unmap the scatter table, and
+	 * finally unpin. The teardown-quiesce that refuses release while any
+	 * buffer is still KERNEL_OWNED (design 31 D4) lands with PR4's RECV; PR3b
+	 * SEND completions always flip ownership back before the app can close.
+	 */
+	kvfree(ctx->ops);
+	ctx->ops = NULL;
+	kvfree(ctx->own);
+	ctx->own = NULL;
+
+	if (ctx->mr) {
+		ib_dereg_mr(ctx->mr);
+		ctx->mr = NULL;
 	}
+	if (ctx->sgt.sgl) {
+		ib_dma_unmap_sg(ctx->ib_dev, ctx->sgt.sgl, ctx->sgt.orig_nents,
+				DMA_BIDIRECTIONAL);
+		sg_free_table(&ctx->sgt);
+	}
+	ctx->sg_nents	= 0;
+	ctx->mr_iova	= 0;
 	if (ctx->ep) {
 		urp_endpoint_put(ctx->ep);
 		ctx->ep = NULL;
@@ -141,64 +265,145 @@ static void urp_cmd_pool_release(struct urp_cmd_ctx *ctx)
 /* uring_cmd handlers.                                                      */
 /* ----------------------------------------------------------------------- */
 
+/* Synchronous completion cookie for the REG_MR work request below. */
+struct urp_reg_wait {
+	struct ib_cqe		cqe;
+	struct completion	done;
+	int			status;
+};
+
+static void urp_cmd_reg_mr_done(struct ib_cq *cq, struct ib_wc *wc)
+{
+	struct urp_reg_wait *rw = container_of(wc->wr_cqe, struct urp_reg_wait, cqe);
+
+	rw->status = (wc->status == IB_WC_SUCCESS) ? 0 : -EIO;
+	complete(&rw->done);
+}
+
 /*
- * Bind the pinned pool to the named endpoint and DMA-map every page against
- * that endpoint's RDMA device, so the pool shares the endpoint's protection
- * domain (the data path in a later PR posts on its QP with @lkey). On success
- * fills ctx->{ep,ib_dev,dma,lkey} and holds an endpoint kref; on failure
- * returns a negative errno having undone any partial mapping and dropped the
- * ref. The caller still owns the pin on failure.
+ * Register @mr with the HCA via a fast-registration work request on @qp and
+ * wait for its completion. RDMA guarantees every posted WR completes (success
+ * or IB_WC_WR_FLUSH_ERR on QP teardown), so the uninterruptible wait cannot
+ * hang -- the stack cookie stays valid until the CQ callback fires complete().
+ */
+static int urp_cmd_reg_mr_sync(struct ib_qp *qp, struct ib_mr *mr)
+{
+	struct urp_reg_wait rw;
+	struct ib_reg_wr rwr = {};
+	int ret;
+
+	init_completion(&rw.done);
+	rw.cqe.done = urp_cmd_reg_mr_done;
+
+	rwr.wr.opcode	  = IB_WR_REG_MR;
+	rwr.wr.wr_cqe	  = &rw.cqe;
+	rwr.wr.send_flags = IB_SEND_SIGNALED;
+	rwr.mr		  = mr;
+	rwr.key		  = mr->lkey;
+	rwr.access	  = IB_ACCESS_LOCAL_WRITE;
+
+	ret = ib_post_send(qp, &rwr.wr, NULL);
+	if (ret)
+		return ret;
+
+	wait_for_completion(&rw.done);
+	return rw.status;
+}
+
+/*
+ * Bind the pinned pool to the named endpoint and register it as ONE memory
+ * region against that endpoint's RDMA device (design 31 PR3b, Option C): build
+ * a scatter table over the pinned pages, DMA-map it, allocate an FRWR MR big
+ * enough for every page, program it with the page list, and register it on the
+ * endpoint's QP. The pool then shares the endpoint's PD and is addressable by
+ * virtual offset through mr->lkey, so a SEND of any frame size posts a single
+ * SGE. On success fills ctx->{ep,ib_dev,mr,mr_iova,lkey,sgt,sg_nents} and holds
+ * an endpoint kref; on failure returns a negative errno having undone every
+ * partial step and dropped the ref. The caller still owns the pin on failure.
  *
- * NOTE (hardened in the PR that adds the data path): ep->pd / ep->ib_dev are
- * read without ep->lock. The kref keeps the endpoint struct alive, but a
- * concurrent endpoint teardown could still race the mapping. Safe for the
- * current milestone (the pool is registered against a stable, established
- * endpoint); the ownership/quiesce protocol closes the race.
+ * NOTE: ep->pd / ep->ib_dev / qp[0] are read without ep->lock. The kref keeps
+ * the endpoint struct alive; a concurrent endpoint teardown racing the mapping
+ * is closed by the ownership/quiesce protocol (design 31 D4) landing in PR4.
  */
 static int urp_cmd_map_pool(struct urp_cmd_ctx *ctx, struct page **pages,
 			    unsigned long nr_pages, const char *ep_name)
 {
 	struct urp_endpoint *ep;
-	dma_addr_t *dma;
-	unsigned long i;
-	int ret;
+	struct ib_qp *qp;
+	struct ib_mr *mr;
+	int nents, mapped, ret;
 
 	ep = urp_endpoint_get(ep_name);
 	if (!ep)
 		return -ENODEV;
 
-	/* Need an established RDMA back-end (PD + device) to map against. */
-	if (!ep->pd || !ep->ib_dev) {
+	/* Need an established RDMA back-end (PD + device + a QP to register on). */
+	if (!ep->pd || !ep->ib_dev || !ep->qps || !ep->qps[0].qp) {
 		ret = -ENOTCONN;
 		goto err_put;
 	}
+	qp = ep->qps[0].qp;
 
-	dma = kvmalloc_array(nr_pages, sizeof(*dma), GFP_KERNEL);
-	if (!dma) {
-		ret = -ENOMEM;
+	ret = sg_alloc_table_from_pages(&ctx->sgt, pages, nr_pages, 0,
+					(size_t)nr_pages << PAGE_SHIFT, GFP_KERNEL);
+	if (ret)
 		goto err_put;
+
+	nents = ib_dma_map_sg(ep->ib_dev, ctx->sgt.sgl, ctx->sgt.orig_nents,
+			      DMA_BIDIRECTIONAL);
+	if (nents == 0) {
+		ret = -ENOMEM;
+		goto err_sgt;
+	}
+	ctx->sg_nents = nents;
+
+	mr = ib_alloc_mr(ep->pd, IB_MR_TYPE_MEM_REG, nr_pages);
+	if (IS_ERR(mr)) {
+		ret = PTR_ERR(mr);
+		goto err_unmap;
 	}
 
-	for (i = 0; i < nr_pages; i++) {
-		dma[i] = ib_dma_map_page(ep->ib_dev, pages[i], 0, PAGE_SIZE,
-					 DMA_BIDIRECTIONAL);
-		if (ib_dma_mapping_error(ep->ib_dev, dma[i])) {
-			ret = -ENOMEM;
-			goto err_unmap;
-		}
+	/*
+	 * Program the MR's page table from the DMA-mapped scatter list. The IOMMU
+	 * may coalesce adjacent pages, so the mapped count is compared against the
+	 * post-map @nents (sg elements), NOT nr_pages -- ib_map_mr_sg returns the
+	 * number of sg elements it consumed. A short map means the whole pool did
+	 * not fit the MR page list; verify mr->length covers every pinned page too,
+	 * so the app can never address a byte the MR does not map.
+	 */
+	mapped = ib_map_mr_sg(mr, ctx->sgt.sgl, nents, NULL, PAGE_SIZE);
+	if (mapped < 0) {
+		ret = mapped;
+		goto err_mr;
 	}
+	if (mapped != nents || mr->length < ((u64)nr_pages << PAGE_SHIFT)) {
+		ret = -EINVAL;
+		goto err_mr;
+	}
+
+	/* Bump the key so a stale rkey/lkey from a prior MR generation is invalid,
+	 * then register the MR with the HCA and block until it is live.
+	 */
+	ib_update_fast_reg_key(mr, ib_inc_rkey(mr->lkey) & 0xff);
+	ret = urp_cmd_reg_mr_sync(qp, mr);
+	if (ret)
+		goto err_mr;
 
 	ctx->ep		= ep;
 	ctx->ib_dev	= ep->ib_dev;
-	ctx->dma	= dma;
-	ctx->lkey	= ep->pd->local_dma_lkey;
+	ctx->mr		= mr;
+	ctx->mr_iova	= mr->iova;
+	ctx->lkey	= mr->lkey;
 	return 0;
 
+err_mr:
+	ib_dereg_mr(mr);
 err_unmap:
-	while (i-- > 0)
-		ib_dma_unmap_page(ep->ib_dev, dma[i], PAGE_SIZE,
-				  DMA_BIDIRECTIONAL);
-	kvfree(dma);
+	ib_dma_unmap_sg(ep->ib_dev, ctx->sgt.sgl, ctx->sgt.orig_nents,
+			DMA_BIDIRECTIONAL);
+	ctx->sg_nents = 0;
+err_sgt:
+	sg_free_table(&ctx->sgt);
 err_put:
 	urp_endpoint_put(ep);
 	return ret;
@@ -283,6 +488,20 @@ static int urp_cmd_do_register(struct urp_cmd_ctx *ctx,
 	ctx->geom.count		= reg.count;
 	ctx->geom.buf_size	= reg.buf_size;
 	ctx->registered		= true;
+
+	/*
+	 * Ownership bitmap (all APP_OWNED) + the per-buffer completion slab. On
+	 * failure urp_cmd_pool_release undoes the MR/map/pin fully -- ctx is now
+	 * marked registered so it runs the whole teardown.
+	 */
+	ctx->own = kvcalloc(urp_own_words(reg.count), sizeof(unsigned long),
+			    GFP_KERNEL);
+	ctx->ops = kvcalloc(reg.count, sizeof(*ctx->ops), GFP_KERNEL);
+	if (!ctx->own || !ctx->ops) {
+		urp_cmd_pool_release(ctx);
+		ret = -ENOMEM;
+		goto out;
+	}
 	ret = 0;
 out:
 	mutex_unlock(&ctx->lock);
@@ -296,10 +515,216 @@ static int urp_cmd_do_unregister(struct urp_cmd_ctx *ctx)
 	mutex_lock(&ctx->lock);
 	if (!ctx->registered) {
 		ret = -ENXIO;
-	} else {
-		urp_cmd_pool_release(ctx);
-		ret = 0;
+		goto out;
 	}
+	/*
+	 * Refuse while any buffer is still in flight (KERNEL_OWNED): unpinning /
+	 * deregistering under the NIC would be a use-after-free. The app must reap
+	 * all SEND completions first. The full teardown-quiesce that also drains
+	 * outstanding WRs (design 31 D4) lands with PR4; explicit fd close is
+	 * already safe because io_uring holds the file until every SEND completes.
+	 */
+	spin_lock(&ctx->own_lock);
+	if (urp_own_any_kernel(ctx->own, ctx->geom.count)) {
+		spin_unlock(&ctx->own_lock);
+		ret = -EBUSY;
+		goto out;
+	}
+	spin_unlock(&ctx->own_lock);
+
+	urp_cmd_pool_release(ctx);
+	ret = 0;
+out:
+	mutex_unlock(&ctx->lock);
+	return ret;
+}
+
+/*
+ * Per-stream TX state for a fast SEND, created on first use (no pump kthread --
+ * the app drives the QP). Reuses struct urp_stream so tx_seq/SYN, credits, and
+ * the PR4 RX reorder come from the existing machinery. Two concurrent first
+ * frames race on create; the loser gets -EEXIST and re-looks-up.
+ */
+static int urp_fast_stream_get(struct urp_endpoint *ep, u16 stream_id,
+			       struct urp_stream **out)
+{
+	struct urp_stream *s;
+	int ret;
+
+	s = urp_stream_lookup(ep, stream_id);
+	if (s) {
+		*out = s;
+		return 0;
+	}
+	ret = urp_stream_create(ep, stream_id, &s);
+	if (ret == -EEXIST) {
+		s = urp_stream_lookup(ep, stream_id);
+		if (!s)
+			return -EEXIST;
+	} else if (ret) {
+		return ret;
+	}
+	*out = s;
+	return 0;
+}
+
+/*
+ * Write the 20-byte in-place frame header (design 31 D3) into the app's pinned
+ * pages at the start of buffer @buf_index. buf_size need not divide the page
+ * size, so the header can straddle a page boundary -- split the copy in that
+ * case. The payload was written by the app in userspace and is untouched.
+ *
+ * DMA coherence: header (kernel) and payload (userspace) reach the NIC through
+ * the shared MR mapping. On the DMA-coherent targets (x86 ConnectX; the rxe/siw
+ * software providers copy from the pages directly) no explicit sync is needed;
+ * a non-coherent arch would additionally dma_sync_sg_for_device the frame range
+ * before the post -- deferred with real non-x86 HW support.
+ */
+static void urp_fast_write_header(struct urp_cmd_ctx *ctx, u32 buf_index,
+				  const u8 *hdr)
+{
+	u64 off = (u64)buf_index * ctx->geom.buf_size;
+	unsigned long pg = off >> PAGE_SHIFT;
+	unsigned int poff = offset_in_page(off);
+	unsigned int n0 = min_t(unsigned int, URP_FRAME_HEADER_SIZE,
+				PAGE_SIZE - poff);
+	void *k;
+
+	k = kmap_local_page(ctx->pages[pg]);
+	memcpy(k + poff, hdr, n0);
+	kunmap_local(k);
+	if (n0 < URP_FRAME_HEADER_SIZE) {
+		k = kmap_local_page(ctx->pages[pg + 1]);
+		memcpy(k, hdr + n0, URP_FRAME_HEADER_SIZE - n0);
+		kunmap_local(k);
+	}
+}
+
+/*
+ * Send completion (send CQ, IB_POLL_WORKQUEUE). Flip the buffer back to
+ * APP_OWNED -- always, including the IB_WC_WR_FLUSH_ERR drain path, so a QP
+ * teardown never strands a buffer or an io_uring request (mirrors
+ * urp_send_done). Record the result and bounce to the owning task to post the
+ * CQE (io_uring_cmd_done must run in the submitter's task, not here).
+ */
+static void urp_fast_send_done(struct ib_cq *cq, struct ib_wc *wc)
+{
+	struct urp_fast_op *op = container_of(wc->wr_cqe, struct urp_fast_op, cqe);
+	struct urp_cmd_ctx *ctx = op->ctx;
+
+	if (wc->status != IB_WC_SUCCESS && wc->status != IB_WC_WR_FLUSH_ERR)
+		pr_err_ratelimited("fast send completion error: %s (%d)\n",
+				   ib_wc_status_msg(wc->status), wc->status);
+
+	op->res = (wc->status == IB_WC_SUCCESS) ? (s32)op->len : -EIO;
+
+	spin_lock(&ctx->own_lock);
+	urp_own_release(ctx->own, ctx->geom.count, op->buf_index);
+	spin_unlock(&ctx->own_lock);
+
+	io_uring_cmd_complete_in_task(op->ioucmd, urp_fast_send_tw);
+}
+
+/*
+ * URP_CMD_SEND: zero-copy transmit of buffer @buf_index's payload. Claims the
+ * buffer (APP->KERNEL), encodes the in-place header, and posts a single-SGE
+ * IB_WR_SEND addressing the pool MR by offset (any frame size, no payload copy).
+ * Returns -EIOCBQUEUED: the CQE is posted from urp_fast_send_done via task-work.
+ * A synchronous failure returns a negative errno (no deferred completion) after
+ * releasing ownership. Runs in a blocking context (see the fop dispatch) since
+ * first-use stream creation may allocate.
+ */
+static int urp_cmd_do_send(struct urp_cmd_ctx *ctx, struct io_uring_cmd *ioucmd,
+			   const struct io_uring_sqe *sqe)
+{
+	const struct urp_cmd_data *in = urp_sqe_cmd(sqe, struct urp_cmd_data);
+	struct urp_cmd_pool_geom geom;
+	struct urp_cmd_req req;
+	struct urp_endpoint *ep;
+	struct urp_stream *stream;
+	struct urp_fast_op *op;
+	struct urp_qp *qp;
+	u8 hdr[URP_FRAME_HEADER_SIZE];
+	u8 flags = 0;
+	u64 seq;
+	int ret;
+
+	mutex_lock(&ctx->lock);
+	if (!ctx->registered) {
+		mutex_unlock(&ctx->lock);
+		return -ENXIO;
+	}
+	geom = ctx->geom;
+	ep = ctx->ep;
+
+	ret = urp_cmd_validate_data(URP_CMD_SEND, in, &geom, &req);
+	if (ret)
+		goto out_unlock;
+
+	/*
+	 * Fast streams are app-assigned and must be non-zero: urp_stream_create
+	 * treats stream_id 0 as "pick the next id", which would desync the id the
+	 * app stamps in the header from the stream object. Reject it up front.
+	 */
+	if (req.stream_id == 0) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
+	spin_lock(&ctx->own_lock);
+	ret = urp_own_claim(ctx->own, geom.count, req.buf_index);
+	spin_unlock(&ctx->own_lock);
+	if (ret)
+		goto out_unlock;			/* -EBUSY: double submit */
+
+	ret = urp_fast_stream_get(ep, req.stream_id, &stream);
+	if (ret)
+		goto err_release;
+
+	qp = urp_qp_select_round_robin(ep);
+	if (!qp || !qp->qp) {
+		ret = -ENOTCONN;
+		goto err_release;
+	}
+
+	mutex_lock(&stream->lock);
+	seq = stream->tx_seq++;
+	mutex_unlock(&stream->lock);
+
+	if (seq == 0)
+		flags |= URP_DATA_FLAG_SYN;		/* first frame opens the stream */
+	if (req.flags & URP_CMD_F_FIN)
+		flags |= URP_DATA_FLAG_FIN;
+
+	urp_frame_encode(hdr, req.stream_id, seq, URP_FRAME_TYPE_DATA, flags, 0,
+			 req.len);
+	urp_fast_write_header(ctx, req.buf_index, hdr);
+
+	op = &ctx->ops[req.buf_index];
+	op->cqe.done	= urp_fast_send_done;
+	op->ioucmd	= ioucmd;
+	op->ctx		= ctx;
+	op->buf_index	= req.buf_index;
+	op->len		= req.len;
+	op->stream_id	= req.stream_id;
+	op->res		= 0;
+	*io_uring_cmd_to_pdu(ioucmd, struct urp_fast_op *) = op;
+
+	ret = urp_post_frame_raw(qp->qp,
+				 ctx->mr_iova + (u64)req.buf_index * geom.buf_size,
+				 URP_FRAME_HEADER_SIZE + req.len, ctx->lkey,
+				 &op->cqe);
+	if (ret)
+		goto err_release;
+
+	mutex_unlock(&ctx->lock);
+	return -EIOCBQUEUED;
+
+err_release:
+	spin_lock(&ctx->own_lock);
+	urp_own_release(ctx->own, geom.count, req.buf_index);
+	spin_unlock(&ctx->own_lock);
+out_unlock:
 	mutex_unlock(&ctx->lock);
 	return ret;
 }
@@ -321,7 +746,7 @@ static int urp_cmd_do_data(struct urp_cmd_ctx *ctx, u32 cmd_op,
 	if (ret)
 		return ret;
 
-	/* PR1 validates the op; the RDMA data path arrives in a later PR. */
+	/* RECV zero-copy receive lands in PR4 (app-page recv sink + CQE32). */
 	return -ENOSYS;
 }
 
@@ -344,6 +769,15 @@ static int urp_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int issue_flags)
 			return urp_cmd_do_register(ctx, sqe);
 		return urp_cmd_do_unregister(ctx);
 	case URP_CMD_SEND:
+		/*
+		 * SEND may sleep on first-use stream creation (GFP_KERNEL), so
+		 * take the same io-wq punt as REGISTER. A future optimisation can
+		 * attempt an inline non-sleeping fast path and punt only on the
+		 * cold first frame. Completion is asynchronous (-EIOCBQUEUED).
+		 */
+		if (issue_flags & IO_URING_F_NONBLOCK)
+			return -EAGAIN;
+		return urp_cmd_do_send(ctx, ioucmd, sqe);
 	case URP_CMD_RECV:
 		return urp_cmd_do_data(ctx, ioucmd->cmd_op, sqe);
 	default:
@@ -364,6 +798,7 @@ static int urp_cmd_open(struct inode *inode, struct file *file)
 		return -ENOMEM;
 
 	mutex_init(&ctx->lock);
+	spin_lock_init(&ctx->own_lock);
 	file->private_data = ctx;
 	return 0;
 }

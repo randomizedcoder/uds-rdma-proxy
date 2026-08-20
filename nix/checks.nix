@@ -270,6 +270,7 @@ in
       fileset = pkgs.lib.fileset.unions [
         ../kernel/urp_cmd_validate.c
         ../kernel/urp_cmd.h
+        ../kernel/urp_cmd_own.h
         ../kernel/urp_cmd_compat.h
         ../kernel/include/uapi/linux/urp_cmd.h
         ../tools/urp-fast-validate-test.c

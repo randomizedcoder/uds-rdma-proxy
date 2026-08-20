@@ -47,7 +47,7 @@ struct urp_cmd_req {
  *   -EINVAL      reserved field set, bad/zero flags, or len == 0
  *   -ENXIO       no pool registered (geom->count == 0)
  *   -ERANGE      buf_index >= count
- *   -EMSGSIZE    len > buf_size
+ *   -EMSGSIZE    len (payload) > buf_size - URP_CMD_HEADER_RESV
  */
 int urp_cmd_validate_data(u32 cmd_op, const struct urp_cmd_data *in,
 			  const struct urp_cmd_pool_geom *geom,
