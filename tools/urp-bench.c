@@ -1442,7 +1442,30 @@ static int run_fast(struct run *r)
 	if (f.pool == MAP_FAILED)
 		fail(cfg, "mmap", -errno);
 
-	res = fast_register(&f, r->fast_endpoint);
+	/*
+	 * REGISTER can transiently fail while the RC session is still settling:
+	 * -ENOTCONN before the QP establishes, and -EIO if the QP is momentarily
+	 * draining. The latter is the interop startup race (design 31 D1): a
+	 * uds-initiator peer emits keepalive PINGs and re-dials on its own probe
+	 * timeout until this fast acceptor has armed recvs to answer them, so the
+	 * QP churns and REG_MR lands on a draining QP. Each fresh establishment
+	 * gives a brief healthy window; retry on those two codes until REGISTER
+	 * lands, after which the armed recvs below keep the peer's probe PONGed and
+	 * the session stops churning. Other errors (e.g. -EINVAL misalign) are
+	 * permanent -- fail immediately.
+	 */
+	{
+		uint64_t reg_deadline = now_ns() + 8ULL * 1000000000ULL;
+
+		for (;;) {
+			res = fast_register(&f, r->fast_endpoint);
+			if (res == 0 || (res != -EIO && res != -ENOTCONN))
+				break;
+			if (now_ns() >= reg_deadline)
+				break;
+			usleep(150000);
+		}
+	}
 	if (res != 0)
 		fail(cfg, "register", res);
 

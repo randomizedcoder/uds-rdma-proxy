@@ -195,6 +195,17 @@ struct urp_qp {
 	bool			accept_slot_held;
 
 	/*
+	 * Design 31 D1 interop: peer's advertised endpoint kind is FAST,
+	 * learned from the CM private_data trailer (urp_conn_priv_peer_kind)
+	 * at accept (initiator's connect payload) / ESTABLISHED (acceptor's
+	 * accept payload). A fast peer has no pump to answer keepalive PINGs,
+	 * so probing it churns the connection -- urp_probe_work_fn skips a QP
+	 * whose peer is fast. Defaults false (peer unknown / pre-trailer build
+	 * => treated as UDS => probed as before).
+	 */
+	bool			peer_is_fast;
+
+	/*
 	 * Step 4: per-QP credit-based flow control state. Initialized on
 	 * QP allocation; not yet wired into TX/RX (Step 4b adds the
 	 * consume-and-block + grant-frame emission).
@@ -397,6 +408,18 @@ struct urp_endpoint {
 	 * Built once at endpoint create time.
 	 */
 	u8			auth_priv[1 + URP_PSK_HASH_LEN];
+	/*
+	 * Design 31 D1 interop: the CM private_data we actually put on the wire
+	 * for rdma_connect / rdma_accept = the optional auth_priv (when
+	 * has_password) followed by a [MAGIC][MAGIC][kind] trailer that advertises
+	 * this endpoint's kind (urp_conn_priv_build). Prebuilt once at create.
+	 */
+	u8			conn_priv[1 + URP_PSK_HASH_LEN + 3];
+					/* +3 == URP_CONN_PRIV_TRAILER_LEN
+					 * (urp_frame.h, included below the
+					 * struct so the literal is used here) */
+	u8			conn_priv_len;
+	u8			auth_len;	/* has_password ? sizeof(auth_priv) : 0 */
 
 	/* Lifecycle */
 	enum urp_endpoint_state	state;

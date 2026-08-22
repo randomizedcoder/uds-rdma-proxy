@@ -700,6 +700,74 @@ static void test_classify_frame(struct kunit *test)
 #undef PONGSZ
 }
 
+/*
+ * Fast RECV control-frame disposition (design 31 D1 + design 33). The zero-copy
+ * recv path has no pump, so urp_fast_recv_done must map each classified action
+ * to: deliver DATA to the app, answer a PROBE PING with a PONG, silently absorb
+ * a PONG/CREDIT, or reject a malformed frame. A PING mapped to anything but PONG
+ * would leave a fast acceptor unable to answer a UDS initiator's keepalive ->
+ * silent-drop re-dial loop; a control frame mapped to REJECT (-EBADMSG) would
+ * abort a well-behaved zero-copy consumer on a mere keepalive. Pin the whole map.
+ */
+static void test_fast_rx_disposition(struct kunit *test)
+{
+	const struct { enum urp_rx_action in; enum urp_fast_rx_disp want; } cases[] = {
+		{ URP_RX_DELIVER_STREAM,	URP_FAST_RX_DELIVER },
+		{ URP_RX_DELIVER_LEGACY,	URP_FAST_RX_DELIVER },
+		{ URP_RX_PROBE_PING,		URP_FAST_RX_PONG },
+		{ URP_RX_PROBE_PONG,		URP_FAST_RX_ABSORB },
+		{ URP_RX_CREDIT,		URP_FAST_RX_ABSORB },
+		{ URP_RX_DROP_SHORT,		URP_FAST_RX_REJECT },
+		{ URP_RX_DROP_OVERSIZE,		URP_FAST_RX_REJECT },
+		{ URP_RX_DROP_PAYLOAD_OVERRUN,	URP_FAST_RX_REJECT },
+		{ URP_RX_DROP_SHORT_PROBE,	URP_FAST_RX_REJECT },
+	};
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++)
+		KUNIT_EXPECT_EQ_MSG(test, urp_fast_rx_disposition(cases[i].in),
+				    cases[i].want, "action %d", cases[i].in);
+}
+
+/*
+ * CM private_data kind-advertisement trailer (design 31 D1). A uds initiator
+ * uses the peer's advertised kind to suppress its probe against a fast acceptor,
+ * so build/parse must round-trip and, critically, a missing/old trailer must
+ * read as "not found" (caller then assumes UDS and probes as before) while the
+ * leading PSK auth bytes stay byte-for-byte intact under the appended trailer.
+ */
+static void test_conn_priv_kind_trailer(struct kunit *test)
+{
+	u8 buf[64];
+	u8 kind;
+
+	/* No auth: trailer at offset 0, len 3, round-trips to FAST. */
+	memset(buf, 0, sizeof(buf));
+	KUNIT_EXPECT_EQ(test, urp_conn_priv_build(buf, 0, URP_EP_KIND_FAST), 3);
+	KUNIT_EXPECT_TRUE(test, urp_conn_priv_peer_kind(buf, 3, 0, &kind));
+	KUNIT_EXPECT_EQ(test, kind, (u8)URP_EP_KIND_FAST);
+
+	/* 33-byte auth: trailer at offset 33; auth bytes preserved. */
+	memset(buf, 0xAB, 33);
+	KUNIT_EXPECT_EQ(test, urp_conn_priv_build(buf, 33, URP_EP_KIND_UDS), 36);
+	KUNIT_EXPECT_EQ(test, buf[0], (u8)0xAB);
+	KUNIT_EXPECT_EQ(test, buf[32], (u8)0xAB);
+	KUNIT_EXPECT_TRUE(test, urp_conn_priv_peer_kind(buf, 36, 33, &kind));
+	KUNIT_EXPECT_EQ(test, kind, (u8)URP_EP_KIND_UDS);
+
+	/* Old peer / truncated / null => not found (caller assumes UDS). */
+	kind = 0xEE;
+	KUNIT_EXPECT_FALSE(test, urp_conn_priv_peer_kind(buf, 33, 33, &kind));
+	KUNIT_EXPECT_FALSE(test, urp_conn_priv_peer_kind(NULL, 0, 0, &kind));
+	KUNIT_EXPECT_FALSE(test, urp_conn_priv_peer_kind(buf, 0, 0, &kind));
+
+	/* Corrupt magic => not found. */
+	memset(buf, 0, sizeof(buf));
+	urp_conn_priv_build(buf, 0, URP_EP_KIND_FAST);
+	buf[0] = 0x00;
+	KUNIT_EXPECT_FALSE(test, urp_conn_priv_peer_kind(buf, 3, 0, &kind));
+}
+
 /* ---- Buffer-geometry resolver tests (design 29 Gap 2) ---- */
 
 /*
@@ -1337,6 +1405,8 @@ static struct kunit_case urp_test_cases[] = {
 	KUNIT_CASE(test_stream_next_state),
 	/* design 28 E1: RX frame classifier */
 	KUNIT_CASE(test_classify_frame),
+	KUNIT_CASE(test_fast_rx_disposition),
+	KUNIT_CASE(test_conn_priv_kind_trailer),
 	/* design 32: acceptor connection plan (eager-connect gate) */
 	KUNIT_CASE(test_acceptor_eager_connect),
 	/* design 32: credit-grant routing (per-stream vs per-QP pool) */

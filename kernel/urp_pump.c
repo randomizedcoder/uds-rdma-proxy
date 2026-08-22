@@ -495,8 +495,18 @@ static void urp_probe_work_fn(struct work_struct *work)
 	 * missing PONGs are the only signal). A single-QP acceptor stays quiet.
 	 */
 	if (ep->qps && urp_should_emit_probes(ep->is_initiator, ep->num_qps)) {
-		for (i = 0; i < ep->num_qps; i++)
+		for (i = 0; i < ep->num_qps; i++) {
+			/*
+			 * Design 31 D1: a fast peer has no pump to answer a PING,
+			 * so probing it would rack up missed PONGs and trip the
+			 * silent-drop reconnect in a loop, never letting the fast
+			 * side's REGISTER stabilize. Skip it -- a fast peer's
+			 * liveness is RC + app-completion driven, not probe based.
+			 */
+			if (ep->qps[i].peer_is_fast)
+				continue;
 			urp_emit_ping_on(ep, &ep->qps[i]);
+		}
 	}
 
 	schedule_delayed_work(&ep->probe_work,

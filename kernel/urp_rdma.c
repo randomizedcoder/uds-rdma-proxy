@@ -277,13 +277,15 @@ void urp_connect_work_fn(struct work_struct *w)
 	param.retry_count = 7;
 	param.rnr_retry_count = 7;
 	/*
-	 * Phase 3b Step 8: include PSK auth payload in private_data when
-	 * configured. Acceptor compares the hash against its own and
-	 * rdma_reject's on mismatch.
+	 * Phase 3b Step 8 + design 31 D1: private_data = ep->conn_priv = optional
+	 * PSK auth (acceptor memcmp's it, rdma_reject's on mismatch) + a kind
+	 * trailer only when we are fast. conn_priv_len is 0 for a no-password uds
+	 * endpoint, so we send no private_data at all -- byte-identical to the
+	 * pre-interop wire. An old acceptor checks only the leading auth bytes.
 	 */
-	if (ep->has_password) {
-		param.private_data = ep->auth_priv;
-		param.private_data_len = sizeof(ep->auth_priv);
+	if (ep->conn_priv_len) {
+		param.private_data = ep->conn_priv;
+		param.private_data_len = ep->conn_priv_len;
 	}
 
 	ret = rdma_connect(qp->cm_id, &param);
@@ -926,15 +928,32 @@ static int urp_cm_accept_one(struct rdma_cm_id *child, struct urp_endpoint *ep,
 	param.initiator_depth = 1;
 	param.rnr_retry_count = 7;
 	/*
-	 * Phase 3b Step 8: echo our own auth_priv in the accept reply
-	 * so the initiator can (in a future bidirectional check) also
-	 * validate the acceptor. Initiator-validates-acceptor is not
-	 * wired yet -- this just stages the payload on the wire.
+	 * Phase 3b Step 8 + design 31 D1: reply with our conn_priv (auth echo +
+	 * kind trailer). The initiator reads the trailer at ESTABLISHED to learn
+	 * our kind and suppress probing if we are fast; an old initiator ignores
+	 * it. (Initiator-validates-acceptor auth is still not wired -- only the
+	 * kind advertisement is consumed today.)
 	 */
-	if (ep->has_password) {
-		param.private_data = ep->auth_priv;
-		param.private_data_len = sizeof(ep->auth_priv);
+	if (ep->conn_priv_len) {
+		param.private_data = ep->conn_priv;
+		param.private_data_len = ep->conn_priv_len;
 	}
+
+	/*
+	 * Design 31 D1: learn the initiator's kind from its connect private_data
+	 * trailer so a probing acceptor (num_qps > 1) skips a fast peer. Absent /
+	 * old-build trailer => treated as UDS (probed as before). Set before
+	 * ESTABLISHED so the first probe tick already sees it.
+	 */
+	{
+		u8 peer_kind;
+
+		ep->qps[qp_index].peer_is_fast =
+			urp_conn_priv_peer_kind(peer_priv, peer_priv_len,
+						ep->auth_len, &peer_kind) &&
+			peer_kind == URP_EP_KIND_FAST;
+	}
+
 	ret = rdma_accept(child, &param);
 	if (ret)
 		goto err_destroy_qp;
@@ -1021,7 +1040,23 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 
 	case RDMA_CM_EVENT_ESTABLISHED:
 		if (ep->qps && ctx->qp_index < ep->num_qps) {
+			u8 peer_kind;
+
 			ep->qps[ctx->qp_index].established = true;
+			/*
+			 * Design 31 D1: the acceptor's accept-reply private_data
+			 * carries its kind trailer. If it is fast, suppress our
+			 * keepalive probe on this QP -- a pumpless fast peer
+			 * cannot PONG during bring-up, and probing it would trip
+			 * the silent-drop reconnect in a churn loop. Absent /
+			 * old-build trailer => UDS => probe as before.
+			 */
+			ep->qps[ctx->qp_index].peer_is_fast =
+				urp_conn_priv_peer_kind(
+					event->param.conn.private_data,
+					event->param.conn.private_data_len,
+					ep->auth_len, &peer_kind) &&
+				peer_kind == URP_EP_KIND_FAST;
 			/* Design 33 Phase 1: a fresh establish clears the
 			 * connect-retry budget, so a later disconnect gets its
 			 * own full backoff window.

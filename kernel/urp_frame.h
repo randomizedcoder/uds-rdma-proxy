@@ -203,4 +203,83 @@ struct urp_rx_decoded {
 enum urp_rx_action
 urp_classify_frame(u32 byte_len, const u8 *hdr, struct urp_rx_decoded *out);
 
+/*
+ * How the zero-copy fast RECV path (urp_fast_recv_done) must dispose of a
+ * classified frame. The copy path routes everything through the pump; the fast
+ * path has no pump, so it handles the peer's liveness/flow-control protocol
+ * inline and delivers only DATA to the app. Pure so the completion handler and
+ * KUnit agree on the mapping (design 31 D1 + design 33 recv-path PONG).
+ */
+enum urp_fast_rx_disp {
+	URP_FAST_RX_DELIVER,	/* DATA: hand the payload to the app */
+	URP_FAST_RX_PONG,	/* PROBE PING: emit a PONG, then empty completion */
+	URP_FAST_RX_ABSORB,	/* PROBE PONG / CREDIT: swallow, empty completion */
+	URP_FAST_RX_REJECT,	/* malformed: surface -EBADMSG to the app */
+};
+
+static inline enum urp_fast_rx_disp
+urp_fast_rx_disposition(enum urp_rx_action action)
+{
+	switch (action) {
+	case URP_RX_DELIVER_STREAM:
+	case URP_RX_DELIVER_LEGACY:
+		return URP_FAST_RX_DELIVER;
+	case URP_RX_PROBE_PING:
+		return URP_FAST_RX_PONG;
+	case URP_RX_PROBE_PONG:
+	case URP_RX_CREDIT:
+		return URP_FAST_RX_ABSORB;
+	default:
+		return URP_FAST_RX_REJECT;
+	}
+}
+
+/*
+ * CM private_data kind-advertisement trailer (design 31 D1 interop). Each side
+ * appends [MAGIC0][MAGIC1][kind] AFTER its optional PSK auth bytes, so:
+ *   - an old peer's fixed-offset auth memcmp (bytes [0..auth_len)) is unaffected,
+ *   - a peer that sends no trailer (old build) reads back as "kind unknown",
+ *     which the caller treats as UDS -- the safe, probe-as-before default.
+ * A uds *initiator* uses the peer's advertised kind to suppress its keepalive
+ * probe against a *fast* acceptor, whose PONG a pumpless fast endpoint cannot
+ * answer during bring-up (design 33 silent-drop churn otherwise). The trailer
+ * sits at offset @auth_len; auth is symmetric for a successful connection, so a
+ * receiver locates it using its own auth length.
+ */
+#define URP_CONN_PRIV_MAGIC0		0x55	/* 'U' */
+#define URP_CONN_PRIV_MAGIC1		0x52	/* 'R' */
+#define URP_CONN_PRIV_TRAILER_LEN	3	/* magic0, magic1, kind */
+
+/*
+ * Append the kind trailer after @auth_len existing bytes in @buf; return the new
+ * total private_data length. @buf must have room for auth_len + trailer.
+ */
+static inline u8 urp_conn_priv_build(u8 *buf, u8 auth_len, u8 kind)
+{
+	buf[auth_len]	  = URP_CONN_PRIV_MAGIC0;
+	buf[auth_len + 1] = URP_CONN_PRIV_MAGIC1;
+	buf[auth_len + 2] = kind;
+	return auth_len + URP_CONN_PRIV_TRAILER_LEN;
+}
+
+/*
+ * Read the peer's advertised endpoint kind from CM private_data. @auth_len is
+ * the receiver's own auth length (== the peer's, auth being symmetric). Returns
+ * true and sets *out_kind when a valid trailer is present; false (peer predates
+ * the trailer, or truncated) otherwise -- the caller then assumes UDS.
+ */
+static inline bool urp_conn_priv_peer_kind(const void *priv, u8 priv_len,
+					   u8 auth_len, u8 *out_kind)
+{
+	const u8 *p = priv;
+
+	if (!p || priv_len < (u8)(auth_len + URP_CONN_PRIV_TRAILER_LEN))
+		return false;
+	if (p[auth_len] != URP_CONN_PRIV_MAGIC0 ||
+	    p[auth_len + 1] != URP_CONN_PRIV_MAGIC1)
+		return false;
+	*out_kind = p[auth_len + 2];
+	return true;
+}
+
 #endif /* _URP_FRAME_H */

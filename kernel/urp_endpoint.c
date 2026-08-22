@@ -203,6 +203,24 @@ int urp_endpoint_create(struct urp_endpoint *cfg, struct urp_endpoint **out)
 		memcpy(ep->auth_priv + 1, ep->password_hash, URP_PSK_HASH_LEN);
 	}
 
+	/*
+	 * Design 31 D1 interop: prebuild the CM private_data we advertise on
+	 * rdma_connect / rdma_accept. It starts with the optional PSK auth payload
+	 * (so an acceptor's fixed-offset memcmp is unchanged). Only a FAST endpoint
+	 * then appends a kind trailer so a peer can learn it is fast and skip
+	 * probing it. A UDS endpoint keeps the EXACT legacy wire -- auth-if-password
+	 * else nothing -- so uds<->uds behaviour is byte-for-byte unchanged (a peer
+	 * that receives no trailer already assumes UDS, which is correct).
+	 */
+	ep->auth_len = ep->has_password ? sizeof(ep->auth_priv) : 0;
+	if (ep->auth_len)
+		memcpy(ep->conn_priv, ep->auth_priv, ep->auth_len);
+	if (urp_ep_is_fast(ep))
+		ep->conn_priv_len = urp_conn_priv_build(ep->conn_priv,
+							ep->auth_len, ep->kind);
+	else
+		ep->conn_priv_len = ep->auth_len;
+
 	ep->is_initiator = initiator;
 	ep->state        = URP_STATE_CREATING;
 	mutex_init(&ep->lock);

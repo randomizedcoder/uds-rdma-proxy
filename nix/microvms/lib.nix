@@ -1206,6 +1206,145 @@ in rec {
       echo ""
 
       # -----------------------------------------------------------------
+      # Phase 10l — MIXED-KIND interop: FAST source -> UDS/copy sink
+      # (design 31 D1). Proves the fast SEND wire frame is byte-compatible
+      # with the copy-path reassembler: a zero-copy app can feed an
+      # unmodified legacy uds consumer. vm1 is a UDS acceptor, vm2 a FAST
+      # initiator on the same RC session; the fast source (`--mode
+      # uring-cmd`) blasts a small bounded stream, the copy sink (`--mode
+      # blocking`) drains + FULL-verifies every byte. BENCH_OK on both is
+      # the gate. (This direction needs no probe fix: the uds acceptor is
+      # quiet and the fast initiator's own probe is gated off since PR#57.)
+      # A small --count keeps the transfer inside the buffers (no
+      # no-backpressure flood, design 34 §34.5.1 finding 1).
+      # -----------------------------------------------------------------
+      echo "--- Phase 10l: mixed-kind interop FAST->UDS (design 31 D1) ---"
+      f4port=4798
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+        "urp add mix_uds_acc --kind uds --connect-path /tmp/urp-mix-uds-acc.sock --bind $VM1_IP:$f4port --buffer-count 16 --buffer-size 8192" "$T_URP" \
+        > "$RUNDIR/diag/vm1.mixl-add.txt" 2>&1
+      vm_run "$VM2_VIRTIO" "$VM2_PROC" \
+        "urp add mix_fast_init --kind fast --listen-path /tmp/urp-mix-fast-init.sock --peer $VM1_IP:$f4port --buffer-count 16 --buffer-size 8192" "$T_URP" \
+        > "$RUNDIR/diag/vm2.mixl-add.txt" 2>&1
+      if ! grep -q "ok:" "$RUNDIR/diag/vm1.mixl-add.txt" || ! grep -q "ok:" "$RUNDIR/diag/vm2.mixl-add.txt"; then
+        awk '{print "    vm1: "$0}' "$RUNDIR/diag/vm1.mixl-add.txt"
+        awk '{print "    vm2: "$0}' "$RUNDIR/diag/vm2.mixl-add.txt"
+        fail "mixed FAST->UDS endpoint pair add failed"
+      fi
+      # Readiness: a REGISTER-ready fast initiator proves the RC session to
+      # the uds acceptor is established (REG_MR needs the QP connected).
+      mixl_ready=0
+      for _try in $(seq 1 12); do
+        sleep "$POLL"
+        vm_run "$VM2_VIRTIO" "$VM2_PROC" \
+          "urp-fast-poc /dev/urp mix_fast_init 4096 8 2>&1" "$T_BENCH" \
+          > "$RUNDIR/diag/vm2.mixl-ready.txt" 2>&1 || true
+        if grep -q URP_FAST_POC_OK "$RUNDIR/diag/vm2.mixl-ready.txt"; then mixl_ready=1; break; fi
+      done
+      if [ "$mixl_ready" != 1 ]; then
+        awk '{print "      "$0}' "$RUNDIR/diag/vm2.mixl-ready.txt"
+        fail "mixed FAST->UDS: fast initiator never reached REGISTER-ready"
+      fi
+      mlcli="$RUNDIR/diag/vm2.mixl-fast-src.txt"
+      mllst="$RUNDIR/diag/vm1.mixl-uds-sink.txt"
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+        "pkill -f 'urp-bench --listen' 2>/dev/null; nohup urp-bench --listen /tmp/urp-mix-uds-acc.sock --id 2 --mode blocking --pattern stream --msg-size 1024 --count 100 --verify full >/tmp/urp-mixl-l.out 2>&1 & sleep 0.3; echo MIXL_L_UP" 10 \
+        >/dev/null 2>&1 || true
+      vm_run "$VM2_VIRTIO" "$VM2_PROC" \
+        "urp-bench --connect /tmp/urp-mix-fast-init.sock --id 1 --mode uring-cmd --fast-endpoint mix_fast_init --pattern stream --msg-size 1024 --count 100 --batch 8 --verify full 2>&1" "$T_BENCH" \
+        > "$mlcli" 2>&1 || true
+      scan_splat "$mlcli" "mixed fast source"
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" "cat /tmp/urp-mixl-l.out" 10 > "$mllst" 2>&1 || true
+      scan_splat "$mllst" "mixed uds sink"
+      if grep -q BENCH_OK "$mlcli" && grep -q BENCH_OK "$mllst"; then
+        pass "mixed-kind interop FAST->UDS: BENCH_OK both, uds sink verify=full (design 31 D1)"
+        grep -h BENCH_OK "$mlcli" "$mllst" | awk '{print "    "$0}'
+      else
+        awk '{print "    src:  "$0}' "$mlcli"
+        awk '{print "    sink: "$0}' "$mllst"
+        vm_run "$VM1_VIRTIO" "$VM1_PROC" "urp stats mix_uds_acc; dmesg | tail -20" 10 \
+          > "$RUNDIR/diag/vm1.mixl-fail.txt" 2>&1 || true
+        fail "mixed FAST->UDS: no BENCH_OK on both sides (see $mlcli / $mllst)"
+      fi
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" "pkill -f 'urp-bench --listen' 2>/dev/null; urp remove mix_uds_acc 2>/dev/null; echo MLGONE1" 15 >/dev/null 2>&1 || true
+      vm_run "$VM2_VIRTIO" "$VM2_PROC" "urp remove mix_fast_init 2>/dev/null; echo MLGONE2" 15 >/dev/null 2>&1 || true
+      echo ""
+
+      # -----------------------------------------------------------------
+      # Phase 10m — MIXED-KIND interop: UDS/copy source -> FAST sink
+      # (design 31 D1, reverse). This is the GATE for the peer-kind CM
+      # handshake: a UDS *initiator* emits design-33 keepalive PINGs and,
+      # before the fix, a pumpless FAST *acceptor* could not answer them in
+      # time, so the initiator declared a silent drop and re-dialed in a loop
+      # (~URP_QP_MISS_THRESHOLD * URP_PROBE_INTERVAL_MS), and REGISTER against
+      # the fast acceptor churned. Now the acceptor advertises kind=fast in its
+      # CM private_data trailer, the initiator reads it at ESTABLISHED and
+      # SUPPRESSES probing that QP (urp_probe_work_fn), the session stays up,
+      # and the uds source's bytes land zero-copy (verified end-to-end on real
+      # hardware). The recv-path PONG answer stays as defense-in-depth. BENCH_OK
+      # on both is the gate.
+      # -----------------------------------------------------------------
+      echo "--- Phase 10m: mixed-kind interop UDS->FAST + peer-kind probe suppression (design 31 D1) ---"
+      f5port=4799
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+        "urp add mix_fast_acc --kind fast --connect-path /tmp/urp-mix-fast-acc.sock --bind $VM1_IP:$f5port --buffer-count 16 --buffer-size 8192" "$T_URP" \
+        > "$RUNDIR/diag/vm1.mixm-add.txt" 2>&1
+      # The fast acceptor is added above; the uds initiator is added LATER (below)
+      # on purpose. Check the acceptor add alone here.
+      if ! grep -q "ok:" "$RUNDIR/diag/vm1.mixm-add.txt"; then
+        awk '{print "    vm1: "$0}' "$RUNDIR/diag/vm1.mixm-add.txt"
+        fail "mixed UDS->FAST fast acceptor add failed"
+      fi
+      mmcli="$RUNDIR/diag/vm2.mixm-uds-src.txt"
+      mmlst="$RUNDIR/diag/vm1.mixm-fast-sink.txt"
+      # Start the fast sink BEFORE the uds initiator exists. The peer-kind CM
+      # handshake (design 31 D1) makes the uds initiator learn the acceptor is
+      # fast and SUPPRESS its keepalive probe, so the session never churns. The
+      # sink's REGISTER-retry then lands cleanly and arms recvs.
+      #
+      # Sizing: the uds pump coalesces bench frames up to its buffer_size (4096),
+      # so the fast sink must donate recv buffers big enough to hold them --
+      # --msg-size 8192 gives a recv sink_len ~8212 >= 4096 (a smaller msg-size
+      # caps the recv below the incoming frame -> IB local length error). The
+      # sink verifies the reassembled byte stream regardless of its own msg-size.
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" \
+        "pkill -f 'urp-bench --listen' 2>/dev/null; nohup urp-bench --listen /tmp/urp-mix-fast-acc.sock --id 2 --mode uring-cmd --fast-endpoint mix_fast_acc --pattern stream --msg-size 8192 --count 100 --verify full >/tmp/urp-mixm-l.out 2>&1 & sleep 0.3; echo MIXM_L_UP" 10 \
+        >/dev/null 2>&1 || true
+      sleep "$POLL"
+      # Now dial in the uds initiator; the waiting fast sink registers + arms.
+      vm_run "$VM2_VIRTIO" "$VM2_PROC" \
+        "urp add mix_uds_init --kind uds --listen-path /tmp/urp-mix-uds-init.sock --peer $VM1_IP:$f5port --buffer-count 16 --buffer-size 4096" "$T_URP" \
+        > "$RUNDIR/diag/vm2.mixm-add.txt" 2>&1
+      if ! grep -q "ok:" "$RUNDIR/diag/vm2.mixm-add.txt"; then
+        awk '{print "    vm2: "$0}' "$RUNDIR/diag/vm2.mixm-add.txt"
+        fail "mixed UDS->FAST uds initiator add failed"
+      fi
+      # Give REGISTER a couple of windows to land + the PONG'd session to settle,
+      # then run the uds source.
+      sleep 3
+      vm_run "$VM2_VIRTIO" "$VM2_PROC" \
+        "urp-bench --connect /tmp/urp-mix-uds-init.sock --id 1 --mode blocking --pattern stream --msg-size 1024 --count 100 --batch 8 --verify full 2>&1" "$T_BENCH" \
+        > "$mmcli" 2>&1 || true
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" "cat /tmp/urp-mixm-l.out" 10 > "$mmlst" 2>&1 || true
+      mixm_ok=0
+      if grep -q BENCH_OK "$mmcli" && grep -q BENCH_OK "$mmlst"; then mixm_ok=1; fi
+      scan_splat "$mmcli" "mixed uds source"
+      scan_splat "$mmlst" "mixed fast sink"
+      if [ "$mixm_ok" = 1 ]; then
+        pass "mixed-kind interop UDS->FAST: BENCH_OK both, uds initiator suppresses probe of the fast peer (design 31 D1)"
+        grep -h BENCH_OK "$mmcli" "$mmlst" | awk '{print "    "$0}'
+      else
+        awk '{print "    src:  "$0}' "$mmcli"
+        awk '{print "    sink: "$0}' "$mmlst"
+        vm_run "$VM1_VIRTIO" "$VM1_PROC" "urp stats mix_fast_acc; dmesg | tail -25" 10 \
+          > "$RUNDIR/diag/vm1.mixm-fail.txt" 2>&1 || true
+        fail "mixed UDS->FAST: no BENCH_OK (probe-PONG fix regressed? see $mmcli / $mmlst)"
+      fi
+      vm_run "$VM1_VIRTIO" "$VM1_PROC" "pkill -f 'urp-bench --listen' 2>/dev/null; urp remove mix_fast_acc 2>/dev/null; echo MMGONE1" 15 >/dev/null 2>&1 || true
+      vm_run "$VM2_VIRTIO" "$VM2_PROC" "urp remove mix_uds_init 2>/dev/null; echo MMGONE2" 15 >/dev/null 2>&1 || true
+      echo ""
+
+      # -----------------------------------------------------------------
       # Phase 11 — teardown (drain, remove, rmmod), each step timed
       # so the slow command pops out of the verdict table.
       # -----------------------------------------------------------------

@@ -369,6 +369,139 @@ Three findings sharpen the phasing:
    fix is **adding retry/backoff to the acceptor's backend-UDS connect** so a
    late-starting consumer recovers instead of losing a stream's frames.
 
+## 34.5.2 Zero-copy fast-path measurement — copy vs zero-copy (design 31 PR5)
+
+The Phase-0 numbers above (§34.5.1) are the **copy path** (`AF_UNIX` pump, 4
+copies/frame). Design 31's zero-copy `io_uring_cmd` fast path (Option E) is now
+built and merged (PR1–PR4), and `urp-bench` grew a `--mode uring-cmd` backend
+(PR5a) so the *same* bench core drives both paths. This section is the measured
+answer to the founding question — *how different is zero-copy vs copy on
+throughput, latency, syscalls, and CPU/memory pressure?*
+
+Same boxes, same 25 GbE RoCEv2 link, back-to-back (hp1 acceptor ↔ hp3 initiator,
+2026-08-19). Copy path = `--mode uring-rw`; zero-copy = `--mode uring-cmd`
+against a dedicated `--kind fast` endpoint pair (NIC DMAs straight into/out of
+the app's pinned pool — 0 software copies). Runners: `.#urp-fast-bw-matrix`
+(goodput) and `.#urp-fast-hw-matrix` (RTT).
+
+**Performance summary — copy vs zero-copy (headline table).** One row per axis,
+worst→best frame size; higher is better for goodput, lower for the rest:
+
+| metric | frame | copy path | zero-copy | improvement |
+|--------|-------|-----------|-----------|-------------|
+| one-way goodput  | 4 KB  | 6.6–9.7 MB/s        | **47.5 MB/s**   | ~5–7×  |
+| one-way goodput  | 16 KB | 9.4–9.6 MB/s        | **585 MB/s**    | **~62×** |
+| one-way goodput  | 64 KB | 52.7 MB/s (1.7% line)| **2133 MB/s (68% line)** | **~40×** |
+| RTT p50          | 24 B  | 34.7 µs             | **22.9 µs**     | 1.5×   |
+| RTT p50          | 64 KB | 321 µs              | **78 µs**       | **4.1×** |
+| RTT p99          | 64 KB | 408 µs              | **95 µs**       | 4.3×   |
+| syscalls / msg   | 64 KB | 9.14                | **1.00**        | 9×     |
+| CPU µs / msg     | 64 KB | 93.0                | **4.2**         | **~22×** |
+
+The single takeaway: **at 64 KB the fast path moves ~40× the bytes at ~4× lower
+latency for ~22× less CPU per message** — and the goodput advantage grows with
+frame size (4 copies → 0, §31.7). Full per-size tables and method below.
+
+**One-way bulk goodput (`--pattern stream`, batch=16, sink-measured).** Copy
+column is §34.5.1's `--mode blocking` best; the win grows with frame size exactly
+as design 31 §31.7 predicts (4 copies → 0):
+
+| msg_size | copy MB/s (§34.5.1) | zero-copy MB/s | zero-copy Mb/s | % of 25 GbE | **speedup** | fast syscalls/msg | fast cpu µs/msg |
+|----------|---------------------|----------------|----------------|-------------|-------------|-------------------|-----------------|
+| 4 KB     | 6.6–9.7             | **47.5**       | 380            | 1.5 %       | ~5–7×       | 0.19              | 0.91            |
+| 16 KB    | 9.4–9.6             | **585.2**      | 4 682          | 18.7 %      | **~62×**    | 0.48              | 1.91            |
+| 64 KB    | 52.7 (best)         | **2133.2**     | 17 066         | **68.3 %**  | **~40×**    | 0.50              | 2.00            |
+
+At 64 KB zero-copy reaches **68 % of line rate** (17.1 Gb/s) vs the copy path's
+1.69 % — and vs the §34.5.1 single-stream iperf2 baseline (~1900 MB/s), the fast
+path is now **~112 %** of TCP goodput on a single flow. Small frames (4 KB) stay
+low: with the copy eliminated the residual cost is per-frame post/CQE (§34.2), so
+the zero-copy 4 KB point is still post-bound, not copy-bound — the fast path wins
+where the copy actually dominated (large frames), as expected.
+
+**Round-trip latency + syscall/CPU cost (`--pattern echo`, batch=1, C↔C,
+single-clock; PTP offset −25.7 µs bounds only the RTT/2 one-way estimate).**
+Both paths measured this session:
+
+| msg_size | copy p50/p99 µs | zero-copy p50/p99 µs | **RTT speedup** | copy syscalls·cpuµs /msg | zero-copy syscalls·cpuµs /msg |
+|----------|-----------------|----------------------|-----------------|--------------------------|-------------------------------|
+| 24 B     | 34.7 / 57.1     | **22.9 / 30.7**      | 1.5×            | 1.04 · 3.07              | 1.00 · 3.32                   |
+| 1 KB     | 56.3 / 64.8     | **25.9 / 31.1**      | 2.2×            | 1.04 · 4.44              | 1.00 · 4.04                   |
+| 4 KB     | 52.5 / 75.6     | **28.9 / 34.5**      | 1.8×            | 1.40 · 7.57              | 1.00 · 4.09                   |
+| 64 KB    | 321.3 / 408.0   | **78.4 / 94.5**      | **4.1×**        | **9.14 · 93.02**         | 1.00 · **4.22**               |
+
+**Verdict — zero-copy lifts the ceiling the copy path was pinned under, and the
+gap is a function of frame size.** Three measured stories:
+
+1. **Throughput:** 64 KB goodput jumps **52.7 → 2133 MB/s (~40×)**, from 1.69 %
+   to 68 % of 25 GbE. The copy path was post/serialization-bound (§34.5.1) *and*
+   copy-bound at large frames; removing the copies uncorks the large-frame case.
+2. **Latency:** zero-copy RTT is lower at every size and the advantage widens
+   with bytes — **4.1× at 64 KB** (78 µs vs 321 µs) — because the copy path pays
+   memcpy + AF_UNIX datagram fragmentation on both legs of the round trip.
+3. **Syscalls & CPU/memory pressure:** the killer number. At 64 KB the copy path
+   fragments a message across **9.14 syscalls** and spends **93 µs of CPU per
+   message**; the zero-copy path holds a flat **1 syscall / 4.2 µs per message
+   (~22× less CPU)** at any size, and its buffer pool is pinned **once** at
+   REGISTER rather than churned per message — the "flat-memory" story design 31
+   §31.7 promised, now measured.
+
+Caveats: single flow, single QP, `verify=none` for goodput / `verify=full` for
+the RTT sweep (copy 64 KB echo shows 74.6 % reassembled under the no-backpressure
+flood — §34.5.1 finding 1 — a copy-path artifact, not a fast-path one; the fast
+path delivered cleanly). `maxrss` not scraped; `cpu_us/msg` is the CPU/memory-
+pressure proxy here. These validate Option E as the decisive copy-elimination
+lever for the large-frame (Redpanda/Kafka replication) workload — while windowing
+(§34.6 / Option C) remains the orthogonal fix for *reliable completion* on both
+paths.
+
+## 34.5.3 Mixed-kind interop — copy ⇄ zero-copy on one RC session (design 31 D1)
+
+The copy (uds) and zero-copy (fast) paths are **wire-compatible**: a fast SEND
+reuses the same `urp_frame_encode` + `struct urp_stream` (SYN/seq) as the pump,
+so their frames are indistinguishable. Both directions were verified on hp1↔hp3
+over 25 GbE RoCEv2 (a fast endpoint on one host, a uds endpoint on the other):
+
+- **fast source → uds/copy sink** (the deployment-relevant direction — a
+  zero-copy producer feeding a legacy consumer): a uds acceptor reassembled a
+  fast sender's frames byte-exact (`BENCH_OK verify=full`, `reorder-drops = 0`).
+  Needs no special handling: the uds acceptor doesn't probe and the fast
+  initiator's own probe is gated off.
+- **uds/copy source → fast sink**: `BENCH_OK verify=full` both sides — but only
+  after two fixes.
+
+**Two issues surfaced on the uds→fast leg, both now handled:**
+
+1. **Probe-churn (fixed).** A uds *initiator* emits design-33 keepalive PINGs; a
+   pumpless fast *acceptor* can't answer them before its app finishes
+   REGISTER + arms recvs, so the initiator hit 3 missed PONGs (~1 s), declared a
+   silent drop, and re-dialed in a self-reinforcing loop — REGISTER against the
+   fast acceptor never stabilized (`-EIO`/`-ENOTCONN`). Fixed by a **peer-kind CM
+   handshake**: a fast endpoint advertises `kind=fast` in a `private_data`
+   trailer (appended after the optional PSK auth bytes, so uds↔uds and the auth
+   memcmp are byte-unchanged); the initiator reads it at ESTABLISHED and
+   **suppresses probing a fast peer** (whose liveness is RC + app-completion
+   driven). Confirmed on hardware: the initiator no longer demotes/re-dials. A
+   recv-path PONG answer (`urp_fast_rx_disposition`) is kept as defense-in-depth.
+2. **Recv-buffer sizing (a requirement, not a bug).** The uds pump coalesces
+   bench frames up to its `buffer_size`, so the fast consumer must donate recv
+   buffers at least that large; a fast recv posted with `sink_len` below the
+   incoming frame yields an IB **local length error**. In practice: size the
+   fast consumer's pool ≥ the uds peer's `buffer_size`.
+
+**Resolved follow-up (pre-existing, unrelated to interop):** with REGISTER now
+succeeding repeatedly on the fast acceptor, the fast REGISTER path tripped a
+`rwsem.h:81` WARN inside `pin_user_pages` (`urp_uring_cmd` → `__gup_longterm_locked`
+→ `find_vma`) — non-fatal (data flowed), but wrong. Root cause: the bare
+`pin_user_pages()` requires the caller to already hold `mmap_read_lock` — it does
+`mmap_assert_locked()` and walks the VMA tree without taking the lock itself. The
+REGISTER hook runs in io-wq issue context holding no such lock, so `find_vma`
+asserted "lock not held." **Fixed** by switching to `pin_user_pages_fast()`
+(`kernel/urp_cmd.c`), which manages `mmap_lock` internally (lockless fast path,
+slow-path fallback takes the lock) and is the same API io_uring uses to pin its
+own fixed buffers. `FOLL_LONGTERM | FOLL_WRITE` are preserved; pool page count
+(≤ 1 GiB / PAGE_SIZE) fits the `int nr_pages` argument.
+
 ## 34.6 The windowing function (designed; built in a later phase)
 
 > **Implementation-ready spec: [design 35](35-windowing-flow-control.md).** That

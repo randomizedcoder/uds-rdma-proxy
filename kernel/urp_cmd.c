@@ -6,7 +6,7 @@
  * ->uring_cmd. An aware application drives the zero-copy fast path over
  * IORING_OP_URING_CMD submissions on this fd:
  *
- *   URP_CMD_REGISTER    pin an app buffer pool once (pin_user_pages,
+ *   URP_CMD_REGISTER    pin an app buffer pool once (pin_user_pages_fast,
  *                       FOLL_LONGTERM) -- the "malloc at startup, then flat
  *                       memory pressure" phase the design centers on.
  *   URP_CMD_UNREGISTER  unpin it.
@@ -32,8 +32,8 @@
 
 /*
  * The fast-path char device leans on modern io_uring plumbing: the split-out
- * <linux/io_uring/cmd.h> header (6.7) and the 4-argument pin_user_pages (the
- * vmas parameter was dropped in 6.5). Gate the whole device on URP_FAST_ENABLED
+ * <linux/io_uring/cmd.h> header (6.7) and the 4-argument pin_user_pages_fast.
+ * Gate the whole device on URP_FAST_ENABLED
  * (urp.h) -- CONFIG_URP_FAST && >= 6.8 -- and stub the register/unregister hooks
  * otherwise (older LTS, or a deliberate CONFIG_URP_FAST=n build) so those
  * compile-only CI gates stay green and the zero-copy path can be excluded
@@ -522,9 +522,18 @@ static int urp_cmd_do_register(struct urp_cmd_ctx *ctx,
 	 * (FOLL_LONGTERM). FOLL_WRITE because RX buffers are DMA *write*
 	 * targets. Runs in the submitting task's mm; the io-wq punt below
 	 * keeps that true even when io_uring offloads this blocking op.
+	 *
+	 * pin_user_pages_fast(), not the bare pin_user_pages(): the latter
+	 * requires the caller to already hold mmap_read_lock -- it does
+	 * mmap_assert_locked() and walks the VMA tree (find_vma) without taking
+	 * the lock itself. We hold no such lock in this io-wq issue context, so
+	 * the plain variant trips a rwsem "lock not held" WARN in find_vma().
+	 * The _fast variant manages mmap_lock internally (lockless fast path,
+	 * slow-path fallback takes the lock) and is the same API io_uring uses
+	 * to pin its own fixed buffers. nr_pages <= 1 GiB/PAGE_SIZE fits int.
 	 */
-	pinned = pin_user_pages(reg.base, nr_pages,
-				FOLL_LONGTERM | FOLL_WRITE, pages);
+	pinned = pin_user_pages_fast(reg.base, (int)nr_pages,
+				     FOLL_LONGTERM | FOLL_WRITE, pages);
 	if (pinned < 0) {
 		ret = (int)pinned;
 		kvfree(pages);
@@ -695,6 +704,33 @@ static void urp_fast_read_header(struct urp_cmd_ctx *ctx, u32 buf_index, u8 *hdr
 }
 
 /*
+ * Copy @len bytes at in-buffer offset @off out of the app's pinned pages for
+ * buffer @buf_index -- the payload analogue of urp_fast_read_header, used to
+ * lift a small control-frame payload (e.g. a PROBE PING) out for in-kernel
+ * handling without disturbing the zero-copy data path. The buffer base is
+ * page-aligned and control payloads are tiny, so this stays within the first
+ * page in practice; the straddle path mirrors urp_fast_read_header for safety.
+ */
+static void urp_fast_read_at(struct urp_cmd_ctx *ctx, u32 buf_index,
+			     unsigned int off, void *dst, unsigned int len)
+{
+	u64 boff = (u64)buf_index * ctx->geom.buf_size + off;
+	unsigned long pg = boff >> PAGE_SHIFT;
+	unsigned int poff = offset_in_page(boff);
+	unsigned int n0 = min_t(unsigned int, len, PAGE_SIZE - poff);
+	void *k;
+
+	k = kmap_local_page(ctx->pages[pg]);
+	memcpy(dst, k + poff, n0);
+	kunmap_local(k);
+	if (n0 < len) {
+		k = kmap_local_page(ctx->pages[pg + 1]);
+		memcpy((u8 *)dst + n0, k, len - n0);
+		kunmap_local(k);
+	}
+}
+
+/*
  * Send completion (send CQ, IB_POLL_WORKQUEUE). Flip the buffer back to
  * APP_OWNED -- always, including the IB_WC_WR_FLUSH_ERR drain path, so a QP
  * teardown never strands a buffer or an io_uring request (mirrors
@@ -847,20 +883,64 @@ static void urp_fast_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 		/*
 		 * Decode + validate the header the peer wrote into the app page.
 		 * urp_classify_frame carries every length guard (design 27 27.8
-		 * #1). Only DATA frames deliver a payload to the app; a control /
-		 * probe / malformed frame yields no bytes (the fast path is
-		 * two-sided DATA -- design 31 D1 -- so these are not expected, but
-		 * are surfaced as an error rather than a bogus length).
+		 * #1). Only DATA frames deliver a payload to the app.
 		 */
 		urp_fast_read_header(ctx, op->buf_index, hdr);
 		action = urp_classify_frame(wc->byte_len, hdr, &dec);
-		if (action == URP_RX_DELIVER_STREAM ||
-		    action == URP_RX_DELIVER_LEGACY) {
+		switch (urp_fast_rx_disposition(action)) {
+		case URP_FAST_RX_DELIVER:
 			op->res = (s32)dec.payload_len;
 			op->stream_id = (u16)dec.stream_id;
-		} else {
+			break;
+		case URP_FAST_RX_PONG: {
+			/*
+			 * A fast endpoint has no pump, so the recv path itself
+			 * must keep the peer's liveness protocol alive: answer
+			 * the PROBE PING with a PONG. Design 33 requires an
+			 * acceptor to "answer PINGs with PONGs in the recv path"
+			 * regardless of kind -- without this a UDS-initiator peer
+			 * never sees a PONG, trips the missed-probe silent-drop
+			 * detector (URP_QP_MISS_THRESHOLD * URP_PROBE_INTERVAL_MS)
+			 * and re-dials in a loop, so REGISTER/SEND/RECV against a
+			 * fast acceptor never stabilizes. The kernel send pool is
+			 * allocated for fast endpoints too (only the SRQ is
+			 * gated), so urp_emit_pong_on works verbatim; lift the
+			 * 32-byte ping payload out of the app page to echo it.
+			 *
+			 * Hand the buffer back as a benign zero-length completion
+			 * (res = 0, below), NOT -EBADMSG: the app re-donates the
+			 * buffer, and a hard error would (correctly) abort a
+			 * well-behaved zero-copy consumer on a mere keepalive.
+			 */
+			u8 ping[URP_PING_PAYLOAD_SIZE];
+
+			urp_fast_read_at(ctx, op->buf_index,
+					 URP_FRAME_HEADER_SIZE, ping,
+					 sizeof(ping));
+			urp_emit_pong_on(ctx->ep, wc->qp, ping);
+			op->res = 0;
+			op->stream_id = 0;
+			break;
+		}
+		case URP_FAST_RX_ABSORB:
+			/*
+			 * Peer liveness/flow-control the fast app does not
+			 * consume (fast endpoints do not probe and use RC's own
+			 * backpressure, not pump credits). Absorb silently and
+			 * hand the buffer back empty so the app re-donates.
+			 */
+			op->res = 0;
+			op->stream_id = 0;
+			break;
+		case URP_FAST_RX_REJECT:
+		default:
+			/*
+			 * Genuinely malformed (DROP_SHORT / OVERSIZE /
+			 * PAYLOAD_OVERRUN / SHORT_PROBE): surface the error.
+			 */
 			op->res = -EBADMSG;
 			op->stream_id = 0;
+			break;
 		}
 	} else {
 		if (wc->status != IB_WC_WR_FLUSH_ERR)
