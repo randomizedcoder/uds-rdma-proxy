@@ -75,4 +75,46 @@ urp_should_unlink_listen_path(bool is_initiator, bool listen_path_set)
 	return is_initiator && listen_path_set;
 }
 
+/*
+ * gap #6 Phase 1: which ep->qps[] slot does an incoming CONNECT_REQUEST claim,
+ * and must that slot first be torn down?
+ *
+ * The acceptor originally used a monotonic CONNECT_REQUEST counter as the slot
+ * index. Under num_qps > 1 the initiator dials all QPs concurrently and each
+ * per-QP retry creates a *fresh* cm_id / CONNECT_REQUEST; the counter then ran
+ * past num_qps on surplus/reordered requests and rejected them -- a storm that
+ * never let all N QPs reach ESTABLISHED, so ep->connected never latched and the
+ * data path stayed dark.
+ *
+ * When @have_peer_index (the initiator advertised its qp_index in the wide
+ * private_data trailer, urp_conn_priv_build_qp), the slot is chosen by peer
+ * identity: a retry for QP k always resolves to slot k and tears down that
+ * slot's stale cm_id, instead of consuming a new counter value. @counter_index
+ * is the legacy fallback for a single-QP or old-build peer that sends no
+ * qp_index (there num_qps is 1, so index 0 is the only valid slot and a genuine
+ * surplus request is still correctly rejected).
+ *
+ * Pure: the caller supplies @slot_occupied (ep->qps[idx].cm_id != NULL) and,
+ * on URP_SLOT_REUSE, runs urp_qp_hard_teardown(ep, *out_index) before reusing.
+ * @out_index is written only when the decision is not URP_SLOT_REJECT.
+ */
+enum urp_slot_decision {
+	URP_SLOT_REJECT = 0,	/* index out of range -> rdma_reject */
+	URP_SLOT_FRESH,		/* slot empty -> create QP directly */
+	URP_SLOT_REUSE,		/* slot holds a stale cm_id -> teardown, then reuse */
+};
+
+static inline enum urp_slot_decision
+urp_acceptor_slot_decide(bool have_peer_index, unsigned int peer_qp_index,
+			 unsigned int counter_index, unsigned int num_qps,
+			 bool slot_occupied, unsigned int *out_index)
+{
+	unsigned int idx = have_peer_index ? peer_qp_index : counter_index;
+
+	if (idx >= num_qps)
+		return URP_SLOT_REJECT;
+	*out_index = idx;
+	return slot_occupied ? URP_SLOT_REUSE : URP_SLOT_FRESH;
+}
+
 #endif /* _URP_CONN_PLAN_H */

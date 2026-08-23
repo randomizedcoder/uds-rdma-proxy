@@ -270,6 +270,7 @@ void urp_connect_work_fn(struct work_struct *w)
 	struct urp_qp *qp = container_of(w, struct urp_qp, connect_work);
 	struct urp_endpoint *ep = qp->ep;
 	struct rdma_conn_param param = {};
+	u8 qp_priv[1 + URP_PSK_HASH_LEN + URP_CONN_PRIV_QP_TRAILER_LEN];
 	int ret;
 
 	param.responder_resources = 1;
@@ -277,13 +278,30 @@ void urp_connect_work_fn(struct work_struct *w)
 	param.retry_count = 7;
 	param.rnr_retry_count = 7;
 	/*
-	 * Phase 3b Step 8 + design 31 D1: private_data = ep->conn_priv = optional
-	 * PSK auth (acceptor memcmp's it, rdma_reject's on mismatch) + a kind
-	 * trailer only when we are fast. conn_priv_len is 0 for a no-password uds
-	 * endpoint, so we send no private_data at all -- byte-identical to the
-	 * pre-interop wire. An old acceptor checks only the leading auth bytes.
+	 * Phase 3b Step 8 + design 31 D1: private_data = optional PSK auth
+	 * (acceptor memcmp's it, rdma_reject's on mismatch) + a trailer.
+	 *
+	 * gap #6 Phase 1: when num_qps > 1, append the WIDE trailer stamping this
+	 * QP's index (urp_conn_priv_build_qp) so the acceptor allocates its
+	 * ep->qps[] slot by identity instead of a monotonic counter -- the fix for
+	 * the multi-QP connect retry storm. The auth prefix is copied from the
+	 * shared ep->conn_priv so a fixed-offset PSK memcmp is unchanged. A plain
+	 * uds endpoint sends this too (it sent nothing before): safe, because a
+	 * no-password acceptor never inspects private_data for auth, and both peers
+	 * run this build for any multi-QP config.
+	 *
+	 * Single-QP / legacy keeps the EXACT pre-gap#6 wire: ep->conn_priv (auth +
+	 * optional kind trailer), or nothing at all for a no-password uds endpoint
+	 * (conn_priv_len == 0) -- byte-identical to the pre-interop wire.
 	 */
-	if (ep->conn_priv_len) {
+	if (ep->num_qps > 1) {
+		if (ep->auth_len)
+			memcpy(qp_priv, ep->conn_priv, ep->auth_len);
+		param.private_data = qp_priv;
+		param.private_data_len =
+			urp_conn_priv_build_qp(qp_priv, ep->auth_len, ep->kind,
+					       (u8)qp->index);
+	} else if (ep->conn_priv_len) {
 		param.private_data = ep->conn_priv;
 		param.private_data_len = ep->conn_priv_len;
 	}
@@ -850,13 +868,70 @@ static int urp_cm_accept_one(struct rdma_cm_id *child, struct urp_endpoint *ep,
 		}
 	}
 
-	qp_index = (u32)atomic_inc_return(&ep->qps_accepted) - 1;
-	if (qp_index >= ep->num_qps) {
-		atomic_dec(&ep->qps_accepted);
-		pr_warn("rejecting extra CONNECT_REQUEST (%u >= %u QPs)\n",
-			qp_index, ep->num_qps);
-		rdma_reject(child, NULL, 0, 0);
-		return 0;
+	/*
+	 * gap #6 Phase 1: choose the target ep->qps[] slot by the initiator's
+	 * advertised QP identity (the wide private_data trailer) when num_qps > 1,
+	 * so a per-QP connect retry always reclaims its own slot instead of
+	 * running the monotonic qps_accepted counter past num_qps -- the reject
+	 * storm that kept multi-QP endpoints from ever reaching all-N ESTABLISHED
+	 * (ep->connected is gated on qps_connected == num_qps and never latched).
+	 * A single-QP or old-build peer (no qp_index trailer) falls back to the
+	 * legacy counter. urp_acceptor_slot_decide() (urp_conn_plan.h) is the pure,
+	 * KUnit- + sandbox-tested decision; qps_accepted stays the held-slot count.
+	 */
+	{
+		u8 peer_qp_index = 0;
+		bool have_peer_index = ep->num_qps > 1 &&
+			urp_conn_priv_peer_qp_index(peer_priv, peer_priv_len,
+						    ep->auth_len, &peer_qp_index);
+		u32 counter_index = (u32)atomic_read(&ep->qps_accepted);
+		u32 probe = have_peer_index ? peer_qp_index : counter_index;
+		bool occupied = probe < ep->num_qps &&
+				ep->qps[probe].accept_slot_held;
+		enum urp_slot_decision decision =
+			urp_acceptor_slot_decide(have_peer_index, peer_qp_index,
+						 counter_index, ep->num_qps,
+						 occupied, &qp_index);
+
+		if (decision == URP_SLOT_REJECT) {
+			pr_warn("rejecting CONNECT_REQUEST: %s slot %u >= %u QPs\n",
+				have_peer_index ? "peer" : "counter",
+				have_peer_index ? peer_qp_index : counter_index,
+				ep->num_qps);
+			rdma_reject(child, NULL, 0, 0);
+			return 0;
+		}
+		if (decision == URP_SLOT_REUSE) {
+			/*
+			 * The identity slot still holds a prior child whose CM
+			 * teardown has not run (the retry-storm case). Release its
+			 * accounting now; the dangling cm_id + ctx are destroyed by
+			 * the urp_qp_hard_teardown() below, and rdma_destroy_id()
+			 * there drains any in-flight handler, so no stale teardown
+			 * event can double-release this slot afterward. We must do
+			 * the release here BECAUSE that drained teardown will never
+			 * run: mirror both the qps_connected demotion (else the new
+			 * child's ESTABLISHED double-counts and the all-N latch is
+			 * corrupted) and the qps_accepted slot release.
+			 */
+			if (ep->qps[qp_index].established) {
+				ep->qps[qp_index].established = false;
+				atomic_dec(&ep->qps_connected);
+				if ((u32)atomic_read(&ep->qps_connected) <
+					    ep->num_qps && ep->connected) {
+					ep->connected = false;
+					reinit_completion(&ep->cm_done);
+				}
+			}
+			ep->qps[qp_index].accept_slot_held = false;
+			atomic_dec(&ep->qps_accepted);
+		}
+		/*
+		 * Claim the slot. Paired with the release on CM teardown
+		 * (urp_acceptor_should_release_slot) or the synchronous
+		 * err_release_slot dec below -- exactly one fires per accept.
+		 */
+		atomic_inc(&ep->qps_accepted);
 	}
 
 	ret = urp_endpoint_setup_shared(ep, child->device);

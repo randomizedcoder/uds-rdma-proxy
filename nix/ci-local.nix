@@ -36,6 +36,7 @@ let
     { name = "urp-control-tests"; drv = checks.urp-control-tests; }
     { name = "urp-fast-validate-units"; drv = checks.urp-fast-validate-units; }
     { name = "urp-reorder-units"; drv = checks.urp-reorder-units; }
+    { name = "urp-conn-slot-units"; drv = checks.urp-conn-slot-units; }
     { name = "kernel-module-build"; drv = checks.kernel-module-build; }
     { name = "urp-ko-6_1"; drv = checks.urp-ko-6_1; }
     { name = "urp-ko-6_6"; drv = checks.urp-ko-6_6; }

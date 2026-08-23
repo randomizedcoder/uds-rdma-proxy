@@ -337,6 +337,38 @@ in
     '';
   };
 
+  # urp acceptor QP-slot decision table tests (status.md gap #6 Phase 1).
+  # Compiles the pure predicate kernel/urp_conn_plan.h ::
+  # urp_acceptor_slot_decide in its userspace form and drives the same case
+  # table the in-kernel KUnit suite runs: identity allocation, out-of-range
+  # rejects, num_qps==1 / max-index boundaries, occupied-slot reuse, and the
+  # legacy counter fallback. Fast sandboxed gate; KUnit re-runs the decision
+  # in-VM. The two must always agree. Pure arithmetic -- no RDMA/rbtree/alloc.
+  urp-conn-slot-units = pkgs.stdenv.mkDerivation {
+    name = "urp-conn-slot-units";
+    src = pkgs.lib.fileset.toSource {
+      root = ../.;
+      fileset = pkgs.lib.fileset.unions [
+        ../kernel/urp_conn_plan.h
+        ../kernel/include/uapi/linux/urp.h
+        ../tools/urp-conn-slot-units.c
+      ];
+    };
+    buildPhase = ''
+      $CC -Wall -Wextra -Werror -O2 -I kernel -I kernel/include/uapi \
+        -o urp-conn-slot-units \
+        tools/urp-conn-slot-units.c
+    '';
+    doCheck = true;
+    checkPhase = ''
+      ./urp-conn-slot-units
+    '';
+    installPhase = ''
+      mkdir -p $out
+      touch $out/passed
+    '';
+  };
+
   # NOTE: miri requires network access to build its sysroot (fetches cfg-if for std).
   # This is incompatible with Nix's sandbox. Run miri via devshell instead:
   #   nix develop --command cargo miri test -p uds-rdma-protocol

@@ -786,6 +786,54 @@ static void test_conn_priv_kind_trailer(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, urp_conn_priv_peer_kind(buf, 3, 0, &kind));
 }
 
+/*
+ * gap #6 Phase 1: the wide [MAGIC0][MAGIC1][kind][qp_index] trailer the
+ * initiator appends when num_qps > 1. It must round-trip the qp_index, stay a
+ * valid kind trailer (prefix compat), and the reader must reject the narrow
+ * 3-byte trailer / absent / corrupt cases so the acceptor falls back cleanly.
+ */
+static void test_conn_priv_qp_trailer(struct kunit *test)
+{
+	u8 buf[64];
+	u8 kind;
+	u8 qp_index;
+
+	/* No auth: wide trailer at offset 0, len 4, round-trips qp_index. */
+	memset(buf, 0, sizeof(buf));
+	KUNIT_EXPECT_EQ(test,
+			urp_conn_priv_build_qp(buf, 0, URP_EP_KIND_UDS, 7), 4);
+	KUNIT_EXPECT_TRUE(test, urp_conn_priv_peer_qp_index(buf, 4, 0, &qp_index));
+	KUNIT_EXPECT_EQ(test, qp_index, (u8)7);
+	/* Prefix compat: still a valid kind trailer. */
+	KUNIT_EXPECT_TRUE(test, urp_conn_priv_peer_kind(buf, 4, 0, &kind));
+	KUNIT_EXPECT_EQ(test, kind, (u8)URP_EP_KIND_UDS);
+
+	/* 33-byte auth: wide trailer at offset 33; auth + max index preserved. */
+	memset(buf, 0xAB, 33);
+	KUNIT_EXPECT_EQ(test,
+			urp_conn_priv_build_qp(buf, 33, URP_EP_KIND_FAST,
+					       URP_NUM_QPS_MAX - 1), 37);
+	KUNIT_EXPECT_EQ(test, buf[0], (u8)0xAB);
+	KUNIT_EXPECT_EQ(test, buf[32], (u8)0xAB);
+	KUNIT_EXPECT_TRUE(test,
+			  urp_conn_priv_peer_qp_index(buf, 37, 33, &qp_index));
+	KUNIT_EXPECT_EQ(test, qp_index, (u8)(URP_NUM_QPS_MAX - 1));
+
+	/* Narrow 3-byte (kind-only) trailer => no qp_index (fallback). */
+	qp_index = 0xEE;
+	memset(buf, 0, sizeof(buf));
+	urp_conn_priv_build(buf, 0, URP_EP_KIND_UDS);
+	KUNIT_EXPECT_FALSE(test, urp_conn_priv_peer_qp_index(buf, 3, 0, &qp_index));
+
+	/* Truncated / null / corrupt magic => no qp_index. */
+	KUNIT_EXPECT_FALSE(test, urp_conn_priv_peer_qp_index(NULL, 0, 0, &qp_index));
+	memset(buf, 0, sizeof(buf));
+	urp_conn_priv_build_qp(buf, 0, URP_EP_KIND_UDS, 3);
+	KUNIT_EXPECT_FALSE(test, urp_conn_priv_peer_qp_index(buf, 3, 0, &qp_index));
+	buf[0] = 0x00;
+	KUNIT_EXPECT_FALSE(test, urp_conn_priv_peer_qp_index(buf, 4, 0, &qp_index));
+}
+
 /* ---- Buffer-geometry resolver tests (design 29 Gap 2) ---- */
 
 /*
@@ -1182,6 +1230,60 @@ static void test_acceptor_should_release_slot(struct kunit *test)
 }
 
 /*
+ * gap #6 Phase 1: acceptor QP-slot allocation decision. Mirrors the userspace
+ * table in tools/urp-conn-slot-units.c (nix check urp-conn-slot-units) -- one
+ * predicate, two drivers. Identity allocation kills the retry storm (a retry
+ * for QP k reclaims slot k, not the next counter value); out-of-range indices
+ * reject; the counter is the single-QP / old-peer fallback.
+ */
+static void test_acceptor_slot_decide(struct kunit *test)
+{
+	static const struct {
+		const char		*name;
+		bool			have_peer_index;
+		unsigned int		peer_qp_index;
+		unsigned int		counter_index;
+		unsigned int		num_qps;
+		bool			slot_occupied;
+		enum urp_slot_decision	want;
+		unsigned int		want_index;
+	} cases[] = {
+		{ "id_first_empty",     true, 0, 0, 8,  false, URP_SLOT_FRESH,  0 },
+		{ "id_mid_occupied",    true, 3, 0, 8,  true,  URP_SLOT_REUSE,  3 },
+		{ "id_ignores_counter", true, 2, 6, 8,  false, URP_SLOT_FRESH,  2 },
+		{ "id_eq_num_qps",      true, 8, 0, 8,  false, URP_SLOT_REJECT, 0 },
+		{ "id_single_qp_bad",   true, 31, 0, 1, false, URP_SLOT_REJECT, 0 },
+		{ "id_max_qps_ok",      true, 31, 0, 32, false, URP_SLOT_FRESH, 31 },
+		{ "id_max_qps_bad",     true, 32, 0, 32, false, URP_SLOT_REJECT, 0 },
+		{ "ctr_first_reuse",    false, 0, 0, 1, true,  URP_SLOT_REUSE,  0 },
+		{ "ctr_surplus_single", false, 0, 1, 1, false, URP_SLOT_REJECT, 0 },
+		{ "ctr_multi_resolves", false, 0, 3, 8, false, URP_SLOT_FRESH,  3 },
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		unsigned int out = 0xDEADu;
+		enum urp_slot_decision got;
+
+		got = urp_acceptor_slot_decide(cases[i].have_peer_index,
+					       cases[i].peer_qp_index,
+					       cases[i].counter_index,
+					       cases[i].num_qps,
+					       cases[i].slot_occupied, &out);
+
+		KUNIT_EXPECT_EQ_MSG(test, (int)got, (int)cases[i].want,
+				    "%s: decision", cases[i].name);
+		if (cases[i].want == URP_SLOT_REJECT)
+			KUNIT_EXPECT_EQ_MSG(test, out, 0xDEADu,
+					    "%s: out_index untouched on reject",
+					    cases[i].name);
+		else
+			KUNIT_EXPECT_EQ_MSG(test, out, cases[i].want_index,
+					    "%s: out_index", cases[i].name);
+	}
+}
+
+/*
  * design 33 Bug 2: stale UDS listen-socket unlink decision.
  *
  * Only the initiator binds a pathname listen socket, and the node must be
@@ -1421,12 +1523,16 @@ static struct kunit_case urp_test_cases[] = {
 	KUNIT_CASE(test_classify_frame),
 	KUNIT_CASE(test_fast_rx_disposition),
 	KUNIT_CASE(test_conn_priv_kind_trailer),
+	/* gap #6 Phase 1: initiator qp_index trailer (num_qps > 1) */
+	KUNIT_CASE(test_conn_priv_qp_trailer),
 	/* design 32: acceptor connection plan (eager-connect gate) */
 	KUNIT_CASE(test_acceptor_eager_connect),
 	/* design 32: credit-grant routing (per-stream vs per-QP pool) */
 	KUNIT_CASE(test_credit_grant_routing),
 	/* design 33 Bug 1: acceptor QP-slot release on any teardown */
 	KUNIT_CASE(test_acceptor_should_release_slot),
+	/* gap #6 Phase 1: acceptor QP-slot identity allocation */
+	KUNIT_CASE(test_acceptor_slot_decide),
 	/* design 33 Bug 2: stale UDS listen-socket unlink decision */
 	KUNIT_CASE(test_should_unlink_listen_path),
 	/* design 33 Phase 1: initiator connect-retry eligibility + backoff */
