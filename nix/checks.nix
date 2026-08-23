@@ -291,6 +291,52 @@ in
     '';
   };
 
+  # urp reorder buffer table tests (status.md gap #1). Compiles the REAL
+  # default C rbtree backend (kernel/urp_reorder.c) against the kernel's own
+  # userspace rbtree (tools/lib/rbtree.c, extracted from the nixpkgs-pinned
+  # kernel source -- narHash-secured, not vendored) and drives the SHARED
+  # op-script table (kernel/urp_reorder_cases.h) that the in-kernel KUnit suite
+  # also runs: positive / negative / boundary / corner scenarios plus the two
+  # -ENOMEM paths reachable via the allocator shim. This is the fast sandboxed
+  # gate; KUnit re-runs the same table in-VM. The two must always agree.
+  # ASAN/UBSan cover the real rbtree usage and the kmalloc(sizeof + len) add.
+  urp-reorder-units = pkgs.stdenv.mkDerivation {
+    name = "urp-reorder-units";
+    src = pkgs.lib.fileset.toSource {
+      root = ../.;
+      fileset = pkgs.lib.fileset.unions [
+        ../kernel/urp_reorder.c
+        ../kernel/urp_reorder.h
+        ../kernel/urp_reorder_cases.h
+        ../tools/urp-reorder-units.c
+      ];
+    };
+    nativeBuildInputs = [ pkgs.clang pkgs.gnutar pkgs.xz ];
+    buildPhase = ''
+      runHook preBuild
+      # Pull the kernel's userspace rbtree from the pinned source tarball.
+      mkdir -p ksrc
+      tar xf ${pkgs.linuxPackages_latest.kernel.src} --strip-components=1 -C ksrc \
+        --wildcards '*/tools/lib/rbtree.c' '*/tools/include/*'
+      clang -g -O1 -std=gnu11 \
+        -fsanitize=address,undefined -fno-omit-frame-pointer \
+        -Wall -Wextra \
+        -DU64_MAX=0xffffffffffffffffULL \
+        -I ksrc/tools/include -I kernel \
+        tools/urp-reorder-units.c kernel/urp_reorder.c ksrc/tools/lib/rbtree.c \
+        -o urp-reorder-units
+      runHook postBuild
+    '';
+    doCheck = true;
+    checkPhase = ''
+      ./urp-reorder-units
+    '';
+    installPhase = ''
+      mkdir -p $out
+      touch $out/passed
+    '';
+  };
+
   # NOTE: miri requires network access to build its sysroot (fetches cfg-if for std).
   # This is incompatible with Nix's sandbox. Run miri via devshell instead:
   #   nix develop --command cargo miri test -p uds-rdma-protocol

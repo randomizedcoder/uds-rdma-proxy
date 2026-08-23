@@ -92,6 +92,9 @@
         # One-way bulk-throughput runner (design 34): sink-measured goodput +
         # iperf2/ib_write_bw baselines. `nix run .#urp-bw-matrix`.
         urpBwMatrix = import ./nix/urp-bw-matrix.nix { inherit pkgs; };
+        # Multi-QP reorder validation (status.md gap #1): sweep num_qps, assert
+        # reorder-insertions>0 + byte-exact delivery. `nix run .#urp-reorder-matrix`.
+        urpReorderMatrix = import ./nix/urp-reorder-matrix.nix { inherit pkgs; };
         # Zero-copy fast-path twins of the two matrices above (design 31 PR5b):
         # dedicated `--kind fast` endpoint pair, `urp-bench --mode uring-cmd`.
         #   .#urp-fast-bw-matrix (goodput), .#urp-fast-hw-matrix (RTT).
@@ -206,7 +209,7 @@
           inherit (nixChecks)
             protocol-tests urp-bench-units urp-bench-rs-tests
             urp-netlink-tests urp-control-tests
-            urp-fast-validate-units
+            urp-fast-validate-units urp-reorder-units
             kernel-module-build
             urp-ko-6_1 urp-ko-6_6 urp-ko-6_12;
         };
@@ -230,6 +233,9 @@
           # Bulk-throughput sweep (design 34):
           #   nix run .#urp-bw-matrix -- <acceptor> <initiator> <acceptor-ip>
           urp-bw-matrix = urpBwMatrix;
+          # Multi-QP reorder validation over RoCEv2 (status gap #1; needs boxes):
+          #   nix run .#urp-reorder-matrix -- <acceptor> <initiator> <acceptor-ip>
+          urp-reorder-matrix = urpReorderMatrix;
           # Zero-copy fast-path twins (design 31 PR5b; needs the boxes):
           #   nix run .#urp-fast-bw-matrix -- <acceptor> <initiator> <acceptor-ip>
           #   nix run .#urp-fast-hw-matrix -- <acceptor> <initiator> <acceptor-ip>

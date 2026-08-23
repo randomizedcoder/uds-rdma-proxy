@@ -15,6 +15,7 @@
 #include "urp_retry_plan.h"
 #include "urp_lazy_plan.h"
 #include "include/uapi/linux/urp_cmd.h"
+#include "urp_reorder_cases.h"
 
 /* ---- Frame codec tests ---- */
 
@@ -307,135 +308,152 @@ static void test_credit_initial_zero(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cs.send_credits, (u16)0);
 }
 
-/* ---- Reorder buffer tests (Phase 3a Step 9; mirrors the 8 Rust
- *      uds_rdma_protocol::reorder unit tests against the C backend) ----
+/* ---- Reorder buffer tests (Phase 3a Step 9; mirrors the Rust
+ *      uds_rdma_protocol::reorder unit tests against the C backend).
+ *      Table-driven: positive / negative / boundary / corner coverage of
+ *      every urp_reorder.c return path. The userspace twin lives in
+ *      tools/urp-reorder-units.c (nix check urp-reorder-units) -- the two
+ *      case sets must stay in lock-step. ----
  */
 
-static void test_reorder_in_order(struct kunit *test)
+/*
+ * The op-script types (enum rop_kind, struct rop, struct reorder_scenario)
+ * and the urp_reorder_scenarios[] table live in urp_reorder_cases.h, shared
+ * verbatim with the userspace units check. This driver is the in-kernel half.
+ */
+static void run_reorder_scenario(struct kunit *test,
+				 const struct reorder_scenario *sc)
 {
-	struct urp_reorder *rb = urp_reorder_alloc(0, 64);
-	u8 payload[8];
-	u64 seq;
-	size_t len;
-	u32 i;
+	struct urp_reorder *rb = urp_reorder_alloc(sc->initial, sc->max_buffered);
+	u8 buf[64];
+	u8 pat[64];
+	u32 j, i;
 
 	KUNIT_ASSERT_NOT_NULL(test, rb);
 
-	for (i = 0; i < 3; i++) {
-		u8 b = (u8)i;
+	for (j = 0; sc->ops[j].kind != ROP_END; j++) {
+		const struct rop *op = &sc->ops[j];
+		u64 seq = 0;
+		size_t len;
+		int ret;
 
-		KUNIT_EXPECT_EQ(test, urp_reorder_insert(rb, i, &b, 1), 0);
-		len = sizeof(payload);
-		KUNIT_EXPECT_EQ(test, urp_reorder_drain_next(rb, &seq, payload, &len), 0);
-		KUNIT_EXPECT_EQ(test, seq, (u64)i);
-		KUNIT_EXPECT_EQ(test, len, (size_t)1);
-		KUNIT_EXPECT_EQ(test, payload[0], (u8)i);
+		switch (op->kind) {
+		case ROP_INSERT:
+			for (i = 0; i < op->len; i++)
+				pat[i] = (u8)(op->seq + i);
+			ret = urp_reorder_insert(rb, op->seq,
+						 op->len ? pat : NULL, op->len);
+			KUNIT_EXPECT_EQ_MSG(test, ret, op->want_ret,
+					    "%s op %u: insert seq=%llu",
+					    sc->name, j, op->seq);
+			break;
+		case ROP_DRAIN:
+			len = op->bufsz ? op->bufsz : sizeof(buf);
+			ret = urp_reorder_drain_next(rb, &seq, buf, &len);
+			KUNIT_EXPECT_EQ_MSG(test, ret, op->want_ret,
+					    "%s op %u: drain", sc->name, j);
+			if (op->want_ret == 0) {
+				KUNIT_EXPECT_EQ_MSG(test, seq, op->seq,
+						    "%s op %u: drained seq",
+						    sc->name, j);
+				KUNIT_EXPECT_EQ_MSG(test, len, (size_t)op->len,
+						    "%s op %u: drained len",
+						    sc->name, j);
+				for (i = 0; i < op->len; i++)
+					KUNIT_EXPECT_EQ_MSG(test, buf[i],
+							    (u8)(op->seq + i),
+							    "%s op %u: byte %u",
+							    sc->name, j, i);
+			} else if (op->want_ret == -ENOBUFS) {
+				KUNIT_EXPECT_EQ_MSG(test, len, (size_t)op->len,
+						    "%s op %u: required size",
+						    sc->name, j);
+			}
+			break;
+		case ROP_EXP_NEXT:
+			KUNIT_EXPECT_EQ_MSG(test, urp_reorder_next_expected(rb),
+					    op->seq, "%s op %u: next_expected",
+					    sc->name, j);
+			break;
+		case ROP_EXP_GAP:
+			KUNIT_EXPECT_EQ_MSG(test, urp_reorder_gap_count(rb),
+					    (size_t)op->seq, "%s op %u: gap_count",
+					    sc->name, j);
+			break;
+		case ROP_EXP_DRAINPEND:
+			KUNIT_EXPECT_EQ_MSG(test, urp_reorder_drain_pending(rb),
+					    (size_t)op->seq,
+					    "%s op %u: drain_pending", sc->name, j);
+			break;
+		default:
+			break;
+		}
 	}
-	KUNIT_EXPECT_EQ(test, urp_reorder_next_expected(rb), (u64)3);
-
-	urp_reorder_free(rb);
-}
-
-static void test_reorder_out_of_order(struct kunit *test)
-{
-	struct urp_reorder *rb = urp_reorder_alloc(0, 64);
-	u8 payload[8];
-	u8 b;
-	u64 seq;
-	size_t len = sizeof(payload);
-
-	KUNIT_ASSERT_NOT_NULL(test, rb);
-
-	/* Insert seq 2 first -- buffered, no drain */
-	b = 2;
-	KUNIT_EXPECT_EQ(test, urp_reorder_insert(rb, 2, &b, 1), 0);
-	KUNIT_EXPECT_EQ(test, urp_reorder_drain_next(rb, &seq, payload, &len), -ENOENT);
-	KUNIT_EXPECT_EQ(test, urp_reorder_gap_count(rb), (size_t)1);
-
-	/* Insert seq 0 -- drains immediately */
-	b = 0;
-	KUNIT_EXPECT_EQ(test, urp_reorder_insert(rb, 0, &b, 1), 0);
-	len = sizeof(payload);
-	KUNIT_EXPECT_EQ(test, urp_reorder_drain_next(rb, &seq, payload, &len), 0);
-	KUNIT_EXPECT_EQ(test, seq, (u64)0);
-
-	/* Insert seq 1 -- drains 1 then 2 */
-	b = 1;
-	KUNIT_EXPECT_EQ(test, urp_reorder_insert(rb, 1, &b, 1), 0);
-	len = sizeof(payload);
-	KUNIT_EXPECT_EQ(test, urp_reorder_drain_next(rb, &seq, payload, &len), 0);
-	KUNIT_EXPECT_EQ(test, seq, (u64)1);
-	len = sizeof(payload);
-	KUNIT_EXPECT_EQ(test, urp_reorder_drain_next(rb, &seq, payload, &len), 0);
-	KUNIT_EXPECT_EQ(test, seq, (u64)2);
-	KUNIT_EXPECT_EQ(test, urp_reorder_next_expected(rb), (u64)3);
-
-	urp_reorder_free(rb);
-}
-
-static void test_reorder_duplicate(struct kunit *test)
-{
-	struct urp_reorder *rb = urp_reorder_alloc(0, 64);
-	u8 b = 2;
-
-	KUNIT_ASSERT_NOT_NULL(test, rb);
-
-	KUNIT_EXPECT_EQ(test, urp_reorder_insert(rb, 2, &b, 1), 0);
-	KUNIT_EXPECT_EQ(test, urp_reorder_insert(rb, 2, &b, 1), -EEXIST);
-
-	urp_reorder_free(rb);
-}
-
-static void test_reorder_already_delivered(struct kunit *test)
-{
-	struct urp_reorder *rb = urp_reorder_alloc(0, 64);
-	u8 b = 0;
-	u8 payload[4];
-	u64 seq;
-	size_t len = sizeof(payload);
-
-	KUNIT_ASSERT_NOT_NULL(test, rb);
-	urp_reorder_insert(rb, 0, &b, 1);
-	urp_reorder_drain_next(rb, &seq, payload, &len);
-	/* Inserting seq 0 again should be rejected as duplicate */
-	KUNIT_EXPECT_EQ(test, urp_reorder_insert(rb, 0, &b, 1), -EEXIST);
-
-	urp_reorder_free(rb);
-}
-
-static void test_reorder_buffer_full(struct kunit *test)
-{
-	struct urp_reorder *rb = urp_reorder_alloc(0, 2);
-	u8 b;
-
-	KUNIT_ASSERT_NOT_NULL(test, rb);
-	b = 2; urp_reorder_insert(rb, 2, &b, 1);
-	b = 3; urp_reorder_insert(rb, 3, &b, 1);
-	b = 4;
-	KUNIT_EXPECT_EQ(test, urp_reorder_insert(rb, 4, &b, 1), -ENOBUFS);
-	/* But the in-order seq still works (drains immediately) */
-	b = 0;
-	KUNIT_EXPECT_EQ(test, urp_reorder_insert(rb, 0, &b, 1), 0);
 
 	urp_reorder_free(rb);
 }
 
 /*
- * Regression (C twin of the Rust reorder_ops fuzz find): delivering the
- * frame at the top of the sequence space must saturate next_expected at
- * U64_MAX rather than overflow. The Rust twin overflow-panics -> BUG();
- * the C twin must not wrap to 0.
+ * Positive / boundary / corner scenarios expressed as op-scripts. Folds the
+ * former one-scenario-per-function tests (in_order, out_of_order, duplicate,
+ * already_delivered, buffer_full, seq_saturates) in as named rows and adds
+ * the previously-uncovered paths: deep out-of-order, drain_pending
+ * accounting, initial_expected != 0, zero-length payloads, max_buffered == 1,
+ * full-then-relieve backpressure, and the drain size-probe.
  */
-static void test_reorder_seq_saturates(struct kunit *test)
+static void test_reorder_scenarios(struct kunit *test)
 {
-	struct urp_reorder *rb = urp_reorder_alloc(U64_MAX, 16);
+	u32 s;
+
+	for (s = 0; s < ARRAY_SIZE(urp_reorder_scenarios); s++)
+		run_reorder_scenario(test, &urp_reorder_scenarios[s]);
+}
+
+/*
+ * Argument / boundary guards that are single calls rather than op-scripts:
+ * NULL handles, NULL data with non-zero length, empty-queue drain,
+ * max_buffered == 0, and NULL-handle accessors.
+ */
+static void test_reorder_arg_guards(struct kunit *test)
+{
+	struct urp_reorder *rb = urp_reorder_alloc(0, 64);
 	u8 b = 0xAB;
+	u8 buf[8];
+	u64 seq;
+	size_t len;
 
 	KUNIT_ASSERT_NOT_NULL(test, rb);
-	KUNIT_EXPECT_EQ(test, urp_reorder_insert(rb, U64_MAX, &b, 1), 0);
-	KUNIT_EXPECT_EQ(test, urp_reorder_next_expected(rb), U64_MAX);
+
+	/* insert guards */
+	KUNIT_EXPECT_EQ(test, urp_reorder_insert(NULL, 0, &b, 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, urp_reorder_insert(rb, 0, NULL, 1), -EINVAL);
+
+	/* drain guards */
+	len = sizeof(buf);
+	KUNIT_EXPECT_EQ(test, urp_reorder_drain_next(NULL, &seq, buf, &len), -EINVAL);
+	KUNIT_EXPECT_EQ(test, urp_reorder_drain_next(rb, NULL, buf, &len), -EINVAL);
+	KUNIT_EXPECT_EQ(test, urp_reorder_drain_next(rb, &seq, buf, NULL), -EINVAL);
+	len = sizeof(buf);	/* *inout_len > 0 with NULL out_data */
+	KUNIT_EXPECT_EQ(test, urp_reorder_drain_next(rb, &seq, NULL, &len), -EINVAL);
+	/* empty drain queue */
+	len = sizeof(buf);
+	KUNIT_EXPECT_EQ(test, urp_reorder_drain_next(rb, &seq, buf, &len), -ENOENT);
 
 	urp_reorder_free(rb);
+
+	/* alloc(_, 0) is rejected (KUNIT_EXPECT_TRUE for portability across the
+	 * 6.1--7.x range; KUNIT_EXPECT_NULL is 6.5+). free() is NULL-safe. */
+	{
+		struct urp_reorder *nrb = urp_reorder_alloc(0, 0);
+
+		KUNIT_EXPECT_TRUE(test, nrb == NULL);
+		urp_reorder_free(nrb);
+	}
+
+	/* NULL-handle accessors are safe and return 0 */
+	KUNIT_EXPECT_EQ(test, urp_reorder_next_expected(NULL), (u64)0);
+	KUNIT_EXPECT_EQ(test, urp_reorder_gap_count(NULL), (size_t)0);
+	KUNIT_EXPECT_EQ(test, urp_reorder_drain_pending(NULL), (size_t)0);
 }
 
 /* ---- QP round-robin selection tests (Phase 3a Step 9) ---- */
@@ -1388,12 +1406,8 @@ static struct kunit_case urp_test_cases[] = {
 	KUNIT_CASE(test_credit_take_grants_resets),
 	KUNIT_CASE(test_credit_initial_one),
 	KUNIT_CASE(test_credit_initial_zero),
-	KUNIT_CASE(test_reorder_in_order),
-	KUNIT_CASE(test_reorder_out_of_order),
-	KUNIT_CASE(test_reorder_duplicate),
-	KUNIT_CASE(test_reorder_already_delivered),
-	KUNIT_CASE(test_reorder_buffer_full),
-	KUNIT_CASE(test_reorder_seq_saturates),
+	KUNIT_CASE(test_reorder_arg_guards),
+	KUNIT_CASE(test_reorder_scenarios),
 	KUNIT_CASE(test_qp_select_round_robin_determinism),
 	KUNIT_CASE(test_qp_select_skips_unestablished),
 	KUNIT_CASE(test_qp_select_returns_null_when_none_ready),

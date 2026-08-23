@@ -3,7 +3,7 @@
 #
 # ci.yml has two jobs; this target reproduces both faithfully:
 #
-#   nix-checks   -- 11 pure `nix build` targets (shared-crate tests, urp-cli,
+#   nix-checks   -- 12 pure `nix build` targets (shared-crate tests, urp-cli,
 #                   the two urp-bench cores, the urp-netlink lib tests, the
 #                   urp-control control-plane tests, the urp-fast validators,
 #                   and the 4-kernel module matrix). Here
@@ -25,7 +25,7 @@
 { pkgs, checks, urpCli, fuzz }:
 
 let
-  # The eleven build targets of the ci.yml `nix-checks` job, in the same order.
+  # The twelve build targets of the ci.yml `nix-checks` job, in the same order.
   # Referenced from the script text below so each is a realised dependency.
   buildTargets = [
     { name = "protocol-tests"; drv = checks.protocol-tests; }
@@ -35,6 +35,7 @@ let
     { name = "urp-netlink-tests"; drv = checks.urp-netlink-tests; }
     { name = "urp-control-tests"; drv = checks.urp-control-tests; }
     { name = "urp-fast-validate-units"; drv = checks.urp-fast-validate-units; }
+    { name = "urp-reorder-units"; drv = checks.urp-reorder-units; }
     { name = "kernel-module-build"; drv = checks.kernel-module-build; }
     { name = "urp-ko-6_1"; drv = checks.urp-ko-6_1; }
     { name = "urp-ko-6_6"; drv = checks.urp-ko-6_6; }
@@ -70,10 +71,10 @@ pkgs.writeShellApplication {
       fi
     }
 
-    echo '======== job: nix-checks (11 build targets) ========'
+    echo '======== job: nix-checks (12 build targets) ========'
     echo 'All build targets below were realised as dependencies of this app:'
 ${reportLines}
-    echo 'nix-checks: 11/11 build targets realised (reaching here means they built).'
+    echo 'nix-checks: 12/12 build targets realised (reaching here means they built).'
 
     echo
     echo '======== job: fuzz-smoke ========'
@@ -108,7 +109,7 @@ ${reportLines}
 
     echo
     echo '======== LOCAL CI SUMMARY ========'
-    echo "nix-checks: 11/11 build targets green"
+    echo "nix-checks: 12/12 build targets green"
     printf 'fuzz-smoke: PASS=%d FAIL=%d\n' "$pass" "$fail"
     if [ "$fail" -ne 0 ]; then
       printf 'FAILED:%s\n' "$failed"
