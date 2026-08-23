@@ -1,327 +1,274 @@
 # Project Status
 
-_Last updated: 2026-08-12_
+_Last updated: 2026-08-23_
 
-## Current branch
+## Current state
 
-`main` is current through PR #21. Highlights of the merged run of PRs:
+`main` is current through **PR #58**. The core thesis — UDS traffic tunneled
+over RoCEv2 through an in-kernel module with no application changes — is fully
+delivered and **proven on real ConnectX-4 Lx 25GbE hardware** (not just soft-RoCE):
+a real Redpanda produce/consume round-trip and a **128/128 `BENCH_OK`
+`verify=full`** benchmark matrix both ride the tunnel end-to-end.
 
-- **Redpanda over UDS-over-RDMA** (PRs #1–#2 + follow-ups): metadata round-trip
-  AND full Kafka produce/consume over the RDMA tunnel, KASAN/KMEMLEAK/lockdep
-  validated. Initiator multi-stream (Phase 3a Step 7d) landed as part of this.
-- **Static analysis / maintainer hygiene** (see section below +
-  `docs/design/26-upstream-readiness.md`): hermetic `nix/analysis/` tooling,
-  three real bugs fixed, checkpatch 79 → 24.
-- **Comprehensive fuzzing program** (PRs #12–#21, design doc 27 — see the
-  Fuzzing section below): every attack surface fuzzed, three memory-safety
-  bugs found or closed (SET num_qps OOB teardown; endpoint lookup-vs-DEL UAF,
-  fixed via kref; verbose-GET-vs-DEL sub-object UAF), per-push + nightly CI
-  wired.
+Since the kernel-module plan (Phases 0–5) completed, work has been organised by
+numbered design doc rather than the original linear phase plan. The major
+post-plan workstreams — comprehensive fuzzing (27), the io_uring bench harness
+(30), the zero-copy fast path (31), real-hardware integration (32), initiator
+connection bring-up & recovery (33), and the bulk-throughput / windowing /
+congestion-control designs (34–36) — are summarised below.
 
-## Where we are
+Highlights:
+
+- **Real hardware (design 32)** — off emulated `rdma_rxe`: hp1↔hp3 over RoCEv2,
+  128/128 bench cells green, full C/Rust interop matrix. Results in
+  `docs/design/32-performance-results.md`.
+- **Zero-copy fast path (design 31)** — `/dev/urp` `uring_cmd` ABI → pinned-pool
+  REGISTER → `fast` endpoint kind → async SEND → zero-copy RECV, plus a
+  `uring-cmd` bench backend and measured copy-vs-zero-copy numbers. PR1–PR5b
+  merged and hardware-validated.
+- **Connection bring-up & recovery (design 33)** — bounded connect-retry with
+  capped backoff, reconnect-on-drop, silent-drop probe→retry, and lazy
+  connect-on-first-accept; all hardware-verified. A userland gRPC rendezvous
+  control plane is code-complete (cold-boot hardware verify pending).
+- **Redpanda over UDS-over-RDMA** — metadata **and** full Kafka produce/consume
+  round-trip, payload byte-verified, KASAN/KMEMLEAK/lockdep clean.
+- **Fuzzing (design 27)** — every attack surface fuzzed; three real
+  memory-safety bugs found and fixed.
+
+## Where we are — kernel-module plan phases
 
 | Phase | Plan doc | Status |
 |---|---|---|
 | **0** — Skeleton | `docs/KERNEL-MODULE-PLAN.md` §0 | ✅ Committed (`3a32ffc`) |
 | **1 — k0** RDMA echo data path | `docs/KERNEL-MODULE-PLAN.md` §1 | ✅ Committed (`d440794`, `a986fe7`, `a600b17`) |
-| **2** — GENL control plane | `docs/KERNEL-MODULE-IMPLEMENTATION.md` §Phase 2 | ✅ Committed (`067829e`) |
-| **3a** — k1 data path | `docs/KERNEL-MODULE-PLAN.md` §3 + `KERNEL-MODULE-IMPLEMENTATION.md` §Phase 3a | ✅ **Phase 3a complete -- Steps 1-10 + 2b, 4b, 5b, 7b, 7c done (`c2eea2e` through `b7caab2`); 23/23 `test-kmod-k0` PASS. Sub-step 7d (initiator multi-stream + concurrent-connection integration) **DONE (`74df057`; KASAN-clean 12-stream burst) -- see Redpanda section**. 5b's objtool-on-IBT follow-up remains pending.** |
-| **3b** — probes / PSK | `docs/KERNEL-MODULE-PLAN.md` §3.6-§3.7 + `KERNEL-MODULE-IMPLEMENTATION.md` §Phase 3b | ✅ **Complete. Steps 1-10 done (`0d5c077` through `dd6bab0`). Probes (PING/PONG/RTT EWMA/state machine), PSK SHA-256 + rdma_cm `private_data` validation, auth-failure observability all wired. Test-kmod-k0 23/23 PASS. Sub-steps 8b (initiator-validates-acceptor) + 3b/test (URP-to-URP harness) pending.** |
-| 3c — KUnit hardening + soak | (deferred) | largely superseded: KUnit suites landed via 3a Step 9 + design 28 extractions (34 cases in `kernel/urp_test.c`); the 1-hour soak landed in Phase 4 |
-| **4** — k2 optimized | `docs/KERNEL-MODULE-PLAN.md` §4 + `KERNEL-MODULE-IMPLEMENTATION.md` §Phase 4 | ✅ **rxe-testable scope complete + 1-hour soak PASS. Steps: 1 page_pool (`ded84a7`), 2 NUMA-aware (`78967e5`), 3 tracker (`c535c7a`), 4-5 soak harness + reconnect-leak fix (`c41bd61`). 23/23 `test-kmod-k0` + 1240 cycles + 120 churn add/remove with 0 errors, 1828 kB slab leak (budget 2048). §4.2 zero-copy / §4.3 adaptive CQ / §4.4 kthread NUMA bind / §4.5 hardware benchmarks deferred to a hardware-validation pass.** |
-| **5** — MicroVM integration | `docs/KERNEL-MODULE-PLAN.md` §5 + `KERNEL-MODULE-IMPLEMENTATION.md` §Phase 5 | 🟢 **Substantially complete (6/8 deliverables done, +1 partial, 1 blocked). Steps 1-9 x86_64 harness/sanitizer PASS. Step 10 kernel-version matrix (6.1.180/6.6.148/6.12.101/7.1.6 build via 4 LTS compat shims). Step 11 nixpkgs+microvm bump (latest kernel 7.1.6). Step 12 CI (`ci.yml` every-push + `nightly.yml` self-hosted KVM). Steps 13-14 cross-arch harness (localSystem/crossSystem, xdp2-aligned). Step 15 aarch64 emulated pair test FULL PASS under TCG. riscv64: urp.ko build gate (boot via same harness, not run). Redpanda: **metadata AND full produce/consume round-trip over RDMA PASS** (Stage 0 unblocked -- broker built hermetically via the redpanda fork's Nix flake; see below).** |
-| 6 | per `docs/KERNEL-MODULE-PLAN.md` | not started |
+| **2** — GENL control plane | `KERNEL-MODULE-IMPLEMENTATION.md` §Phase 2 | ✅ Committed (`067829e`); 19/19 integration tests |
+| **3a** — k1 data path (multi-QP, SRQ, credit FC, reorder, streams) | `KERNEL-MODULE-PLAN.md` §3 + IMPL §3a | ✅ Steps 1–10 + initiator multi-stream (`74df057`); KASAN-clean 12-stream burst |
+| **3b** — probes / PSK | `KERNEL-MODULE-PLAN.md` §3.6–§3.7 + IMPL §3b | ✅ Probes (PING/PONG/RTT EWMA/state machine) + PSK SHA-256 in `rdma_cm` `private_data` |
+| 3c — KUnit hardening + soak | (deferred) | superseded: 34 KUnit cases in `kernel/urp_test.c`; 1-hour soak landed in Phase 4 |
+| **4** — k2 optimized | `KERNEL-MODULE-PLAN.md` §4 + IMPL §4 | ✅ rxe scope + 1-hour soak PASS (1240 cycles, 120 churn add/remove, 0 errors). §4.2–4.5 (zero-copy in copy path, adaptive CQ, kthread NUMA bind, hw bench) folded into the design-31/32 hardware work |
+| **5** — MicroVM integration | `KERNEL-MODULE-PLAN.md` §5 + IMPL §5 | ✅ x86_64 + aarch64 (TCG) pair tests, kernel matrix 6.1/6.6/6.12/7.1, cross-arch, CI + nightly |
+| 6 | — | superseded by the design-doc-driven workstreams below |
 
-## Phase 2 deliverables (now committed in `067829e`)
+## Major workstreams (post-plan, by design doc)
 
-GENL control plane: `urp add / show / remove / drain / set / monitor / stats` CLI driving the kernel module via a generic netlink family. 19/19 integration tests pass in the QEMU VM.
-
-Working-tree files attributable to Phase 2:
-
-- `crates/urp-cli/` — clap-driven CLI, neli-based netlink client
-- `kernel/urp_netlink.c`, `kernel/urp_endpoint.c` — GENL family + endpoint rhashtable
-- `kernel/include/uapi/linux/urp.h` — UAPI for GENL attrs
-- `kernel/urp.h`, `kernel/urp_main.c`, `kernel/urp_proc.c`, `kernel/urp_rdma.c`, `kernel/urp_socket.c`, `kernel/Kbuild` — endpoint lifecycle wiring
-- `nix/urp-cli.nix` — CLI build
-- `nix/test-kmod-k0.nix`, `nix/test-vm.nix` — integration test harness expansions
-- `docs/KERNEL-MODULE-IMPLEMENTATION.md` — Phase 2 status row, variations #20–21 (positional CLI names, rhashtable fixed-key fix)
-
-Two notable bugfixes captured in IMPLEMENTATION.md:
-1. CLI segfault → kernel `BUG_ON` at `rhashtable.h:968`. `rhashtable_lookup_insert_fast` BUGs when `obj_hashfn` is set; converted to fixed-key default hashing across the full 16-byte zero-padded `name` field.
-2. CLI `--name` mismatch with test invocation pattern. Removed `#[arg(long)]` from `name` in `add`/`set` so the test script's positional invocation works.
-
-## Phase 3a Step 1 deliverables (now committed in `c2eea2e`)
-
-Rust→kernel FFI prerequisite. Sets up the staticlib build path that Step 5 will consume when wiring up the optional Rust-backed reorder buffer (`CONFIG_URP_REORDER_RUST=y`).
-
-New files:
-- `crates/uds-rdma-protocol-ffi/{Cargo.toml, src/lib.rs, src/ffi.rs, src/kernel_runtime.rs}` — sibling staticlib crate. Kept separate from `uds-rdma-protocol` to avoid duplicate-`panic_impl` lang-item collisions when libtest pulls in `std`.
-- `kernel/include/urp_ffi.h` — C prototypes for the seven `urp_rust_reorder_*` exports + the three kernel-supplied callbacks (`urp_kalloc`, `urp_kfree`, `urp_panic_abort`). Gated on `CONFIG_URP_REORDER_RUST`.
-- `nix/urp-protocol-ffi.nix` — `rustPlatform.buildRustPackage` derivation with `cargoLock.lockFile` for offline (sandboxed) Nix builds.
-
-Modified:
-- `Cargo.toml` (workspace) — adds the new member + workspace-level `[profile.release] panic = "abort"` (Cargo refuses package-level profiles in workspaces).
-- `flake.nix` — exposes `packages.urp-protocol-ffi`.
-- `nix/checks.nix` — `protocol-tests` switched from raw `cargo test` to `rustPlatform.buildRustPackage` (raw `cargo test` can't reach crates.io from the Nix sandbox); src filter widened to include the new crate dirs.
-
-Verified via Nix (no system Rust used):
-- `nix build .#urp-protocol-ffi` → produces `result/lib/liburp_protocol_ffi.a` (2.2 MB after LTO+strip) + `result/include/urp_ffi.h`. All 7 expected `T urp_rust_reorder_*` symbols are defined; only the 3 expected `U urp_kalloc / urp_kfree / urp_panic_abort` are undefined (resolved by the kernel module side in Step 5).
-- `nix build .#checks.x86_64-linux.protocol-tests` → passes.
-- `nix build .#checks.x86_64-linux.kernel-module-build` → passes (urp.ko unchanged in default config).
-
-## Phase 3a Steps 2–10 — progress
-
-| Step | Subject | Commit | Status |
-|------|---------|--------|--------|
-| 2 | Multi-QP scaffold + round-robin selection | `9dd0a70` | done |
-| 2b | Actual N-QP multi-cm-id allocation | `f9f49b4` | done |
-| 3 | Shared Receive Queue (SRQ) | `0fba325` | done |
-| 4 | Per-QP credit flow control (scaffold) | `728db70` | done |
-| 4b | Wire credit gate into TX/RX paths | `b7caab2` | done (best-effort + stream-id != 0 gating) |
-| 5 | Reorder buffer (C rbtree backend) | `3737132` | done |
-| 5b | Rust reorder backend wiring | `83570af` | done (default build green; `urp-ko-rust` blocked by objtool on IBT kernels) |
-| 6 | Stream multiplexing core (scaffold) | `e2ea525` | done |
-| 7 | Stream lifecycle handlers | `f3f9903` | done |
-| 7b | Wire stream_id dispatch into RX path | `9075f57` | done |
-| 7c | TX + UDS multi-stream wiring (acceptor) | `f14a107` | done |
-| 7d | Initiator multi-stream accept loop + concurrent-connection test | `74df057` | **done** (per-stream pump per UDS conn; KASAN-clean 12-stream burst) |
-| 8 | GENL emitters wire up real state | `70fafc6` | done |
-| 9 | KUnit suites + multi-QP integration smoke | `336e7e0` | done (23/23 PASS) |
-| 10 | Tracker polish + DoD checklist | done (this row) | done |
-
-User-confirmed cadence: one commit per step (so Step 2's commit is not fully
-e2e runnable on its own with `num_qps > 1` — Step 2b lifts the
-`-EOPNOTSUPP` guard). The current `phase3a-k1-data-path` branch's HEAD
-(Step 2) still passes the full 19/19 `test-kmod-k0` suite because every
-existing test uses the default `num_qps = 1`.
+| Design | Workstream | Status |
+|---|---|---|
+| 27 | Fuzzing program | ✅ Complete — F0–F3 automated; 3 real bugs fixed |
+| 30 | `urp-bench` io_uring UDS benchmark (C + Rust twins) | ✅ Complete — 7 modes, differential fuzz, matrix |
+| 31 | urp-fast zero-copy path | ✅ PR1–PR5b merged + hardware-validated. PR6 (Rust backend) / PR7 (Seastar) roadmap |
+| 31a | C++/Seastar demo client | ⏳ Deferred (roadmap PR7) |
+| 32 | Real-hardware RoCEv2 integration | ✅ Matrix 128/128; extra probes + Results-caveat flip pending |
+| 33 | Initiator connection bring-up & recovery | 🟢 Phases 0–2 hardware-verified; Phase 3 (gRPC) code-complete, cold-boot verify pending |
+| 34 | Bulk throughput | ✅ Measured on hardware; copy-vs-zero-copy captured |
+| 35 | Windowing / flow control | 🟢 Phase 1 (pump completion waitqueue) merged; further windowing spec'd |
+| 36 | CUBIC congestion control | 📝 Design-only, LATER (fabric near-lossless, path is pump-bound) |
 
 ## Redpanda over UDS-over-RDMA
 
-Real Kafka client (`rpk`) ↔ real Redpanda broker, Kafka bytes carried over the
-URP RDMA data path. Single host, soft-RoCE (`rdma_rxe`), RDMA loopback over one
-device. Broker + `rpk` are built from the redpanda fork's Nix flake (`redpanda`
-flake input, pinned to `randomizedcoder/redpanda@d4b44629`, which carries the
-native Kafka UDS listener from PR #30240 — unblocking the old "Stage 0"
-hermetic-source gap). Two fork fixes were required: build `rpk` from local
-source (it fetched an upstream rev predating the UDS client support), and build
-the broker with clang 22 (the llvm 23 RC miscompiled it).
+Real `rpk` ↔ real Redpanda broker, Kafka bytes over the URP RDMA data path
+(single host, soft-RoCE, RDMA loopback). Broker + `rpk` built from the redpanda
+fork flake (`randomizedcoder/redpanda@d4b44629`, carrying the native Kafka UDS
+listener from PR #30240).
 
-### Stage A — metadata round-trip (PASS, PR #2)
+- **Metadata round-trip** (`nix run .#test-redpanda-uds`, root): 9/9 pass; `rpk
+  cluster info` returns the real cluster id + broker list over RDMA.
+- **Full produce/consume** (`nix run .#test-redpanda-produce-consume`, root):
+  11/11 pass; `rpk topic create` + produce + consume, consumed payload matches
+  byte-for-byte. The broker advertises a client-local bridge (`127.0.0.2:9092`)
+  so create/produce/fetch all ride RDMA (UDS is non-advertisable).
 
-```
-rpk --UDS--> urp initiator ==RDMA/rxe==> urp acceptor --UDS--> redpanda
-  unix://rpk.sock                                       kafka_api unix_path (+ TCP)
-```
+## Real-hardware RoCEv2 integration (design 32)
 
-- Harness: `nix/test-redpanda-uds.nix` (`nix run .#test-redpanda-uds`, root).
-- **9/9 pass.** `rpk cluster info` returns the real cluster id + broker list;
-  `urp show` confirms the 53 B request / 424 B response crossed RDMA; a negative
-  check proves attribution (fails when the acceptor is removed; direct TCP fine).
+First validation off emulated `rdma_rxe`: **hp1 (acceptor) ↔ hp3 (initiator)**,
+ConnectX-4 Lx 25GbE, RoCEv2, both kernel 7.1.8, PTP time sync (`ptp4l`/`phc2sys`,
+HW timestamping confirmed).
 
-### Full produce/consume over RDMA (PASS, `74df057`)
+- `nix/nixos-module.nix` → `nixosModules.urp` (per-endpoint systemd units) and
+  `nix/urp-hw-matrix.nix` → `urp-hw-matrix` runner (ssh-driven, `nix copy` bench
+  closures, per-cell `BENCH_OK` assert, 4-combo interop + RTT p50/p99).
+- **Matrix: 128/128 `BENCH_OK` `verify=full`, 0 fail, 0 skip** across c↔c /
+  c↔rust / rust↔c / rust↔rust × {blocking, uring-rw, uring-fixed, uring-bufring}
+  × {24, 1024, 4076, 65516} × {1, 16} batch. Full numbers, methodology, and the
+  interop table in **`docs/design/32-performance-results.md`**.
 
-`rpk`/franz use UDS only for the metadata bootstrap; produce/consume then follow
-the *advertised* address (UDS is non-advertisable). So the broker advertises a
-client-local bridge (`127.0.0.2:9092`) that funnels back into the tunnel, so ALL
-Kafka traffic — create, produce, fetch — rides RDMA:
+Five first-real-HW bugs were found and fixed to get here — the headline one being
+the **credit-grant stall** (`bd133dd`): the stream flow-control handshake never
+exchanged a credit grant on real hardware (remote credits stuck at `r0`), which
+the emulated-rxe path had masked. Also fixed: stale-UDS-socket unlink, acceptor
+QP-slot leak, an `ib_free_cq` cleanup WARN, and establishment order sensitivity.
 
-```
-rpk --TCP 127.0.0.2:9092--> socat --UDS--> urp initiator ==RDMA==> urp acceptor --UDS--> redpanda
-```
+Still open in design 32: the extra single-purpose probes (`urp-test-client`
+scenario sweep, `urp-fast-poc` on hardware) are not yet run, and the design-32
+Results-caveat flip / `status` refresh for those probes is pending.
 
-- Harness: `nix/test-redpanda-produce-consume.nix`
-  (`nix run .#test-redpanda-produce-consume`, root).
-- **11/11 pass.** `rpk topic create` + `produce` + `consume` round-trip; the
-  consumed payload matches byte-for-byte.
+## Initiator connection bring-up & recovery (design 33)
 
-### Initiator multi-stream (Phase 3a Step 7d, `74df057`)
+Layered plan (fix compounding bugs → bounded retry → lazy connect → gRPC
+rendezvous), tracked in `docs/design/33-implementation-status.md`.
 
-Full produce/consume required completing the initiator data path: franz opens a
-separate connection per broker, so the initiator now opens **one stream per
-accepted UDS connection** (per-stream pump emits SYN) instead of the single k0
-`ep->conn`. Completing this surfaced two host-oopsing teardown bugs, now fixed:
-shut the UDS **before** `kthread_stop` (was reversed → `rmmod` hang), and the
-per-stream pump **parks** on `kthread_should_stop` after EOF instead of
-self-returning (was a `task_struct` refcount underflow / oops).
+- **Phase 0 — compounding recovery bugs** ✅ hardware-verified (`5bfcd37`):
+  acceptor QP-slot leak on half-open child, and the initiator's stale UDS listen
+  socket never being unlinked. Both were prerequisites for any auto-recovery.
+- **Phase 1 — bounded connect-retry + backoff** ✅ hardware-verified: capped
+  exponential backoff, reconnect-on-drop, runtime `/proc/sys/urp/` tunables
+  (`connect_max_attempts` / `connect_backoff_base_ms` / `connect_backoff_ceil_ms`).
+  **Phase 1.5** closes the silent-drop gap (hard peer reboot delivers no CM
+  event): a single-QP initiator now emits liveness PINGs; on missed PONGs it
+  demotes the QP and schedules the same reconnect. Verified via SysRq-b hard
+  drop → hp3 self-heals with no manual restart.
+- **Phase 2 — lazy connect on first UDS accept** ✅ hardware-verified: an idle
+  endpoint holds no RDMA resources; the dial fires on first accept (one-shot
+  `connect_started`). All 6 scenarios pass incl. 128/128 through the lazy path,
+  clean drain of a never-connected endpoint, boot-race safety-net, fail-fast
+  after exhaustion.
+- **Phase 3 — userland gRPC control plane** 🟢 code-complete + sandbox-verified
+  (PRs #46 netlink lib, #47 proto+daemon, #48 auth-before-slot, #49 NixOS units).
+  `urp-control` (tonic/prost) serves `Rendezvous` + `Heartbeat`; the initiator
+  gates the app on peer-ready via `sd_notify READY=1`. gRPC-OK is a hint, not a
+  RoCEv2 guarantee, so the Phase-1 kernel retry stays the safety net.
+  **Open:** the hp1/hp3 cold simultaneous-boot integration verify (rendezvous →
+  gate → lazy connect → `established` → `BENCH_OK`, zero manual steps) is still
+  pending (Task #42).
 
-Validated in the microVM pair test (now fires a **12-concurrent-stream burst**):
-non-sanitizer PASS, and **KASAN + KMEMLEAK + lockdep CLEAN** on both VMs.
-`test-kmod-k0` still 23/23 (k0 path unaffected).
+## urp-fast zero-copy (design 31 + 31a)
 
-Known follow-ups: (1) **reap-on-close via a FIN handshake** — the eager
-reap-on-`tx_done` dropped half-close responses and was reverted, so streams reap
-at drain (no per-endpoint leak, but long-lived endpoints accumulate until then);
-(2) make the acceptor's eager k0 `ep->conn` lazy (it opens one idle backend
-connection in the multi-stream case).
+The opt-in fast path (`docs/design/31-urp-fast-zero-copy.md`): an aware app hands
+its own buffer pool to `urp.ko` over `IORING_OP_URING_CMD` into a `/dev/urp` char
+device, the pool is registered against a connected endpoint's PD, and the NIC
+DMAs straight into/out of the app's pinned pages — the last software copy the
+`AF_UNIX` path (design 30) provably can't remove.
 
-## Static analysis / upstream readiness (2026-08-09)
+**PR1–PR5b merged (#36 … #58) and hardware-validated:**
 
-`nix/analysis/` (patterned on xdp2) adds hermetic, report-only analyzers:
-`nix build .#analysis-all -L` runs **sparse** (pinned upstream master;
-nixpkgs' is too old for 7.x headers), **smatch**, **checkpatch --strict**
-(from the target kernel's own source tree inside `.dev`), **W=1/W=2**,
-**coccicheck** (the kernel's coccinelle suite), **clippy**, and
-**rustfmt --check**, and prints a per-tool count table. Manual-run only --
-not wired into checks/CI.
+- **PR1** — `/dev/urp` misc device + `->uring_cmd` fop; shared ABI
+  (`include/uapi/linux/urp_cmd.h`), trust-boundary validators as a dual-compile
+  pure core (KUnit + `urp-fast-validate-units`).
+- **PR2** — `REGISTER` binds to a named connected endpoint, DMA-maps every pinned
+  page against its RDMA device, shares the endpoint's PD (`ib_dma_map_page` +
+  `local_dma_lkey`).
+- **PR3a/PR3b** — `fast` endpoint kind (`CONFIG_URP_FAST`) + zero-copy SEND data
+  path with a per-buffer ownership state machine.
+- **PR4** — zero-copy RECV data path + teardown quiesce.
+- **PR5a** — a `uring-cmd` (fast) backend for `urp-bench` (C twin), driving the
+  same bench core over the zero-copy path; VM Phase 10j proves exact-byte
+  delivery over rxe. Also fixed a uds→fast probe-liveness interop gap.
+- **PR5b** — fast bw + RTT matrices, hp1/hp3 run, and the measured
+  copy-vs-zero-copy comparison written into design 34.
+- Fixed post-merge: the fast REGISTER pinned the pool with bare
+  `pin_user_pages()` from an io-wq context holding no `mmap_lock`, tripping a
+  `rwsem.h:81` WARN; switched to `pin_user_pages_fast()` (PR #58, `c52f110`),
+  validated on hp1/hp3 (WARN count 0 across a ~2-day soak).
 
-First pass results (kernel 7.1.6): sparse/smatch/W=1/coccicheck/clippy/
-rustfmt all **0**; checkpatch 79 -> **24**, every residual intentional and
-justified in `docs/design/26-upstream-readiness.md` §26.4. Three **real
-bugs** found and fixed: `NLA_POLICY_RANGE` s16-truncating
-`URP_BUFFER_SIZE_MAX` (65536 -> 0, validation broken), a 5.9 KiB stack
-frame in `urp_new_endpoint_doit` (whole `struct urp_endpoint` as stack
-scratch), and a QP-slot leak on the `urp_cm_accept_one` OOM path. Plus the
-mechanical hygiene sweep (pr_fmt, ratelimited printks, SPDX on
-Kbuild/Makefile, urp-y, `__noreturn`, `# Safety` docs on the FFI, cargo
-fmt, checkpatch style). Deeper maintainer items were catalogued as
-follow-ups in design doc 26; of those, **kref endpoint lifetime** (incl.
-the sub-object GET-vs-DEL UAF) and **kthread task_struct pinning** have
-since been FIXED (see design 26 §26.6); netns, lock scope, and
-waitqueue-driven pumps remain open. All regression gates re-verified
-green: urp-ko (7.1.6 + 6.1/6.6/6.12), urp-cli (incl. the uapi mirror
-test), protocol-tests.
+**Roadmap:** PR6 Rust `crates/urp-fast` backend (C-vs-Rust differential parity /
+fuzz) + `uring_cmd` decoder fuzz target; PR7 C++/Seastar client (design 31a).
+One-sided `RDMA_WRITE`+rkey (design 34 Option D) stays deferred.
 
-## Fuzzing program (2026-08-10/11, design doc 27 — COMPLETE)
+## io_uring UDS benchmark (design 30)
+
+`urp-bench`: a symmetric userland benchmark pair (C + liburing and Rust + the
+`io-uring` crate, same CLI and wire framing) driving the UDS side with io_uring.
+**Complete** — pure cores table-tested in both languages (877 C checks / 15
+mirrored Rust suites, identical cross-language hex vectors, miri); **all 7
+io_uring modes live** in both twins and interop C↔Rust; `fuzz-bench-deframe` +
+cargo-fuzz differential (C-vs-Rust) in CI; first userland C static analysis
+(clang-tidy + cppcheck). The `uring-sendzc` probe answered the design's core
+question: on 7.1.6 **AF_UNIX has no zero-copy send** (`result=eopnotsupp`) — the
+copy-path win is syscall batching (0.9–1.4 → 0.01–0.09 syscalls/msg), which is
+exactly what motivated the design-31 zero-copy path.
+
+## Fuzzing program (design 27 — complete)
 
 Tracks F0–F3 all implemented and automated:
 
-- **F0/F1 hermetic harnesses** (libFuzzer + ASAN/UBSan, compile the REAL
-  kernel C): `nix run .#fuzz-classify` (RX frame classifier),
-  `.#fuzz-rx-seq` (classify → dispatch → stream state machine over frame
-  sequences; uses the extracted dual-compile `kernel/urp_stream_sm.c`),
-  `.#fuzz-reorder` (default C rbtree reorder backend against a spec-model
-  differential, linked with the kernel's own `tools/lib/rbtree.c` from the
-  nixpkgs-pinned kernel source). Plus 5 cargo-fuzz targets on the shared
-  Rust crate (`fuzz/fuzz_targets/`).
-- **F2 live-VM fuzzers**, run as phases of the sanitizer microVM pair test
-  (KASAN + KMEMLEAK + lockdep + KCOV kernel): blind + KCOV coverage-guided
-  netlink fuzzers (with `KCOV_TRACE_CMP` operand-dictionary feedback), a
-  multi-threaded netlink racer (NEW/DEL/SET/GET churn), and a hostile-peer
-  RDMA **wire** fuzzer (librdmacm RC client speaking malformed frames at a
-  dedicated acceptor). Each fuzz phase is followed by an inline dmesg
-  `scan_splat` oracle so a wedged VM cannot mask a KASAN splat.
-- **F3 CI**: every push runs `fuzz-smoke` (45 s classify + rx-seq +
-  regression-reproducer replay); nightly runs `fuzz-long` (10 min each of
-  the three hermetic harnesses) and the sanitizer pair test with all F2
-  fuzz phases. Crash reproducers are committed under `fuzz/regressions/`.
+- **F0/F1 hermetic harnesses** (libFuzzer + ASAN/UBSan, compiling the REAL kernel
+  C): `fuzz-classify` (RX frame classifier), `fuzz-rx-seq` (classify → dispatch →
+  stream state machine), `fuzz-reorder` (C rbtree backend vs a spec model). Plus
+  5 cargo-fuzz targets on the shared Rust crate.
+- **F2 live-VM fuzzers** (phases of the sanitizer microVM pair test, KASAN +
+  KMEMLEAK + lockdep + KCOV kernel): blind + KCOV coverage-guided netlink
+  fuzzers, a multi-threaded netlink racer, and a hostile-peer RDMA **wire** fuzzer
+  — each followed by an inline `dmesg` `scan_splat` oracle.
+- **F3 CI**: every push runs `fuzz-smoke`; nightly runs `fuzz-long` + the
+  sanitizer pair test with all F2 phases. Reproducers under `fuzz/regressions/`.
 
-Real bugs found or closed by the program: (1) `SET_ENDPOINT`
-num_qps/buffer_count OOB teardown — found live by the coverage-guided
-netlink fuzzer, fixed with `-EBUSY` on active endpoints; (2) endpoint
-lookup-vs-DEL use-after-free — closed by the kref + release-via-RCU
-refactor; (3) verbose-GET-vs-DEL sub-object UAF (`ep->qps[]`/streams read
-unlocked during drain) — closed by holding `ep->lock` across the verbose
-fill. Remaining optional items are listed in design 27 (lifecycle/churn
-soak fuzz, corpus artifact management, coverage reporting).
+Real bugs found or closed: `SET_ENDPOINT` num_qps/buffer_count OOB teardown
+(coverage-guided fuzzer → `-EBUSY` on active endpoints); endpoint lookup-vs-DEL
+UAF (kref + release-via-RCU); verbose-GET-vs-DEL sub-object UAF (`ep->lock` across
+the verbose fill).
 
-## io_uring UDS benchmark design (2026-08-12, design doc 30 — DESIGNED)
+## Static analysis / upstream readiness (design 26)
 
-`docs/design/30-urp-bench-io-uring.md` designs `urp-bench`: a symmetric
-userland benchmark pair (C + liburing and Rust + the `io-uring` crate, same
-CLI and wire framing) that drives the UDS side with io_uring and sweeps
-message size × batch size × io_uring mode (blocking control, batched
-send/recv, registered buffers, provided-buffer rings + multishot recv,
-SQPOLL, and a SEND_ZC evidence probe). It answers design 20 §20.1's open
-question — the honest hypothesis is that AF_UNIX has no zero-copy path, so
-the copy stays and syscall batching is the measurable win. Work items B1–B8
-(pure table-tested cores in both languages, io_uring shells, `urp-bench-units`
-check, `fuzz-bench-deframe` + cargo-fuzz + C↔Rust differential targets,
-first userland C static analysis via clang-tidy/cppcheck, pair-test Phase 13)
-are all **not started**. Note: design doc 29 remains referenced-but-uncommitted;
-30 was numbered around it.
+`nix build .#analysis-all -L` runs sparse, smatch, checkpatch --strict, W=1/W=2,
+coccicheck, clippy, rustfmt — all **0** except a small documented checkpatch
+residual (24, every item justified in `docs/design/26-upstream-readiness.md`
+§26.4). Three real bugs found and fixed in the first pass (NLA_POLICY_RANGE
+s16-truncating `URP_BUFFER_SIZE_MAX`; a 5.9 KiB stack frame in
+`urp_new_endpoint_doit`; a QP-slot leak on the `urp_cm_accept_one` OOM path).
+Manual-run only; not wired into CI.
 
-Progress (2026-08-12): **B1–B8 all IMPLEMENTED** (PRs #30–#33).
+## Known gaps
 
-- Pure cores, both languages, table-tested (C: 877 checks in the sandboxed
-  `urp-bench-units` check; Rust: 15 mirrored suites in `urp-bench-rs-tests`;
-  identical cross-language hex vectors; miri via `run-miri`).
-- io_uring shells: **all 7 modes live** in both C and Rust (`uring-bufring`
-  = provided-buffer ring + multishot recv, completed 2026-08-16, interops
-  C↔Rust). `nix run .#urp-bench-local` = C↔C, Rust↔Rust, C↔Rust interop
-  both ways (incl. bufring), all `--verify full`.
-- The `uring-sendzc` probe answered the design's core question on 7.1.6:
-  `result=eopnotsupp` — **AF_UNIX has no zero-copy send**; the win is
-  syscall batching (0.9–1.4 → 0.01–0.09 syscalls/msg).
-- Fuzz: `fuzz-bench-deframe` (nix, in ci fuzz-smoke + nightly fuzz-long);
-  cargo-fuzz `bench_frame_decode` + `bench_differential` (10.7 M clean
-  C-vs-Rust comparisons at landing), devshell `run-fuzz`.
-- First userland C static analysis: `analysis-clang-tidy` (57 report-only
-  findings) + `analysis-cppcheck` (0), in `analysis-all`.
-- `nix run .#urp-bench-matrix` sweep + C-vs-Rust delta table (~0 within
-  noise); pair-test **Phase 10g** runs tunneled cells with `scan_splat`
-  armed; `URP_BENCH_FULL=1` extends the tunneled set.
-- The matrix caught two real shared bugs during bring-up (tracker-slot
-  backpressure treated as fatal; multiple outstanding recvs permuting the
-  SOCK_STREAM byte stream) — details in `docs/BENCHMARKING.md`.
+Previously-listed functional gaps that are now **closed** (were open in the
+2026-08-12 status):
 
-## urp-fast zero-copy (design docs 31 + 31a — IN PROGRESS)
+1. **Per-stream reorder buffer** — wired into the RX path
+   (`urp_rx_deliver_stream`, `kernel/urp_rdma.c:520–544`) and now covered by
+   comprehensive **table-driven unit tests** (positive / negative / boundary /
+   corner + both `-ENOMEM` paths). The shared op-script table
+   `kernel/urp_reorder_cases.h` drives both the in-kernel KUnit suite
+   (`test_reorder_scenarios` / `test_reorder_arg_guards`) and the userspace
+   `urp-reorder-units` check (compiles the *real* backend under ASAN/UBSan; in
+   `ci-local`), mirrored in the Rust twin (`reorder.rs`). **The reorder *code* is
+   verified.** The real-hardware exercise under multi-QP arrival skew remains
+   **blocked — not by the reorder buffer, but by gap #6**: the first multi-QP data
+   run (2026-08-23, `.#urp-reorder-matrix`) never reaches clean delivery, so the
+   buffer cannot yet be exercised end-to-end on real skew.
+2. **`buffer_count` / `buffer_size` endpoint config** — now drives live pool
+   geometry: `urp_endpoint.c:284–285` resolves `ep->num_bufs` / `ep->buf_size`
+   from the config (via `urp_resolve_num_bufs` / `urp_resolve_buf_size`), feeding
+   pool depth, CQ/SRQ/SQ sizing, credit window, and DMA slot bytes. **Minor
+   drift:** a stale comment at `kernel/urp_netlink.c:575–577` still claims
+   `buffer_count` does not size the pool (references "design doc 29 Gap 2") — the
+   code contradicts it; the comment should be corrected.
 
-`docs/design/31-urp-fast-zero-copy.md` specifies the opt-in fast path: an
-aware app hands its own buffer pool to `urp.ko` over `IORING_OP_URING_CMD`
-into a `/dev/urp` char device, the pool is dual-registered (io_uring fixed
-buffers + RDMA MR), and the NIC DMAs straight into/out of the app's pinned
-pages — the last software copy the `AF_UNIX` path (design 30) provably can't
-remove. `31a` is the C++/Seastar client (Redpanda's framework). Kernel-first
-phasing so the client has a real integration target.
+Genuinely open:
 
-Progress (2026-08-16): **PR1 merged (#36); PR2 landing** (branch `urp-fast-mr`).
-
-- **PR1** — `/dev/urp` misc char device + `->uring_cmd` fop (`kernel/urp_cmd.c`);
-  the shared ABI (`include/uapi/linux/urp_cmd.h`): opcodes
-  `URP_CMD_{REGISTER,UNREGISTER,SEND,RECV}`, inline `urp_cmd_data`, cold-path
-  `urp_cmd_reg`. Trust-boundary validators (`kernel/urp_cmd_validate.c`, §31.10):
-  a **dual-compile pure core** — same source into `urp.ko` (KUnit
-  `test_cmd_validate_{data,reg}`) and a userspace check
-  (`urp-fast-validate-units`, 55 table cases, in `nix flake check` + ci).
-  `REGISTER`/`UNREGISTER` = `pin_user_pages(FOLL_LONGTERM)` / `unpin` (pool
-  pins **once**, §31.4).
-- **PR2** — `REGISTER` now takes an endpoint name (`urp_cmd_reg.endpoint`),
-  binds to a connected endpoint (`urp_endpoint_get`), and DMA-maps every
-  pinned page against its RDMA device (`ib_dma_map_page`), producing the local
-  `lkey` (= `pd->local_dma_lkey`) the data path posts with — the pool shares
-  the endpoint's PD. `UNREGISTER` unmaps + drops the endpoint ref. Chose
-  `ib_dma_map_page` + `local_dma_lkey` over `ib_reg_user_mr` (matches
-  `urp_bufs_init`; two-sided SEND/RECV needs no remote rkey).
-- `SEND`/`RECV` validate then `-ENOSYS` (data path is PR3).
-- `nix run .#urp-fast-poc <dev> <endpoint>` drives it end-to-end (REGISTER +
-  negative cases incl. unknown-endpoint + UNREGISTER); pair-test **Phase 10h**
-  runs it on vm1 against the connected `pair_acceptor`, `scan_splat` armed.
-- Fast path gated on kernel ≥ 6.8 (`<linux/io_uring/cmd.h>` + 4-arg
-  `pin_user_pages`); stubbed on older LTS so 6.1/6.6 compile gates stay green.
-- Next: PR3 `SEND`/`RECV` posting + per-buffer ownership + `fast` endpoint
-  kind; PR4 client libs (C/Rust/Seastar) + bench T3 + fuzz.
-
-## Known functional gaps
-
-Found by the 2026-08-11 docs-vs-implementation review (full analysis and
-wiring plans land in `docs/design/29-code-review-refactor-plan.md`):
-
-1. **Per-stream reorder buffer is not wired into the RX path.** Both backends
-   (C rbtree default, optional Rust FFI) are implemented, KUnit-tested, and
-   fuzzed — but `urp_recv_done` delivers frames in completion order and never
-   calls `urp_reorder_insert`/`urp_reorder_drain_next`; the per-stream buffer
-   is allocated and freed unused, and `stats.reorder_insertions`/`reorder_drops`
-   are exported but never incremented. Invisible on single-QP and rxe-loopback
-   paths; matters for real multi-QP/ECMP deployments.
-2. **`buffer_count` / `buffer_size` endpoint config is accepted but unused.**
-   Parsed, validated, reported, and change-guarded — but the buffer pool is
-   sized by compile-time `URP_NUM_BUFS`/`URP_BUF_SIZE`.
-3. **A second concurrent initiator endpoint never starts its CM machinery**
-   (found 2026-08-12 by pair-test Phase 10g, design 30). With
-   `pair_initiator` active, `urp add bench_init --listen-path … --peer …`
-   returns ok and `urp show` lists the endpoint as active — but no
-   "listening on UDS", no CM address-resolved/established events, and
-   stats stay all-zero; app connects to the listen path then time out.
-   Acceptor endpoints coexist fine (10d/10e/10f create several serially
-   and the 10c3 racer leaves four active). Phase 10g works around it by
-   riding the established pair endpoints (urp-bench replaces socat as the
-   `/tmp/urp-pair-echo.sock` backend). Needs a kernel-side look at the
-   initiator add path (per-module vs per-endpoint CM/listen state).
+3. **gRPC control-plane cold-boot verify (design 33 Phase 3).** Code merged and
+   sandbox-verified; the hp1/hp3 cold simultaneous-boot end-to-end run (zero
+   manual steps) is still pending (Task #42).
+4. **Design 32 extra hardware probes.** The `urp-test-client` scenario sweep and
+   an on-hardware `urp-fast-poc` run are not yet done, and the design-32 Results
+   caveat has not yet been flipped for them.
+5. **Second concurrent initiator endpoint (design 30 Phase 10g finding).** A
+   2026-08-12 finding that a second concurrent *initiator* endpoint never started
+   its CM machinery. The design-33 initiator bring-up rework (lazy connect /
+   retry) likely supersedes it, but this specific multi-initiator-in-one-module
+   case has not been explicitly re-verified.
+6. **Multi-QP data path unstable on real hardware (found 2026-08-23).** The first
+   multi-QP data transfer on hp1↔hp3 (`.#urp-reorder-matrix`, sweeping
+   `num_qps ∈ {1,4,8}`) wedges: only single-QP/4096 delivers cleanly (`BENCH_OK
+   verify=full`, `drops=0`, `rx≈1.5M`); every multi-QP cell errors out. dmesg
+   shows a **connect-handshake race** (acceptor `rejecting extra CONNECT_REQUEST
+   (8 >= 8 QPs)`, initiator QPs `CM down (rejected)` / retry storm) and **RC
+   transport-retry exhaustion** (`send completion error: transport retry counter
+   exceeded` — fabric loss under multi-QP bursts; no PFC/ECN/congestion control).
+   QPs erroring mid-stream open permanent sequence gaps → the reorder window
+   overflows → `reorder_drops` explode → delivery wedges. **Every real-hardware
+   result to date — including the design-32 128/128 matrix — used `num_qps=1`;
+   multi-QP has never carried clean data on the boxes.** Fixing it needs the
+   acceptor multi-QP slot/connect race resolved and congestion control (design 36)
+   before multi-QP is viable. Repro (and the reorder hardware-exercise tool once
+   the path is stable): `nix run .#urp-reorder-matrix -- hp1 hp3 10.10.2.1`.
+7. **Roadmap (not gaps, deferred by design).** urp-fast PR6 (Rust backend) / PR7
+   (Seastar); design 35 further windowing; design 36 CUBIC congestion control
+   (now motivated by gap #6 — multi-QP bursts exhaust RC transport retries, so the
+   fabric is *not* near-lossless under multi-QP load); one-sided `RDMA_WRITE`+rkey
+   (design 34 Option D).
 
 ## Working-tree hygiene notes
 
-- `result*` Nix build-output symlinks are gitignored (`result`, `result-*`)
-  and must not be committed.
+- `result*` Nix build-output symlinks are gitignored (`result`, `result-*`) and
+  must not be committed.
 - `.claude/` — Claude Code session state; not committed.
 - `fuzz/Cargo.lock` **is committed intentionally** (reproducible fuzz-target
   builds, same rationale as the workspace `Cargo.lock`).

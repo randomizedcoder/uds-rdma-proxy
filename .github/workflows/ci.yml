@@ -56,6 +56,9 @@ jobs:
       - name: urp-fast command validators (design 31 trust boundary)
         run: nix build -L .#checks.x86_64-linux.urp-fast-validate-units
 
+      - name: urp reorder buffer table tests (status gap #1)
+        run: nix build -L .#checks.x86_64-linux.urp-reorder-units
+
       # Kernel module build matrix (Phase 5 DoD 7). kernel-module-build is
       # latest mainline; urp-ko-6_* are the supported LTS line. The
       # LINUX_VERSION_CODE / __has_include compat shims in kernel/ are what

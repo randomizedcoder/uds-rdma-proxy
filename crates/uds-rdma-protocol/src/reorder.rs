@@ -240,4 +240,65 @@ mod tests {
         assert_eq!(r.delivered[0].0, u64::MAX);
         assert_eq!(rb.next_expected(), u64::MAX); // saturated, no overflow
     }
+
+    // Parity with the C twin's shared op-script table
+    // (kernel/urp_reorder_cases.h): boundary/corner rows the Rust API can
+    // express (guard/NULL-pointer rows are C-only).
+
+    #[test]
+    fn initial_nonzero() {
+        let mut rb = ReorderBuffer::new(100, 64);
+        assert_eq!(rb.insert(100, vec![100]).unwrap().delivered, vec![(100, vec![100])]);
+        assert_eq!(rb.insert(101, vec![101]).unwrap().delivered, vec![(101, vec![101])]);
+        assert_eq!(rb.next_expected(), 102);
+        // A seq below next_expected is a duplicate, not a new gap.
+        assert_eq!(
+            rb.insert(99, vec![99]),
+            Err(ProtocolError::ReorderDuplicate { seq: 99 })
+        );
+    }
+
+    #[test]
+    fn zero_length_payload() {
+        let mut rb = ReorderBuffer::new(0, 64);
+        let r = rb.insert(0, vec![]).unwrap();
+        assert_eq!(r.delivered, vec![(0, vec![])]);
+        assert_eq!(rb.next_expected(), 1);
+    }
+
+    #[test]
+    fn max_buffered_one() {
+        let mut rb = ReorderBuffer::new(0, 1);
+        assert!(rb.insert(2, vec![2]).unwrap().delivered.is_empty()); // buffered
+        assert_eq!(
+            rb.insert(3, vec![3]),
+            Err(ProtocolError::ReorderFull { max_buffered: 1 })
+        );
+        // In-order frame is accepted even at capacity (drains 0, leaves 2).
+        assert_eq!(rb.insert(0, vec![0]).unwrap().delivered, vec![(0, vec![0])]);
+        assert_eq!(rb.next_expected(), 1);
+        assert_eq!(rb.gap_count(), 1);
+        // Filling the gap drains 1 and the still-buffered 2.
+        assert_eq!(rb.insert(1, vec![1]).unwrap().delivered, vec![(1, vec![1]), (2, vec![2])]);
+        assert_eq!(rb.next_expected(), 3);
+    }
+
+    #[test]
+    fn full_then_relieve() {
+        let mut rb = ReorderBuffer::new(0, 3);
+        for seq in 1..=3 {
+            assert!(rb.insert(seq, vec![seq as u8]).unwrap().delivered.is_empty());
+        }
+        assert_eq!(
+            rb.insert(4, vec![4]),
+            Err(ProtocolError::ReorderFull { max_buffered: 3 })
+        );
+        // Draining the prefix frees window space...
+        let r = rb.insert(0, vec![0]).unwrap();
+        assert_eq!(r.delivered, vec![(0, vec![0]), (1, vec![1]), (2, vec![2]), (3, vec![3])]);
+        assert_eq!(rb.next_expected(), 4);
+        // ...so the previously-rejected seq now fits.
+        assert_eq!(rb.insert(4, vec![4]).unwrap().delivered, vec![(4, vec![4])]);
+        assert_eq!(rb.next_expected(), 5);
+    }
 }
