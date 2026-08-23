@@ -1579,6 +1579,23 @@ void urp_rdma_cleanup(struct urp_endpoint *ep)
 			cancel_delayed_work_sync(&ep->qps[i].connect_retry_work);
 	}
 
+	/*
+	 * gap #6 Phase 1: destroy the acceptor's listener FIRST, before tearing
+	 * down the QPs and the shared SRQ/CQs. Otherwise the listener keeps
+	 * accepting CONNECT_REQUESTs throughout teardown -- and a peer whose N QPs
+	 * are all retrying (multi-QP) dials hard enough to land a fresh
+	 * urp_cm_accept_one() that creates a new QP on ep->srq AFTER the QP-destroy
+	 * loop below but BEFORE urp_srq_destroy(), so ib_destroy_srq() returns
+	 * -EBUSY ("Destroy of kernel SRQ shouldn't fail", ib_verbs.h) and ib_free_cq
+	 * warns too. rdma_destroy_id() drains any in-flight CONNECT_REQUEST handler,
+	 * so once this returns no new QP can attach to the SRQ; any QP a just-
+	 * finished accept created is in ep->qps[] and is destroyed just below.
+	 * (Initiator endpoints have no listener, so they never hit this -- matching
+	 * the acceptor-only WARN observed on hp1.)
+	 */
+	if (ep->listen_id)
+		urp_cm_id_destroy(&ep->listen_id);
+
 	/* Disconnect all established QPs. */
 	if (ep->qps) {
 		for (i = 0; i < ep->num_qps; i++) {
@@ -1623,6 +1640,10 @@ void urp_rdma_cleanup(struct urp_endpoint *ep)
 	}
 	ep->ib_dev = NULL;
 
+	/* Listener already destroyed at the top (before QP/SRQ teardown) so no
+	 * late CONNECT_REQUEST could re-attach a QP to the SRQ. Guard remains in
+	 * case an error path left it set; urp_cm_id_destroy is idempotent-safe.
+	 */
 	if (ep->listen_id)
 		urp_cm_id_destroy(&ep->listen_id);
 }
