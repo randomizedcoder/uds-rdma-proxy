@@ -209,7 +209,7 @@
           inherit (nixChecks)
             protocol-tests urp-bench-units urp-bench-rs-tests
             urp-netlink-tests urp-control-tests
-            urp-fast-validate-units urp-reorder-units
+            urp-fast-validate-units urp-reorder-units urp-conn-slot-units
             kernel-module-build
             urp-ko-6_1 urp-ko-6_6 urp-ko-6_12;
         };

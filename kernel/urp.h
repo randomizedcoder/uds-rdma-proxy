@@ -458,7 +458,12 @@ struct urp_endpoint {
 	/* Multi-QP state (Phase 3a Step 2 scaffold; Step 2b fills it) */
 	struct urp_qp	*qps;		/* array of num_qps entries; allocated in activate */
 	atomic_t		qps_connected;	/* count of QPs in ESTABLISHED state */
-	atomic_t		qps_accepted;	/* acceptor: count of CONNECT_REQUESTs processed */
+	atomic_t		qps_accepted;	/* acceptor: count of currently-held QP slots
+						 * (claimed at accept, released on teardown).
+						 * gap #6 Phase 1: no longer the slot index --
+						 * that comes from peer identity when num_qps>1;
+						 * this stays the legacy single-QP/old-peer
+						 * allocator and the held-slot accounting. */
 	atomic_t		rr_counter;	/* round-robin selector cursor */
 
 	/* Stream multiplexing (Phase 3a Step 6) */

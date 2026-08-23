@@ -249,6 +249,16 @@ urp_fast_rx_disposition(enum urp_rx_action action)
 #define URP_CONN_PRIV_MAGIC0		0x55	/* 'U' */
 #define URP_CONN_PRIV_MAGIC1		0x52	/* 'R' */
 #define URP_CONN_PRIV_TRAILER_LEN	3	/* magic0, magic1, kind */
+/*
+ * gap #6 Phase 1: a wider trailer the *initiator* appends when num_qps > 1 so
+ * the acceptor can allocate the target ep->qps[] slot by peer identity instead
+ * of a monotonic CONNECT_REQUEST counter (which races the per-QP retry storm).
+ * [MAGIC0][MAGIC1][kind][qp_index]. num_qps is capped at URP_NUM_QPS_MAX == 32,
+ * so a u8 index is always sufficient. The base 3-byte trailer (kind only) is
+ * unchanged, so the acceptor's rdma_accept reply and every single-QP / fast
+ * path keep the exact legacy wire; only a multi-QP connect carries byte 4.
+ */
+#define URP_CONN_PRIV_QP_TRAILER_LEN	4	/* magic0, magic1, kind, qp_index */
 
 /*
  * Append the kind trailer after @auth_len existing bytes in @buf; return the new
@@ -279,6 +289,42 @@ static inline bool urp_conn_priv_peer_kind(const void *priv, u8 priv_len,
 	    p[auth_len + 1] != URP_CONN_PRIV_MAGIC1)
 		return false;
 	*out_kind = p[auth_len + 2];
+	return true;
+}
+
+/*
+ * gap #6 Phase 1: append the wide [MAGIC0][MAGIC1][kind][qp_index] trailer the
+ * initiator sends when num_qps > 1. @buf must have room for auth_len + 4. The
+ * base kind trailer above is a strict prefix, so a peer that only reads the
+ * kind (urp_conn_priv_peer_kind) still sees a valid trailer.
+ */
+static inline u8 urp_conn_priv_build_qp(u8 *buf, u8 auth_len, u8 kind,
+					u8 qp_index)
+{
+	buf[auth_len]	  = URP_CONN_PRIV_MAGIC0;
+	buf[auth_len + 1] = URP_CONN_PRIV_MAGIC1;
+	buf[auth_len + 2] = kind;
+	buf[auth_len + 3] = qp_index;
+	return auth_len + URP_CONN_PRIV_QP_TRAILER_LEN;
+}
+
+/*
+ * Read the initiator's advertised QP index from the wide trailer. Returns true
+ * and sets *out_qp_index only when a full 4-byte trailer with valid magic is
+ * present; false (old/single-QP peer sent the 3-byte trailer or nothing)
+ * otherwise -- the acceptor then falls back to its legacy counter allocation.
+ */
+static inline bool urp_conn_priv_peer_qp_index(const void *priv, u8 priv_len,
+					       u8 auth_len, u8 *out_qp_index)
+{
+	const u8 *p = priv;
+
+	if (!p || priv_len < (u8)(auth_len + URP_CONN_PRIV_QP_TRAILER_LEN))
+		return false;
+	if (p[auth_len] != URP_CONN_PRIV_MAGIC0 ||
+	    p[auth_len + 1] != URP_CONN_PRIV_MAGIC1)
+		return false;
+	*out_qp_index = p[auth_len + 3];
 	return true;
 }
 
