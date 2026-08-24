@@ -910,6 +910,76 @@ static void test_window_negotiate(struct kunit *test)
 }
 
 /*
+ * gap #6 Phase 2 (PR3): byte-window flow-control arithmetic (urp_window.h).
+ * These pure predicates drive the sender gate, the receiver grant, and the
+ * reorder coupling; pin each boundary. Kept numerically in lock-step with the
+ * userspace tools/urp-window-units.c sandbox check.
+ */
+static void test_window_has_room(struct kunit *test)
+{
+	/* Nothing in flight: always room, even for an oversized frame (no
+	 * deadlock on a frame larger than the whole window).
+	 */
+	KUNIT_EXPECT_TRUE(test, urp_window_has_room(0, 0, 1000, 5000));
+	KUNIT_EXPECT_TRUE(test, urp_window_has_room(100, 100, 1000, 5000));
+	/* Fits exactly at the window edge. */
+	KUNIT_EXPECT_TRUE(test, urp_window_has_room(900, 0, 1000, 100));
+	/* One byte over. */
+	KUNIT_EXPECT_FALSE(test, urp_window_has_room(901, 0, 1000, 100));
+	/* Acked bytes free room. */
+	KUNIT_EXPECT_TRUE(test, urp_window_has_room(1000, 100, 1000, 100));
+	KUNIT_EXPECT_FALSE(test, urp_window_has_room(1000, 100, 1000, 101));
+}
+
+static void test_window_should_grant(struct kunit *test)
+{
+	/* Divisor 4: grant once window/4 more bytes have been delivered. */
+	KUNIT_EXPECT_FALSE(test, urp_window_should_grant(1000, 800, 1000)); /* 200 < 250 */
+	KUNIT_EXPECT_TRUE(test, urp_window_should_grant(1050, 800, 1000));  /* 250 >= 250 */
+	KUNIT_EXPECT_TRUE(test, urp_window_should_grant(250, 0, 1000));     /* first grant */
+	KUNIT_EXPECT_FALSE(test, urp_window_should_grant(249, 0, 1000));
+	KUNIT_EXPECT_TRUE(test, urp_window_should_grant(5000, 0, 1000));    /* well past */
+}
+
+static void test_window_apply_grant(struct kunit *test)
+{
+	/* Forward grant advances the acked high-water. */
+	KUNIT_EXPECT_EQ(test, urp_window_apply_grant(100, 500), (u64)500);
+	/* Stale / duplicate / reordered grant never rewinds (idempotent). */
+	KUNIT_EXPECT_EQ(test, urp_window_apply_grant(500, 100), (u64)500);
+	KUNIT_EXPECT_EQ(test, urp_window_apply_grant(500, 500), (u64)500);
+	KUNIT_EXPECT_EQ(test, urp_window_apply_grant(0, 0), (u64)0);
+}
+
+static void test_window_clamp(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, urp_window_clamp(0), (u64)URP_WINDOW_BYTES_MIN);
+	KUNIT_EXPECT_EQ(test, urp_window_clamp(URP_WINDOW_BYTES_MIN - 1),
+			(u64)URP_WINDOW_BYTES_MIN);
+	KUNIT_EXPECT_EQ(test, urp_window_clamp(URP_WINDOW_BYTES_DEFAULT),
+			(u64)URP_WINDOW_BYTES_DEFAULT);
+	KUNIT_EXPECT_EQ(test, urp_window_clamp(URP_WINDOW_BYTES_MAX + 1),
+			(u64)URP_WINDOW_BYTES_MAX);
+	KUNIT_EXPECT_EQ(test, urp_window_clamp(~0ULL),
+			(u64)URP_WINDOW_BYTES_MAX);
+}
+
+static void test_reorder_depth_for_window(struct kunit *test)
+{
+	/* 1 MiB / 16 = 65536 -> at the ceiling. */
+	KUNIT_EXPECT_EQ(test, urp_reorder_depth_for_window(1UL << 20),
+			URP_REORDER_MAX_ENTRIES);
+	/* 64 KiB / 16 = 4096. */
+	KUNIT_EXPECT_EQ(test, urp_reorder_depth_for_window(1UL << 16), 4096u);
+	/* Tiny window clamps up to the 256 floor. */
+	KUNIT_EXPECT_EQ(test, urp_reorder_depth_for_window(1000),
+			URP_REORDER_MIN_ENTRIES);
+	/* 64 MiB / 16 = 4 Mi entries -> clamps down to the 65536 ceiling. */
+	KUNIT_EXPECT_EQ(test, urp_reorder_depth_for_window(1UL << 26),
+			URP_REORDER_MAX_ENTRIES);
+}
+
+/*
  * gap #6 Phase 2: CREDIT-BYTES CONTROL payload codec. The u64 cumulative byte
  * grant must round-trip little-endian, and the decoder must reject a short
  * payload (the apply path then ignores a malformed grant). Kept numerically in
@@ -1668,6 +1738,12 @@ static struct kunit_case urp_test_cases[] = {
 	/* gap #6 Phase 2: caps trailer + byte-window negotiation */
 	KUNIT_CASE(test_conn_priv_cap_trailer),
 	KUNIT_CASE(test_window_negotiate),
+	/* gap #6 Phase 2 (PR3): byte-window flow-control arithmetic */
+	KUNIT_CASE(test_window_has_room),
+	KUNIT_CASE(test_window_should_grant),
+	KUNIT_CASE(test_window_apply_grant),
+	KUNIT_CASE(test_window_clamp),
+	KUNIT_CASE(test_reorder_depth_for_window),
 	/* design 32: acceptor connection plan (eager-connect gate) */
 	KUNIT_CASE(test_acceptor_eager_connect),
 	/* design 32: credit-grant routing (per-stream vs per-QP pool) */

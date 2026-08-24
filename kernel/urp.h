@@ -36,6 +36,7 @@
 
 #include "include/uapi/linux/urp.h"
 #include "urp_credit.h"
+#include "urp_window.h"
 #include "urp_reorder.h"
 
 /*
@@ -298,17 +299,26 @@ extern unsigned int urp_connect_backoff_base_ms;
 extern unsigned int urp_connect_backoff_ceil_ms;
 
 /*
- * gap #6 Phase 2 (PR2): advertise byte-windowing capability
+ * gap #6 Phase 2: advertise byte-windowing capability
  * (URP_CONN_CAP_WINDOW_BYTES) in this endpoint's CM private_data trailer.
- * Non-zero => advertise. Default 0 (OFF) so PR2 is a pure wire/codec addition
- * with no behaviour change: with nobody advertising, no connection negotiates
- * the window and the frame-credit path is unchanged. PR3 flips the default on
- * together with the blocking sender gate + CREDIT-BYTES grant emission, so the
- * capability bit means "I advertise AND honor byte-windowing" (design 35 §35.3).
- * Writable at runtime via /proc/sys/urp/window_bytes_advertise.
+ * Non-zero => advertise. The capability bit means "I advertise AND honor
+ * byte-windowing": PR3 turns the default ON now that the blocking sender gate +
+ * CREDIT-BYTES grant emission are wired, so two urp peers negotiate the window
+ * and enforce flow control (design 35 §35.3). A peer that does not advertise
+ * (0, or a pre-gap#6 build) keeps the frame-credit path -- the interop gate in
+ * urp_window_negotiate() prevents a byte-gated sender from ever blocking on a
+ * frame-credit-only receiver. Writable via /proc/sys/urp/window_bytes_advertise.
  */
-#define URP_WINDOW_BYTES_ADVERTISE_DEFAULT	0
+#define URP_WINDOW_BYTES_ADVERTISE_DEFAULT	1
 extern unsigned int urp_window_bytes_advertise;
+
+/*
+ * gap #6 Phase 2 (PR3): per-stream byte window in bytes (design 35 §35.3),
+ * clamped to [URP_WINDOW_BYTES_MIN, URP_WINDOW_BYTES_MAX] and read at stream
+ * create. Writable via /proc/sys/urp/window_bytes; a change takes effect on
+ * newly created streams.
+ */
+extern unsigned int urp_window_bytes;
 
 /* urp_sysctl.c -- /proc/sys/urp/ runtime tunables (design 33 Phase 1). */
 int  urp_sysctl_register(void);
@@ -375,6 +385,25 @@ struct urp_stream {
 
 	struct urp_credit	credit;		/* per-stream flow control */
 	struct urp_reorder	*reorder;	/* per-stream reorder buffer */
+
+	/*
+	 * gap #6 Phase 2 (PR3): byte-windowing flow control (design 35 §35.3),
+	 * active only when ep->window_negotiated. Reuses tx_bytes (bytes sent)
+	 * and rx_bytes (bytes delivered to the app) as the cumulative counters;
+	 * these add the acked high-water and the sizing/grant bookkeeping.
+	 *
+	 * window_bytes  fixed per-stream window (urp.window_bytes, set at create).
+	 * tx_bytes_acked cumulative bytes the peer has acked via CREDIT-BYTES.
+	 *               Written by the receive-completion context (single writer,
+	 *               max()-monotonic), read by this stream's TX kthread ->
+	 *               READ_ONCE/WRITE_ONCE, no lock. Sender gate:
+	 *               inflight = tx_bytes - tx_bytes_acked <= window_bytes.
+	 * last_window_grant cumulative rx_bytes at the last CREDIT-BYTES we emitted;
+	 *               receive-completion context only (single writer).
+	 */
+	u64			window_bytes;
+	u64			tx_bytes_acked;
+	u64			last_window_grant;
 
 	struct socket		*uds_sock;	/* this stream's UDS endpoint */
 	struct task_struct	*tx_thread;	/* per-stream TX kthread (Step 7c) */
@@ -703,6 +732,11 @@ int  urp_stream_pump_start(struct urp_stream *stream);
 void urp_stream_pump_stop(struct urp_stream *stream);
 int  urp_emit_credit_frame(struct urp_endpoint *ep, struct urp_qp *qp,
 			   u32 stream_id, u16 grants);
+/* gap #6 Phase 2 (PR3): emit a CONTROL/CREDIT-BYTES grant carrying the
+ * cumulative rx_bytes_delivered high-water for @stream_id in the payload.
+ */
+int  urp_emit_credit_bytes_frame(struct urp_endpoint *ep, struct urp_qp *qp,
+				 u32 stream_id, u64 cumulative_bytes);
 int  urp_emit_pong_on(struct urp_endpoint *ep, struct ib_qp *qp,
 		      const void *ping_payload);
 void urp_probe_work_start(struct urp_endpoint *ep);

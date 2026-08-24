@@ -635,6 +635,30 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 							 dec.credits);
 			}
 		}
+		/*
+		 * gap #6 Phase 2 (PR3): CREDIT-BYTES grant -- the peer echoes the
+		 * cumulative bytes it has delivered to its app as our new acked
+		 * high-water. Apply with max() (idempotent under loss/reorder/dup)
+		 * and wake the stream's TX pump if it is blocked on the window.
+		 * Single writer here (serialized recv completions) => WRITE_ONCE.
+		 */
+		if (dec.flags & URP_CTRL_FLAG_CREDIT_BYTES) {
+			u64 granted;
+
+			if (stream_id != 0 &&
+			    urp_credit_bytes_decode(buf->data + URP_FRAME_HEADER_SIZE,
+						    payload_len, &granted)) {
+				struct urp_stream *s =
+					urp_stream_lookup(ep, stream_id);
+
+				if (s) {
+					WRITE_ONCE(s->tx_bytes_acked,
+						   urp_window_apply_grant(
+							s->tx_bytes_acked, granted));
+					wake_up_interruptible(&ep->send_wq);
+				}
+			}
+		}
 		goto repost;
 	}
 	case URP_RX_PROBE_PONG: {
@@ -750,18 +774,47 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 			struct urp_qp *qp = &ep->qps[qp_idx];
 			atomic64_add(payload_len, &qp->rx_bytes);
 			atomic64_inc(&qp->rx_frames);
-			urp_credit_record_recv(&qp->credit);
-			/*
-			 * Only grant toward multi-stream peers (non-zero
-			 * stream_id). Legacy stream_id == 0 traffic posts only
-			 * as many recv WRs as its echo logic needs; an
-			 * unsolicited CREDIT frame there causes RNR.
-			 */
-			if (stream_id != 0 &&
-			    urp_credit_should_grant(&qp->credit)) {
-				u16 grants = urp_credit_take_grants(&qp->credit);
 
-				urp_emit_credit_frame(ep, qp, stream_id, grants);
+			if (rx_stream && READ_ONCE(ep->window_negotiated)) {
+				/*
+				 * gap #6 Phase 2 (PR3): byte-window grant. Ack the
+				 * cumulative bytes DELIVERED to the app once we
+				 * advance another window/DIVISOR since the last
+				 * grant (design 35 §35.3). rx_bytes is bumped inside
+				 * urp_rx_deliver_stream, so this counts only
+				 * reorder-drained (in-order) delivery -- the
+				 * coupling that keeps the sender from outrunning the
+				 * reorder buffer. Single writer (serialized recv
+				 * completions) => plain last_window_grant access.
+				 */
+				u64 delivered =
+					atomic64_read(&rx_stream->rx_bytes);
+
+				if (urp_window_should_grant(delivered,
+						rx_stream->last_window_grant,
+						READ_ONCE(rx_stream->window_bytes))) {
+					urp_emit_credit_bytes_frame(ep, qp,
+								    stream_id,
+								    delivered);
+					rx_stream->last_window_grant = delivered;
+				}
+			} else {
+				urp_credit_record_recv(&qp->credit);
+				/*
+				 * Legacy frame credits (window not negotiated).
+				 * Only grant toward multi-stream peers (non-zero
+				 * stream_id). Legacy stream_id == 0 traffic posts
+				 * only as many recv WRs as its echo logic needs; an
+				 * unsolicited CREDIT frame there causes RNR.
+				 */
+				if (stream_id != 0 &&
+				    urp_credit_should_grant(&qp->credit)) {
+					u16 grants =
+						urp_credit_take_grants(&qp->credit);
+
+					urp_emit_credit_frame(ep, qp, stream_id,
+							      grants);
+				}
 			}
 		}
 	}

@@ -263,7 +263,11 @@ runner from design 34, which already report goodput in MB/s + Mb/s + % of 25 GbE
    grants, the new CONTROL sub-type + capability gate, the sysctl, the reorder
    coupling. *Wire change → interop-gated.* Success = bulk transfers **always
    complete** (no FIN-drop hangs) and `credit_stalls`/`reorder_drops` stay ~0
-   under sustained load.
+   under sustained load. **DONE (2026-08-24) — see §35.7.2;** the blocking gate
+   took the multi-QP flood to 0 drops and made the reorder-matrix 6/9 GREEN (all
+   realistic frame sizes across `num_qps ∈ {1,4,8}`). Motivated as status.md
+   gap #6 Problem B; shipped as PR #60 (connect race) + PR #61 (wire, default-off)
+   + PR3 (gate, behaviour-on).
 4. **Scale-out F2** — N streams, one QP each; aggregate toward line rate.
 
 Verification gates:
@@ -315,6 +319,43 @@ Option B (phase 2)** — the missing flow control, not the large-frame copy wall
 now the dominant source of instability and small-frame goodput loss. The large-frame
 copy/serialization work (phase 2) and F2 (phase 4) remain the levers for raw peak,
 but they are pointless until the flood/drop is fenced by C.
+
+### 35.7.2 Phase 3 (byte windowing) measured results (2026-08-24)
+
+Phase 3 — the blocking sender gate (§35.3), cumulative-absolute CREDIT-BYTES grants,
+the 5-byte capability trailer + `urp.window_bytes`/`urp.window_bytes_advertise`
+sysctls, and the window→reorder-depth coupling — is implemented and hardware-verified
+on hp1 (sink) ↔ hp3 (source) over 25 GbE RoCEv2, driven by `.#urp-reorder-matrix`
+(sweeps `buffer_size ∈ {64, 4096, 65516}` × `num_qps ∈ {1, 4, 8}`, `verify=full`).
+
+**Result: reorder-matrix 6/9 GREEN.** Every 4096 and 65516 cell across all three
+QP counts passes `BENCH_OK verify=full` with `reorder_drops=0`,
+`buffer_alloc_fails=0`, no dmesg WARN, and no deadlock. The byte window took the
+multi-QP flood from **millions of `reorder_drops` → 0** and gave ~150× delivered
+throughput on the cells that previously wedged.
+
+Two additional hardware-only bugs surfaced under sustained multi-QP load and were
+fixed as part of this phase (both required for the GREEN result):
+
+1. **SYN-race** (`urp_stream_rx_dispatch`): under multi-QP striping a DATA frame
+   routinely arrives at the acceptor *before* its stream's SYN (they ride different
+   QPs and complete out of order). The old code returned `-ENOENT` and **dropped**
+   the frame → a permanent reorder gap the windowed sender cannot refill (no
+   retransmit) → hard deadlock (`rx_delivered=1`, "window stalled" every 5 s).
+   Fixed by creating the stream implicitly on the first frame regardless of SYN
+   (SYN is advisory; the reorder buffer keyed by seq delivers seq 0 first; a real
+   SYN is idempotent). Diagnosed via per-second `urp stats` sampling on both boxes.
+2. **Reorder depth for tiny frames** (`urp_window.h`): a 64-byte `buffer_size`
+   yields ~44-byte payloads, so `window/64=16384` under-sized the reorder cap below
+   the ~24000 frames a 1 MiB window admits → drops. `URP_REORDER_MIN_FRAME` lowered
+   64→16 so the cap (`window/16=65536`) covers any realistic frame.
+
+**Remaining open sub-item (orthogonal to this phase):** the **64-byte `buffer_size`
+cells still fail `verify=full` — but they fail even at `num_qps=1`** (single QP, no
+reorder, no multi-QP striping; `rx≈50k` delivered, `reorder_drops=0`). This is a
+**pre-existing small-frame correctness issue**, not a windowing regression — the VM
+pair-test Phases 10f/10g verify small frames byte-exact with windowing on. 64 B is a
+pathological stress size, not a Redpanda workload; tracked separately from gap #6.
 
 ## 35.8 Risks
 

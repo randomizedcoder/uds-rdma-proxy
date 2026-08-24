@@ -33,13 +33,18 @@
 unsigned int urp_connect_max_attempts	 = URP_CONNECT_MAX_ATTEMPTS_DEFAULT;
 unsigned int urp_connect_backoff_base_ms = URP_CONNECT_BACKOFF_BASE_MS_DEFAULT;
 unsigned int urp_connect_backoff_ceil_ms = URP_CONNECT_BACKOFF_CEIL_MS_DEFAULT;
-/* gap #6 Phase 2 (PR2): advertise byte-windowing capability. Default off. */
+/* gap #6 Phase 2: advertise byte-windowing capability (PR3: default on). */
 unsigned int urp_window_bytes_advertise	 = URP_WINDOW_BYTES_ADVERTISE_DEFAULT;
+/* gap #6 Phase 2 (PR3): per-stream byte window; clamped at stream create. */
+unsigned int urp_window_bytes		 = URP_WINDOW_BYTES_DEFAULT;
 
 /* proc_douintvec_minmax bounds (extra1/extra2 are void*, so non-const). */
 static unsigned int urp_uint_zero;			/* 0 */
 static unsigned int urp_uint_one = 1;
 static unsigned int urp_uint_max = UINT_MAX;
+/* gap #6 Phase 2 (PR3): byte-window bounds (mirror urp_window_clamp). */
+static unsigned int urp_window_bytes_min = URP_WINDOW_BYTES_MIN;
+static unsigned int urp_window_bytes_max = URP_WINDOW_BYTES_MAX;
 
 static struct ctl_table urp_sysctls[] = {
 	{
@@ -80,6 +85,18 @@ static struct ctl_table urp_sysctls[] = {
 		.proc_handler	= proc_douintvec_minmax,
 		.extra1		= &urp_uint_zero,
 		.extra2		= &urp_uint_one,
+	},
+	{
+		/* gap #6 Phase 2 (PR3): per-stream byte window, applied at
+		 * stream create (and re-clamped by urp_window_clamp there).
+		 */
+		.procname	= "window_bytes",
+		.data		= &urp_window_bytes,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec_minmax,
+		.extra1		= &urp_window_bytes_min,
+		.extra2		= &urp_window_bytes_max,
 	},
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
 	{ }	/* sentinel: required before 6.11, forbidden after */
