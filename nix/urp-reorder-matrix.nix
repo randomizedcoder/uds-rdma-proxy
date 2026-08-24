@@ -60,7 +60,11 @@ pkgs.writeShellApplication {
     INIT_EP=pair_initiator; INIT_SOCK=/run/urp.sock     # initiator listenPath: source --connect here
 
     # Small -> large so no cell aligns bench (24B hdr + payload) to urp frames.
-    BUFSIZES="''${URP_REORDER_BUFSIZES:-64 4096 65516}"
+    # 68 = URP_BUFFER_SIZE_MIN (URP_FRAME_HEADER_SIZE 20 + URP_PONG_PAYLOAD_SIZE
+    # 48): the smallest buffer that can still receive a QP-health PONG. Anything
+    # below it is rejected at endpoint-create (a smaller recv buffer overflows on
+    # the first PONG and crash-loops the QP), so 68 is the true small-frame floor.
+    BUFSIZES="''${URP_REORDER_BUFSIZES:-68 4096 65516}"
     # 1 = control (must NOT reorder); 4/8 = the cross-QP skew cases.
     NUMQPS="''${URP_REORDER_NUMQPS:-1 4 8}"
     BUFCOUNT="''${URP_REORDER_BUFCOUNT:-1024}"

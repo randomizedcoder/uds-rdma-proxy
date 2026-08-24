@@ -86,10 +86,11 @@ static inline u16 urp_frame_decode_credits(const void *buf)
  * PONG (48 bytes): same layout for fields 0..16 as PING (echoed),
  *   then [24..32) t_recv_real, [32..40) t_pong_mono, [40..48) t_pong_real.
  *
- * Sizes match crates/uds-rdma-protocol/src/probe.rs.
+ * URP_PING_PAYLOAD_SIZE (32) and URP_PONG_PAYLOAD_SIZE (48) are wire constants
+ * defined in include/uapi/linux/urp.h (they also set URP_BUFFER_SIZE_MIN); the
+ * kernel's urp.h pulls that in before this file. Sizes match
+ * crates/uds-rdma-protocol/src/probe.rs.
  */
-#define URP_PING_PAYLOAD_SIZE	32
-#define URP_PONG_PAYLOAD_SIZE	48
 #define URP_PROBE_FLAG_PONG	BIT(0)
 
 static inline void urp_ping_encode(void *buf, u32 probe_seq, u16 qp_index,

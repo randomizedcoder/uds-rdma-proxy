@@ -260,17 +260,19 @@ Genuinely open:
    Two further HW-only bugs surfaced and fixed under PR3: a **SYN-race** (a DATA
    frame arriving before its stream's SYN on a different QP was dropped → gap the
    windowed sender can't refill → deadlock; fixed by implicit stream creation) and
-   the **reorder depth coupling** for tiny frames (MIN_FRAME 64→16). **HW result:
-   reorder-matrix 6/9 GREEN** — every 4096 and 65516 cell × `num_qps ∈ {1,4,8}`
-   passes `BENCH_OK verify=full`, `reorder_drops=0`, `buffer_alloc_fails=0`, no
-   dmesg WARN, no deadlock (byte window took drops millions→0, ~150× throughput on
-   passing cells). **Remaining open sub-item:** the **64-byte `buffer_size` cells
-   still fail `verify=full` — but they fail even at `num_qps=1`** (single QP, no
-   reorder, no multi-QP striping; `rx≈50k` delivered, `drops=0`), so this is a
-   **pre-existing small-frame correctness issue orthogonal to multi-QP flow
-   control**, not a windowing regression (VM pair-test Phases 10f/10g verify small
-   frames byte-exact with windowing on). 64 B is a pathological stress size, not a
-   Redpanda workload. Repro: `nix run .#urp-reorder-matrix -- hp1 hp3 10.10.2.1`.
+   the **reorder depth coupling** for tiny frames (MIN_FRAME 64→16). A third,
+   **pre-existing** bug then surfaced at the smallest sweep size: a QP-health
+   **PONG frame is 68 bytes** (`URP_FRAME_HEADER_SIZE 20 + URP_PONG_PAYLOAD_SIZE
+   48`) but `buffer_size=64` posts 64-byte recv buffers, so the first PONG overran
+   the buffer → ib `local length error` → NAK → `remote invalid request` → QP
+   crash-loop (windowing-independent: it reproduced with `advertise=0`, and per-QP
+   so it failed even at `num_qps=1`). Fixed by raising `URP_BUFFER_SIZE_MIN` to
+   `URP_FRAME_HEADER_SIZE + URP_PONG_PAYLOAD_SIZE` (= 68) — the netlink policy now
+   rejects sub-68 buffers with ERANGE rather than letting them crash-loop.
+   **HW result: reorder-matrix 9/9 GREEN** — every cell (68 / 4096 / 65516 ×
+   `num_qps ∈ {1,4,8}`) passes `BENCH_OK verify=full`, `reorder_drops=0`,
+   `buffer_alloc_fails=0`, no dmesg WARN, no deadlock (byte window took drops
+   millions→0). Repro: `nix run .#urp-reorder-matrix -- hp1 hp3 10.10.2.1`.
 7. **Roadmap (not gaps, deferred by design).** urp-fast PR6 (Rust backend) / PR7
    (Seastar); design 35 further windowing; design 36 CUBIC congestion control
    (now motivated by gap #6 — multi-QP bursts exhaust RC transport retries, so the

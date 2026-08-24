@@ -328,8 +328,8 @@ sysctls, and the window→reorder-depth coupling — is implemented and hardware
 on hp1 (sink) ↔ hp3 (source) over 25 GbE RoCEv2, driven by `.#urp-reorder-matrix`
 (sweeps `buffer_size ∈ {64, 4096, 65516}` × `num_qps ∈ {1, 4, 8}`, `verify=full`).
 
-**Result: reorder-matrix 6/9 GREEN.** Every 4096 and 65516 cell across all three
-QP counts passes `BENCH_OK verify=full` with `reorder_drops=0`,
+**Result: reorder-matrix 9/9 GREEN** (68 / 4096 / 65516 × `num_qps ∈ {1,4,8}`).
+Every cell passes `BENCH_OK verify=full` with `reorder_drops=0`,
 `buffer_alloc_fails=0`, no dmesg WARN, and no deadlock. The byte window took the
 multi-QP flood from **millions of `reorder_drops` → 0** and gave ~150× delivered
 throughput on the cells that previously wedged.
@@ -350,12 +350,15 @@ fixed as part of this phase (both required for the GREEN result):
    the ~24000 frames a 1 MiB window admits → drops. `URP_REORDER_MIN_FRAME` lowered
    64→16 so the cap (`window/16=65536`) covers any realistic frame.
 
-**Remaining open sub-item (orthogonal to this phase):** the **64-byte `buffer_size`
-cells still fail `verify=full` — but they fail even at `num_qps=1`** (single QP, no
-reorder, no multi-QP striping; `rx≈50k` delivered, `reorder_drops=0`). This is a
-**pre-existing small-frame correctness issue**, not a windowing regression — the VM
-pair-test Phases 10f/10g verify small frames byte-exact with windowing on. 64 B is a
-pathological stress size, not a Redpanda workload; tracked separately from gap #6.
+A third, **pre-existing** bug surfaced at the smallest sweep size and was fixed to
+reach 9/9: a QP-health **PONG is 68 bytes** (`URP_FRAME_HEADER_SIZE 20 +
+URP_PONG_PAYLOAD_SIZE 48`) but `buffer_size=64` posts 64-byte recv buffers, so the
+first PONG overran the buffer → ib `local length error` → NAK → `remote invalid
+request` → QP crash-loop. It reproduced with windowing OFF (`advertise=0`) and per-QP
+(so it failed even at `num_qps=1`) — orthogonal to the windowing work. Fixed by
+raising `URP_BUFFER_SIZE_MIN` to `URP_FRAME_HEADER_SIZE + URP_PONG_PAYLOAD_SIZE`
+(= 68): the netlink policy now rejects a sub-68 `buffer_size` with ERANGE instead of
+letting it crash-loop. The matrix's smallest sweep size moved 64 → 68 accordingly.
 
 ## 35.8 Risks
 

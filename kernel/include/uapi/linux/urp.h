@@ -20,6 +20,16 @@
 #define URP_FRAME_TYPE_CONTROL	0x01
 #define URP_FRAME_TYPE_PROBE	0x02
 
+/*
+ * QP health-probe payload sizes (carried inside a URP_FRAME_TYPE_PROBE frame;
+ * byte layout + encoders in kernel/urp_frame.h). Wire constants -- they match
+ * crates/uds-rdma-protocol/src/probe.rs. A PONG is the largest control frame
+ * urp ever emits (URP_FRAME_HEADER_SIZE + URP_PONG_PAYLOAD_SIZE == 68), which
+ * sets the receive-buffer floor below (URP_BUFFER_SIZE_MIN).
+ */
+#define URP_PING_PAYLOAD_SIZE	32
+#define URP_PONG_PAYLOAD_SIZE	48
+
 /* Data flags */
 #define URP_DATA_FLAG_SYN	(1 << 0)
 #define URP_DATA_FLAG_FIN	(1 << 1)
@@ -76,7 +86,19 @@
 #define URP_NUM_QPS_MIN		1
 #define URP_BUFFER_COUNT_MIN	16
 #define URP_BUFFER_COUNT_MAX	65536	/* hard cap: bounds the pool allocation */
-#define URP_BUFFER_SIZE_MIN	URP_FRAME_HEADER_SIZE
+/*
+ * A receive buffer must hold the largest frame the peer can send. DATA frames
+ * are bounded by buffer_size itself (payload = buffer_size - header), but the
+ * fixed-size QP health-probe PONG is URP_FRAME_HEADER_SIZE + URP_PONG_PAYLOAD_SIZE
+ * (== 68) regardless of buffer_size. A smaller buffer overflows on the very first
+ * PONG -- the receiver raises an ib "local length error", NAKs, and the sender's
+ * QP tears down into a reconnect crash-loop (observed on hp1<->hp3 at
+ * buffer_size=64: only 64 of a 68-byte PONG fits). So the floor is the PONG size,
+ * not the bare header. The netlink policy (urp_buffer_size_range, urp_netlink.c)
+ * enforces this floor -- a request below it is rejected with ERANGE rather than
+ * silently accepted -- and urp_resolve_buf_size() also clamps as a backstop.
+ */
+#define URP_BUFFER_SIZE_MIN	(URP_FRAME_HEADER_SIZE + URP_PONG_PAYLOAD_SIZE)
 #define URP_BUFFER_SIZE_MAX	65536
 
 /* Defaults applied when attribute absent in NEW_ENDPOINT */

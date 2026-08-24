@@ -19,7 +19,12 @@ pub const URP_PASSWORD_MAX: usize = 16;
 pub const URP_NUM_QPS_MAX: u32 = 32;
 pub const URP_NUM_QPS_MIN: u32 = 1;
 pub const URP_BUFFER_COUNT_MIN: u32 = 16;
-pub const URP_BUFFER_SIZE_MIN: u32 = 20;
+// = URP_FRAME_HEADER_SIZE (20) + URP_PONG_PAYLOAD_SIZE (48). A recv buffer must
+// hold the largest frame urp emits (a PONG, 68 bytes); a smaller one overflows
+// on the first PONG and crash-loops the QP. Kept in step with the kernel's
+// uapi/linux/urp.h URP_BUFFER_SIZE_MIN (an expression there, so it is excluded
+// from the uapi_constants_match_kernel_header token-parity test below).
+pub const URP_BUFFER_SIZE_MIN: u32 = 68;
 pub const URP_BUFFER_SIZE_MAX: u32 = 65536;
 
 pub const URP_DEFAULT_PORT: u16 = 4791;

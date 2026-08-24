@@ -574,6 +574,21 @@ static void test_probe_payload_sizes(struct kunit *test)
 	 */
 	KUNIT_EXPECT_EQ(test, URP_PING_PAYLOAD_SIZE, 32);
 	KUNIT_EXPECT_EQ(test, URP_PONG_PAYLOAD_SIZE, 48);
+
+	/*
+	 * The receive-buffer floor must hold the largest frame urp emits -- a
+	 * PONG (header + PONG payload = 68). A buffer_size below this overflows
+	 * a recv WQE on the first PONG (ib local-length-error -> QP crash-loop),
+	 * so URP_BUFFER_SIZE_MIN is defined as exactly that, and any configured
+	 * buffer_size is clamped up to it.
+	 */
+	KUNIT_EXPECT_EQ(test, URP_BUFFER_SIZE_MIN,
+			URP_FRAME_HEADER_SIZE + URP_PONG_PAYLOAD_SIZE);
+	KUNIT_EXPECT_GE(test, URP_BUFFER_SIZE_MIN,
+			URP_FRAME_HEADER_SIZE + URP_PONG_PAYLOAD_SIZE);
+	KUNIT_EXPECT_EQ(test, urp_resolve_buf_size(64), URP_BUFFER_SIZE_MIN);
+	KUNIT_EXPECT_EQ(test, urp_resolve_buf_size(URP_BUFFER_SIZE_MIN),
+			URP_BUFFER_SIZE_MIN);
 }
 
 /*
