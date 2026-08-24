@@ -270,7 +270,7 @@ void urp_connect_work_fn(struct work_struct *w)
 	struct urp_qp *qp = container_of(w, struct urp_qp, connect_work);
 	struct urp_endpoint *ep = qp->ep;
 	struct rdma_conn_param param = {};
-	u8 qp_priv[1 + URP_PSK_HASH_LEN + URP_CONN_PRIV_QP_TRAILER_LEN];
+	u8 qp_priv[1 + URP_PSK_HASH_LEN + URP_CONN_PRIV_CAP_TRAILER_LEN];
 	int ret;
 
 	param.responder_resources = 1;
@@ -281,30 +281,24 @@ void urp_connect_work_fn(struct work_struct *w)
 	 * Phase 3b Step 8 + design 31 D1: private_data = optional PSK auth
 	 * (acceptor memcmp's it, rdma_reject's on mismatch) + a trailer.
 	 *
-	 * gap #6 Phase 1: when num_qps > 1, append the WIDE trailer stamping this
-	 * QP's index (urp_conn_priv_build_qp) so the acceptor allocates its
-	 * ep->qps[] slot by identity instead of a monotonic counter -- the fix for
-	 * the multi-QP connect retry storm. The auth prefix is copied from the
-	 * shared ep->conn_priv so a fixed-offset PSK memcmp is unchanged. A plain
-	 * uds endpoint sends this too (it sent nothing before): safe, because a
-	 * no-password acceptor never inspects private_data for auth, and both peers
-	 * run this build for any multi-QP config.
-	 *
-	 * Single-QP / legacy keeps the EXACT pre-gap#6 wire: ep->conn_priv (auth +
-	 * optional kind trailer), or nothing at all for a no-password uds endpoint
-	 * (conn_priv_len == 0) -- byte-identical to the pre-interop wire.
+	 * gap #6 Phase 1 + 2: always append the full trailer
+	 * [MAGIC][MAGIC][kind][qp_index][caps]. The @qp_index lets the acceptor
+	 * allocate its ep->qps[] slot by identity instead of a monotonic counter
+	 * (Phase 1: the fix for the multi-QP connect retry storm); @caps advertises
+	 * byte-windowing support (Phase 2), read live from the sysctl so it is
+	 * symmetric with the accept reply. The auth prefix is copied from the
+	 * shared ep->conn_priv so a fixed-offset PSK memcmp is unchanged. This is
+	 * interop-safe for single-QP / old peers: readers length-guard + re-check
+	 * magic, so a peer reading only kind or qp_index sees its own valid prefix.
 	 */
-	if (ep->num_qps > 1) {
-		if (ep->auth_len)
-			memcpy(qp_priv, ep->conn_priv, ep->auth_len);
-		param.private_data = qp_priv;
-		param.private_data_len =
-			urp_conn_priv_build_qp(qp_priv, ep->auth_len, ep->kind,
-					       (u8)qp->index);
-	} else if (ep->conn_priv_len) {
-		param.private_data = ep->conn_priv;
-		param.private_data_len = ep->conn_priv_len;
-	}
+	if (ep->auth_len)
+		memcpy(qp_priv, ep->conn_priv, ep->auth_len);
+	param.private_data = qp_priv;
+	param.private_data_len =
+		urp_conn_priv_build_full(qp_priv, ep->auth_len, ep->kind,
+					 (u8)qp->index,
+					 READ_ONCE(urp_window_bytes_advertise) ?
+						URP_CONN_CAP_WINDOW_BYTES : 0);
 
 	ret = rdma_connect(qp->cm_id, &param);
 	if (ret)
@@ -846,6 +840,7 @@ static int urp_cm_accept_one(struct rdma_cm_id *child, struct urp_endpoint *ep,
 {
 	struct urp_cm_ctx *child_ctx;
 	struct rdma_conn_param param = {};
+	u8 reply_priv[1 + URP_PSK_HASH_LEN + URP_CONN_PRIV_CAP_TRAILER_LEN];
 	u32 qp_index;
 	int ret;
 
@@ -1003,15 +998,24 @@ static int urp_cm_accept_one(struct rdma_cm_id *child, struct urp_endpoint *ep,
 	param.initiator_depth = 1;
 	param.rnr_retry_count = 7;
 	/*
-	 * Phase 3b Step 8 + design 31 D1: reply with our conn_priv (auth echo +
-	 * kind trailer). The initiator reads the trailer at ESTABLISHED to learn
-	 * our kind and suppress probing if we are fast; an old initiator ignores
-	 * it. (Initiator-validates-acceptor auth is still not wired -- only the
-	 * kind advertisement is consumed today.)
+	 * Phase 3b Step 8 + design 31 D1: reply with the auth echo + trailer. The
+	 * initiator reads the trailer at ESTABLISHED to learn our kind (suppress
+	 * probing if we are fast) and, gap #6 Phase 2, our byte-windowing
+	 * capability. Built live into a stack buffer (rdma_accept copies it into
+	 * the REP synchronously) so @caps reflects the current sysctl and stays
+	 * symmetric with the initiator's connect trailer. qp_index is 0 in the
+	 * reply -- the acceptor does not stamp a slot index. An old initiator
+	 * length-guards past the extra bytes and ignores them.
 	 */
-	if (ep->conn_priv_len) {
-		param.private_data = ep->conn_priv;
-		param.private_data_len = ep->conn_priv_len;
+	{
+		if (ep->auth_len)
+			memcpy(reply_priv, ep->conn_priv, ep->auth_len);
+		param.private_data = reply_priv;
+		param.private_data_len =
+			urp_conn_priv_build_full(reply_priv, ep->auth_len,
+						 ep->kind, 0,
+						 READ_ONCE(urp_window_bytes_advertise) ?
+							URP_CONN_CAP_WINDOW_BYTES : 0);
 	}
 
 	/*
@@ -1019,14 +1023,24 @@ static int urp_cm_accept_one(struct rdma_cm_id *child, struct urp_endpoint *ep,
 	 * trailer so a probing acceptor (num_qps > 1) skips a fast peer. Absent /
 	 * old-build trailer => treated as UDS (probed as before). Set before
 	 * ESTABLISHED so the first probe tick already sees it.
+	 *
+	 * gap #6 Phase 2: also learn whether the initiator advertised
+	 * byte-windowing support. The acceptor's own ESTABLISHED event carries no
+	 * private_data, so this connect-side read is the acceptor's authoritative
+	 * source (the ESTABLISHED handler only refreshes it on the initiator).
 	 */
 	{
 		u8 peer_kind;
+		u8 peer_caps;
 
 		ep->qps[qp_index].peer_is_fast =
 			urp_conn_priv_peer_kind(peer_priv, peer_priv_len,
 						ep->auth_len, &peer_kind) &&
 			peer_kind == URP_EP_KIND_FAST;
+		ep->qps[qp_index].peer_supports_window =
+			urp_conn_priv_peer_caps(peer_priv, peer_priv_len,
+						ep->auth_len, &peer_caps) &&
+			(peer_caps & URP_CONN_CAP_WINDOW_BYTES);
 	}
 
 	ret = rdma_accept(child, &param);
@@ -1125,6 +1139,12 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 			 * cannot PONG during bring-up, and probing it would trip
 			 * the silent-drop reconnect in a churn loop. Absent /
 			 * old-build trailer => UDS => probe as before.
+			 *
+			 * gap #6 Phase 2: the reply also carries the acceptor's
+			 * byte-windowing capability. Only the INITIATOR reads it
+			 * here -- the acceptor's own ESTABLISHED event has no
+			 * private_data and would clobber the value it learned from
+			 * the connect trailer at accept time.
 			 */
 			ep->qps[ctx->qp_index].peer_is_fast =
 				urp_conn_priv_peer_kind(
@@ -1132,6 +1152,16 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 					event->param.conn.private_data_len,
 					ep->auth_len, &peer_kind) &&
 				peer_kind == URP_EP_KIND_FAST;
+			if (ep->is_initiator) {
+				u8 peer_caps;
+
+				ep->qps[ctx->qp_index].peer_supports_window =
+					urp_conn_priv_peer_caps(
+						event->param.conn.private_data,
+						event->param.conn.private_data_len,
+						ep->auth_len, &peer_caps) &&
+					(peer_caps & URP_CONN_CAP_WINDOW_BYTES);
+			}
 			/* Design 33 Phase 1: a fresh establish clears the
 			 * connect-retry budget, so a later disconnect gets its
 			 * own full backoff window.
@@ -1156,9 +1186,22 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 			if ((u32)atomic_inc_return(&ep->qps_connected) ==
 			    ep->num_qps) {
 				ep->connected = true;
+				/*
+				 * gap #6 Phase 2: latch byte-windowing negotiation
+				 * -- enabled iff we advertise it AND the peer did.
+				 * peer_supports_window is identical across a
+				 * connection's QPs (same peer endpoint), so the
+				 * just-established QP is representative. PR2 only
+				 * records this; PR3's sender gate / grant emission
+				 * consume it.
+				 */
+				ep->window_negotiated = urp_window_negotiate(
+					READ_ONCE(urp_window_bytes_advertise) != 0,
+					ep->qps[ctx->qp_index].peer_supports_window);
 				complete(&ep->cm_done);
-				pr_info("all %u QPs established\n",
-					ep->num_qps);
+				pr_info("all %u QPs established (window=%s)\n",
+					ep->num_qps,
+					ep->window_negotiated ? "on" : "off");
 			}
 		}
 		break;

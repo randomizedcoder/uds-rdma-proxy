@@ -206,20 +206,29 @@ int urp_endpoint_create(struct urp_endpoint *cfg, struct urp_endpoint **out)
 	/*
 	 * Design 31 D1 interop: prebuild the CM private_data we advertise on
 	 * rdma_connect / rdma_accept. It starts with the optional PSK auth payload
-	 * (so an acceptor's fixed-offset memcmp is unchanged). Only a FAST endpoint
-	 * then appends a kind trailer so a peer can learn it is fast and skip
-	 * probing it. A UDS endpoint keeps the EXACT legacy wire -- auth-if-password
-	 * else nothing -- so uds<->uds behaviour is byte-for-byte unchanged (a peer
-	 * that receives no trailer already assumes UDS, which is correct).
+	 * (so an acceptor's fixed-offset memcmp is unchanged), followed by the
+	 * canonical trailer [MAGIC][MAGIC][kind][qp_index][caps].
+	 *
+	 * gap #6 Phase 2 (PR2): every endpoint (UDS and FAST, single- and multi-QP)
+	 * now carries the full trailer so byte-windowing capability can be
+	 * negotiated -- notably on the single-QP UDS path, which the hardware
+	 * matrix shows overruns. This is interop-safe: readers length-guard and
+	 * re-check magic (urp_frame.h), so an old/PR1 peer that gets a longer
+	 * trailer reads only its own prefix (kind / qp_index) and ignores the rest;
+	 * a peer that sent no trailer still reads back as UDS/no-caps, unchanged.
+	 * The live connect/accept paths rebuild this trailer into a stack buffer
+	 * so @caps reflects the current urp.window_bytes_advertise sysctl and stays
+	 * symmetric on both sides; this prebuilt copy holds the auth prefix and a
+	 * create-time baseline. qp_index is 0 here (the per-QP connect stamps its
+	 * own index; the accept reply uses 0).
 	 */
 	ep->auth_len = ep->has_password ? sizeof(ep->auth_priv) : 0;
 	if (ep->auth_len)
 		memcpy(ep->conn_priv, ep->auth_priv, ep->auth_len);
-	if (urp_ep_is_fast(ep))
-		ep->conn_priv_len = urp_conn_priv_build(ep->conn_priv,
-							ep->auth_len, ep->kind);
-	else
-		ep->conn_priv_len = ep->auth_len;
+	ep->conn_priv_len = urp_conn_priv_build_full(
+		ep->conn_priv, ep->auth_len, ep->kind, 0,
+		READ_ONCE(urp_window_bytes_advertise) ?
+			URP_CONN_CAP_WINDOW_BYTES : 0);
 
 	ep->is_initiator = initiator;
 	ep->state        = URP_STATE_CREATING;

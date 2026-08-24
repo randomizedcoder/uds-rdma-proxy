@@ -328,4 +328,74 @@ static inline bool urp_conn_priv_peer_qp_index(const void *priv, u8 priv_len,
 	return true;
 }
 
+/*
+ * gap #6 Phase 2 (PR2): the full trailer [MAGIC0][MAGIC1][kind][qp_index][caps].
+ * @caps advertises connection capabilities (URP_CONN_CAP_*), negotiated only
+ * when BOTH peers advertise (design 35 §35.3). This is now the single canonical
+ * trailer both the connect and accept paths emit: it is a strict superset of
+ * the kind (3) and qp (4) trailers, so an old/PR1 peer reading only kind or
+ * qp_index still sees valid magic and its own prefix. @qp_index is 0 for a
+ * single-QP endpoint. @buf must have room for auth_len + 5.
+ */
+#define URP_CONN_PRIV_CAP_TRAILER_LEN	5	/* magic0, magic1, kind, qp_index, caps */
+
+static inline u8 urp_conn_priv_build_full(u8 *buf, u8 auth_len, u8 kind,
+					  u8 qp_index, u8 caps)
+{
+	buf[auth_len]	  = URP_CONN_PRIV_MAGIC0;
+	buf[auth_len + 1] = URP_CONN_PRIV_MAGIC1;
+	buf[auth_len + 2] = kind;
+	buf[auth_len + 3] = qp_index;
+	buf[auth_len + 4] = caps;
+	return auth_len + URP_CONN_PRIV_CAP_TRAILER_LEN;
+}
+
+/*
+ * Read the peer's advertised capability bits from the full trailer. Returns
+ * true and sets *out_caps only when a full 5-byte trailer with valid magic is
+ * present; false (old/PR1 peer sent a shorter trailer, or nothing) otherwise --
+ * the caller then treats the peer as not supporting any capability, so the
+ * byte-window path stays disabled and both sides fall back to frame credits.
+ */
+static inline bool urp_conn_priv_peer_caps(const void *priv, u8 priv_len,
+					   u8 auth_len, u8 *out_caps)
+{
+	const u8 *p = priv;
+
+	if (!p || priv_len < (u8)(auth_len + URP_CONN_PRIV_CAP_TRAILER_LEN))
+		return false;
+	if (p[auth_len] != URP_CONN_PRIV_MAGIC0 ||
+	    p[auth_len + 1] != URP_CONN_PRIV_MAGIC1)
+		return false;
+	*out_caps = p[auth_len + 4];
+	return true;
+}
+
+/*
+ * gap #6 Phase 2 (PR2): CREDIT-BYTES CONTROL payload codec. A CONTROL frame
+ * carrying URP_CTRL_FLAG_CREDIT_BYTES puts a u64 cumulative rx_bytes_delivered
+ * (the absolute high-water mark the receiver has handed to the app) in the
+ * frame *payload* -- the first CONTROL frame with a non-zero payload. Modeled
+ * on the PROBE payload codecs above. Mirrors crates/uds-rdma-protocol
+ * src/frame.rs CreditBytesPayload.
+ */
+static inline void urp_credit_bytes_encode(void *payload, u64 abs_bytes)
+{
+	put_unaligned_le64(abs_bytes, (u8 *)payload);
+}
+
+/*
+ * Decode the cumulative byte grant. Returns true and sets *out only when at
+ * least URP_CREDIT_BYTES_PAYLOAD_SIZE bytes are present; false (short/absent
+ * payload) otherwise -- the apply path then ignores the malformed grant.
+ */
+static inline bool urp_credit_bytes_decode(const void *payload, u32 payload_len,
+					   u64 *out)
+{
+	if (!payload || payload_len < URP_CREDIT_BYTES_PAYLOAD_SIZE)
+		return false;
+	*out = get_unaligned_le64((const u8 *)payload);
+	return true;
+}
+
 #endif /* _URP_FRAME_H */

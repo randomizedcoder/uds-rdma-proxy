@@ -49,12 +49,22 @@ pub const CTRL_FLAG_STREAM_WINDOW: u8 = 1 << 3;
 /// Authentication handshake frame (stream_id must be 0).
 pub const CTRL_FLAG_AUTH: u8 = 1 << 4;
 
+/// gap #6 Phase 2 (PR2): byte-denominated flow-control grant. Carries a u64
+/// cumulative `rx_bytes_delivered` in the CONTROL payload (payload_length = 8),
+/// since the 16-bit `credits_granted` header field cannot hold a byte count.
+/// Mirrors `URP_CTRL_FLAG_CREDIT_BYTES` in kernel/include/uapi/linux/urp.h.
+pub const CTRL_FLAG_CREDIT_BYTES: u8 = 1 << 5;
+
+/// gap #6 Phase 2 (PR2): CREDIT-BYTES CONTROL payload size (u64, little-endian).
+pub const CREDIT_BYTES_PAYLOAD_SIZE: usize = 8;
+
 /// Mask of all valid control flags.
 pub const CTRL_FLAGS_VALID: u8 = CTRL_FLAG_CREDIT
     | CTRL_FLAG_QP_DISABLE
     | CTRL_FLAG_QP_ENABLE
     | CTRL_FLAG_STREAM_WINDOW
-    | CTRL_FLAG_AUTH;
+    | CTRL_FLAG_AUTH
+    | CTRL_FLAG_CREDIT_BYTES;
 
 // -- Probe frame flags (frame_type = 0x02) --
 

@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Userspace table-driven tests for the acceptor QP-slot decision
- * (kernel/urp_conn_plan.h :: urp_acceptor_slot_decide, status.md gap #6
- * Phase 1). Drives the exact same pure predicate the CM accept path and the
- * in-kernel KUnit suite (kernel/urp_test.c) use -- one decision, two drivers;
- * this fast sandboxed gate (nix check urp-conn-slot-units) and the KUnit-in-VM
- * pass must always agree.
+ * Userspace table-driven tests for the pure acceptor connection-plan predicates
+ * in kernel/urp_conn_plan.h (status.md gap #6): urp_acceptor_slot_decide
+ * (Phase 1) and urp_window_negotiate (Phase 2). Drives the exact same pure
+ * functions the CM path and the in-kernel KUnit suite (kernel/urp_test.c) use --
+ * one decision, two drivers; this fast sandboxed gate (nix check
+ * urp-conn-slot-units) and the KUnit-in-VM pass must always agree.
  *
- * Coverage: identity allocation (positive), out-of-range rejects (negative),
- * the num_qps==1 / max-index boundaries, occupied-slot reuse, and the legacy
- * counter fallback for an old / single-QP peer that advertises no qp_index.
+ * Coverage: slot decision -- identity allocation (positive), out-of-range
+ * rejects (negative), the num_qps==1 / max-index boundaries, occupied-slot
+ * reuse, and the legacy counter fallback for an old / single-QP peer that
+ * advertises no qp_index. Window negotiation -- the both-must-advertise AND
+ * truth table (design 35 §35.3 interop gate).
  */
 
 #include <stdio.h>
@@ -108,9 +110,32 @@ static void run_cases(void)
 	}
 }
 
+/* gap #6 Phase 2: byte-windowing is on iff BOTH peers advertise. */
+static void run_negotiate_cases(void)
+{
+	const struct {
+		const char	*name;
+		bool		local_adv;
+		bool		peer_adv;
+		bool		want;
+	} cases[] = {
+		{ "neither",   false, false, false },
+		{ "local_only", true, false, false },
+		{ "peer_only", false, true,  false },
+		{ "both",       true, true,  true },
+	};
+	unsigned int i;
+
+	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+		CHECK_EQ(urp_window_negotiate(cases[i].local_adv,
+					      cases[i].peer_adv),
+			 cases[i].want, "window_negotiate %s", cases[i].name);
+}
+
 int main(void)
 {
 	run_cases();
+	run_negotiate_cases();
 
 	printf("urp-conn-slot-units: %d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;

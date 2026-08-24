@@ -27,6 +27,26 @@
 
 /* Control flags (frame_type == URP_FRAME_TYPE_CONTROL) */
 #define URP_CTRL_FLAG_CREDIT	(1 << 0)	/* credits_granted carries grant */
+/*
+ * gap #6 Phase 2 (PR2): byte-denominated flow-control grant. Carries a u64
+ * cumulative rx_bytes_delivered in the CONTROL *payload* (payload_length == 8)
+ * -- the header's u16 credits_granted cannot hold a byte count. Bit 5 is used
+ * because bits 1..4 are reserved by the Rust protocol twin
+ * (crates/uds-rdma-protocol/src/constants.rs: QP_DISABLE/QP_ENABLE/
+ * STREAM_WINDOW/AUTH); keep the two in lock-step. Codec only in PR2 (encode/
+ * decode + tests); emit/apply lands in PR3 with the blocking sender gate.
+ */
+#define URP_CTRL_FLAG_CREDIT_BYTES	(1 << 5)
+#define URP_CREDIT_BYTES_PAYLOAD_SIZE	8	/* u64 cumulative byte count */
+
+/*
+ * gap #6 Phase 2 (PR2): connection capability bits, advertised in the CM
+ * private_data trailer (urp_conn_priv_build_full) and negotiated by BOTH peers
+ * before the byte-window path activates (design 35 §35.3 interop gate). A
+ * byte-gated sender talking to a frame-credit-only receiver would block
+ * forever, so the window is honored only when both sides advertise support.
+ */
+#define URP_CONN_CAP_WINDOW_BYTES	(1 << 0)	/* peer honors byte-windowing */
 
 /* Default port for RDMA CM */
 #define URP_DEFAULT_PORT	4791
