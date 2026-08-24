@@ -33,6 +33,8 @@
 unsigned int urp_connect_max_attempts	 = URP_CONNECT_MAX_ATTEMPTS_DEFAULT;
 unsigned int urp_connect_backoff_base_ms = URP_CONNECT_BACKOFF_BASE_MS_DEFAULT;
 unsigned int urp_connect_backoff_ceil_ms = URP_CONNECT_BACKOFF_CEIL_MS_DEFAULT;
+/* gap #6 Phase 2 (PR2): advertise byte-windowing capability. Default off. */
+unsigned int urp_window_bytes_advertise	 = URP_WINDOW_BYTES_ADVERTISE_DEFAULT;
 
 /* proc_douintvec_minmax bounds (extra1/extra2 are void*, so non-const). */
 static unsigned int urp_uint_zero;			/* 0 */
@@ -66,6 +68,18 @@ static struct ctl_table urp_sysctls[] = {
 		.proc_handler	= proc_douintvec_minmax,
 		.extra1		= &urp_uint_one,
 		.extra2		= &urp_uint_max,
+	},
+	{
+		/* gap #6 Phase 2: 0 = don't advertise byte-windowing (default),
+		 * non-zero = advertise URP_CONN_CAP_WINDOW_BYTES in the trailer.
+		 */
+		.procname	= "window_bytes_advertise",
+		.data		= &urp_window_bytes_advertise,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec_minmax,
+		.extra1		= &urp_uint_zero,
+		.extra2		= &urp_uint_one,
 	},
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
 	{ }	/* sentinel: required before 6.11, forbidden after */

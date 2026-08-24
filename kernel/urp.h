@@ -206,6 +206,18 @@ struct urp_qp {
 	bool			peer_is_fast;
 
 	/*
+	 * gap #6 Phase 2 (PR2): did the peer advertise URP_CONN_CAP_WINDOW_BYTES
+	 * in its CM private_data trailer? Set from the authoritative side only --
+	 * the acceptor at accept (initiator's connect trailer), the initiator at
+	 * ESTABLISHED (acceptor's reply trailer) -- so an empty reply on the
+	 * acceptor's own ESTABLISHED cannot clobber it. Combined with this
+	 * endpoint's advertise sysctl by urp_window_negotiate() into
+	 * ep->window_negotiated. Defaults false (peer unknown / pre-PR2 build =>
+	 * byte-window disabled => frame-credit fallback). PR3 consumes it.
+	 */
+	bool			peer_supports_window;
+
+	/*
 	 * Step 4: per-QP credit-based flow control state. Initialized on
 	 * QP allocation; not yet wired into TX/RX (Step 4b adds the
 	 * consume-and-block + grant-frame emission).
@@ -284,6 +296,19 @@ struct urp_qp {
 extern unsigned int urp_connect_max_attempts;
 extern unsigned int urp_connect_backoff_base_ms;
 extern unsigned int urp_connect_backoff_ceil_ms;
+
+/*
+ * gap #6 Phase 2 (PR2): advertise byte-windowing capability
+ * (URP_CONN_CAP_WINDOW_BYTES) in this endpoint's CM private_data trailer.
+ * Non-zero => advertise. Default 0 (OFF) so PR2 is a pure wire/codec addition
+ * with no behaviour change: with nobody advertising, no connection negotiates
+ * the window and the frame-credit path is unchanged. PR3 flips the default on
+ * together with the blocking sender gate + CREDIT-BYTES grant emission, so the
+ * capability bit means "I advertise AND honor byte-windowing" (design 35 §35.3).
+ * Writable at runtime via /proc/sys/urp/window_bytes_advertise.
+ */
+#define URP_WINDOW_BYTES_ADVERTISE_DEFAULT	0
+extern unsigned int urp_window_bytes_advertise;
 
 /* urp_sysctl.c -- /proc/sys/urp/ runtime tunables (design 33 Phase 1). */
 int  urp_sysctl_register(void);
@@ -414,10 +439,15 @@ struct urp_endpoint {
 	 * has_password) followed by a [MAGIC][MAGIC][kind] trailer that advertises
 	 * this endpoint's kind (urp_conn_priv_build). Prebuilt once at create.
 	 */
-	u8			conn_priv[1 + URP_PSK_HASH_LEN + 3];
-					/* +3 == URP_CONN_PRIV_TRAILER_LEN
+	u8			conn_priv[1 + URP_PSK_HASH_LEN + 5];
+					/* +5 == URP_CONN_PRIV_CAP_TRAILER_LEN
 					 * (urp_frame.h, included below the
-					 * struct so the literal is used here) */
+					 * struct so the literal is used here).
+					 * gap #6 Phase 2: widened from +3 to
+					 * hold [kind][qp_index][caps]; the
+					 * connect/accept paths build the live
+					 * trailer into a stack buffer, this
+					 * holds the auth prefix + a baseline. */
 	u8			conn_priv_len;
 	u8			auth_len;	/* has_password ? sizeof(auth_priv) : 0 */
 
@@ -497,6 +527,14 @@ struct urp_endpoint {
 	struct completion	cm_done;
 	int			cm_status;
 	bool			connected;
+	/*
+	 * gap #6 Phase 2 (PR2): byte-windowing flow control negotiated with the
+	 * peer -- this endpoint advertises support (urp.window_bytes_advertise)
+	 * AND the peer advertised URP_CONN_CAP_WINDOW_BYTES. Latched at all-N
+	 * ESTABLISHED via urp_window_negotiate(). PR2 only sets it (plumbing);
+	 * PR3's sender gate / grant emission gate on it. Defaults false.
+	 */
+	bool			window_negotiated;
 
 	/*
 	 * design 33 Phase 2: lazy connect-on-first-use. The initiator no longer

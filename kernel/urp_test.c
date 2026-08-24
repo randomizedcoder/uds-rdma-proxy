@@ -691,6 +691,13 @@ static void test_classify_frame(struct kunit *test)
 		{ 5, FT_D, 0, 0, 11, 30, URP_RX_DROP_PAYLOAD_OVERRUN },  /* overrun by 1 */
 		/* CONTROL -> credit */
 		{ 0, FT_C, URP_CTRL_FLAG_CREDIT, 64, 0, HDRSZ, URP_RX_CREDIT },
+		/* gap #6 Phase 2: CONTROL/CREDIT-BYTES carries an 8-byte payload;
+		 * still classifies as URP_RX_CREDIT (both grant flavours share the
+		 * action; PR3's apply path reads the u64 from the payload).
+		 */
+		{ 0, FT_C, URP_CTRL_FLAG_CREDIT_BYTES, 0,
+		  URP_CREDIT_BYTES_PAYLOAD_SIZE, HDRSZ + URP_CREDIT_BYTES_PAYLOAD_SIZE,
+		  URP_RX_CREDIT },
 		/* PROBE ping / pong */
 		{ 0, FT_P, 0, 0, PINGSZ, HDRSZ + PINGSZ, URP_RX_PROBE_PING },
 		{ 0, FT_P, URP_PROBE_FLAG_PONG, 0, PONGSZ, HDRSZ + PONGSZ, URP_RX_PROBE_PONG },
@@ -832,6 +839,136 @@ static void test_conn_priv_qp_trailer(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, urp_conn_priv_peer_qp_index(buf, 3, 0, &qp_index));
 	buf[0] = 0x00;
 	KUNIT_EXPECT_FALSE(test, urp_conn_priv_peer_qp_index(buf, 4, 0, &qp_index));
+}
+
+/*
+ * gap #6 Phase 2: the full [MAGIC0][MAGIC1][kind][qp_index][caps] trailer. It
+ * must round-trip the caps byte, stay a valid kind + qp_index trailer (prefix
+ * compat with PR1 readers), and the caps reader must reject the narrower 3/4-
+ * byte trailers / absent / corrupt cases so an old peer reads as "no caps".
+ */
+static void test_conn_priv_cap_trailer(struct kunit *test)
+{
+	u8 buf[64];
+	u8 kind;
+	u8 qp_index;
+	u8 caps;
+
+	/* No auth: full trailer at offset 0, len 5, round-trips caps. */
+	memset(buf, 0, sizeof(buf));
+	KUNIT_EXPECT_EQ(test,
+			urp_conn_priv_build_full(buf, 0, URP_EP_KIND_UDS, 3,
+						 URP_CONN_CAP_WINDOW_BYTES), 5);
+	KUNIT_EXPECT_TRUE(test, urp_conn_priv_peer_caps(buf, 5, 0, &caps));
+	KUNIT_EXPECT_EQ(test, caps, (u8)URP_CONN_CAP_WINDOW_BYTES);
+	/* Prefix compat: kind + qp_index still read from the wider trailer. */
+	KUNIT_EXPECT_TRUE(test, urp_conn_priv_peer_kind(buf, 5, 0, &kind));
+	KUNIT_EXPECT_EQ(test, kind, (u8)URP_EP_KIND_UDS);
+	KUNIT_EXPECT_TRUE(test, urp_conn_priv_peer_qp_index(buf, 5, 0, &qp_index));
+	KUNIT_EXPECT_EQ(test, qp_index, (u8)3);
+
+	/* 33-byte auth: full trailer at offset 33; auth bytes preserved. */
+	memset(buf, 0xAB, 33);
+	KUNIT_EXPECT_EQ(test,
+			urp_conn_priv_build_full(buf, 33, URP_EP_KIND_FAST,
+						 URP_NUM_QPS_MAX - 1, 0), 38);
+	KUNIT_EXPECT_EQ(test, buf[0], (u8)0xAB);
+	KUNIT_EXPECT_EQ(test, buf[32], (u8)0xAB);
+	KUNIT_EXPECT_TRUE(test, urp_conn_priv_peer_caps(buf, 38, 33, &caps));
+	KUNIT_EXPECT_EQ(test, caps, (u8)0);
+
+	/* Narrow 4-byte (qp) and 3-byte (kind) trailers => no caps (fallback). */
+	caps = 0xEE;
+	memset(buf, 0, sizeof(buf));
+	urp_conn_priv_build_qp(buf, 0, URP_EP_KIND_UDS, 1);
+	KUNIT_EXPECT_FALSE(test, urp_conn_priv_peer_caps(buf, 4, 0, &caps));
+	memset(buf, 0, sizeof(buf));
+	urp_conn_priv_build(buf, 0, URP_EP_KIND_UDS);
+	KUNIT_EXPECT_FALSE(test, urp_conn_priv_peer_caps(buf, 3, 0, &caps));
+
+	/* Truncated / null / corrupt magic => no caps. */
+	KUNIT_EXPECT_FALSE(test, urp_conn_priv_peer_caps(NULL, 0, 0, &caps));
+	memset(buf, 0, sizeof(buf));
+	urp_conn_priv_build_full(buf, 0, URP_EP_KIND_UDS, 0,
+				 URP_CONN_CAP_WINDOW_BYTES);
+	KUNIT_EXPECT_FALSE(test, urp_conn_priv_peer_caps(buf, 4, 0, &caps));
+	buf[0] = 0x00;
+	KUNIT_EXPECT_FALSE(test, urp_conn_priv_peer_caps(buf, 5, 0, &caps));
+}
+
+/*
+ * gap #6 Phase 2: byte-windowing is negotiated only when BOTH peers advertise
+ * (design 35 §35.3 interop gate). Pin the AND truth table so a one-sided
+ * advertise never enables the blocking sender gate PR3 adds.
+ */
+static void test_window_negotiate(struct kunit *test)
+{
+	KUNIT_EXPECT_FALSE(test, urp_window_negotiate(false, false));
+	KUNIT_EXPECT_FALSE(test, urp_window_negotiate(true, false));
+	KUNIT_EXPECT_FALSE(test, urp_window_negotiate(false, true));
+	KUNIT_EXPECT_TRUE(test, urp_window_negotiate(true, true));
+}
+
+/*
+ * gap #6 Phase 2: CREDIT-BYTES CONTROL payload codec. The u64 cumulative byte
+ * grant must round-trip little-endian, and the decoder must reject a short
+ * payload (the apply path then ignores a malformed grant). Kept numerically in
+ * lock-step with crates/uds-rdma-protocol frame.rs credit_bytes_payload_* tests.
+ */
+static void test_credit_bytes_payload(struct kunit *test)
+{
+	u8 buf[URP_CREDIT_BYTES_PAYLOAD_SIZE];
+	u64 out;
+
+	urp_credit_bytes_encode(buf, 0x0807060504030201ULL);
+	/* Little-endian byte layout. */
+	KUNIT_EXPECT_EQ(test, buf[0], (u8)0x01);
+	KUNIT_EXPECT_EQ(test, buf[7], (u8)0x08);
+	KUNIT_EXPECT_TRUE(test,
+			  urp_credit_bytes_decode(buf, sizeof(buf), &out));
+	KUNIT_EXPECT_EQ(test, out, 0x0807060504030201ULL);
+
+	/* Extremes round-trip. */
+	urp_credit_bytes_encode(buf, U64_MAX);
+	KUNIT_EXPECT_TRUE(test,
+			  urp_credit_bytes_decode(buf, sizeof(buf), &out));
+	KUNIT_EXPECT_EQ(test, out, U64_MAX);
+
+	/* Short payload / null => rejected. */
+	out = 0xdeadbeef;
+	KUNIT_EXPECT_FALSE(test,
+			   urp_credit_bytes_decode(buf,
+						   URP_CREDIT_BYTES_PAYLOAD_SIZE - 1,
+						   &out));
+	KUNIT_EXPECT_FALSE(test, urp_credit_bytes_decode(NULL, 0, &out));
+}
+
+/*
+ * gap #6 Phase 2: a CONTROL/CREDIT-BYTES frame round-trips through the header
+ * codec with payload_length == 8 (the first CONTROL frame that carries a
+ * payload), and the payload u64 decodes from the bytes after the header.
+ */
+static void test_frame_roundtrip_credit_bytes(struct kunit *test)
+{
+	u8 buf[URP_FRAME_HEADER_SIZE + URP_CREDIT_BYTES_PAYLOAD_SIZE];
+	u64 out;
+
+	urp_frame_encode(buf, 7, 0, URP_FRAME_TYPE_CONTROL,
+			 URP_CTRL_FLAG_CREDIT_BYTES, 0,
+			 URP_CREDIT_BYTES_PAYLOAD_SIZE);
+	urp_credit_bytes_encode(buf + URP_FRAME_HEADER_SIZE, 123456789ULL);
+
+	KUNIT_EXPECT_EQ(test, urp_frame_decode_type(buf),
+			(u8)URP_FRAME_TYPE_CONTROL);
+	KUNIT_EXPECT_EQ(test, urp_frame_decode_flags(buf),
+			(u8)URP_CTRL_FLAG_CREDIT_BYTES);
+	KUNIT_EXPECT_EQ(test, urp_frame_decode_payload_len(buf),
+			(u32)URP_CREDIT_BYTES_PAYLOAD_SIZE);
+	KUNIT_EXPECT_TRUE(test,
+			  urp_credit_bytes_decode(buf + URP_FRAME_HEADER_SIZE,
+						  URP_CREDIT_BYTES_PAYLOAD_SIZE,
+						  &out));
+	KUNIT_EXPECT_EQ(test, out, 123456789ULL);
 }
 
 /* ---- Buffer-geometry resolver tests (design 29 Gap 2) ---- */
@@ -1490,6 +1627,9 @@ static struct kunit_case urp_test_cases[] = {
 	KUNIT_CASE(test_frame_roundtrip_data),
 	KUNIT_CASE(test_frame_roundtrip_control),
 	KUNIT_CASE(test_frame_roundtrip_probe),
+	/* gap #6 Phase 2: CREDIT-BYTES CONTROL frame (payload-carrying) */
+	KUNIT_CASE(test_frame_roundtrip_credit_bytes),
+	KUNIT_CASE(test_credit_bytes_payload),
 	KUNIT_CASE(test_frame_max_payload),
 	KUNIT_CASE(test_frame_zero_payload),
 	KUNIT_CASE(test_frame_all_flags),
@@ -1525,6 +1665,9 @@ static struct kunit_case urp_test_cases[] = {
 	KUNIT_CASE(test_conn_priv_kind_trailer),
 	/* gap #6 Phase 1: initiator qp_index trailer (num_qps > 1) */
 	KUNIT_CASE(test_conn_priv_qp_trailer),
+	/* gap #6 Phase 2: caps trailer + byte-window negotiation */
+	KUNIT_CASE(test_conn_priv_cap_trailer),
+	KUNIT_CASE(test_window_negotiate),
 	/* design 32: acceptor connection plan (eager-connect gate) */
 	KUNIT_CASE(test_acceptor_eager_connect),
 	/* design 32: credit-grant routing (per-stream vs per-QP pool) */

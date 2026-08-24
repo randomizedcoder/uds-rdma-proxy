@@ -18,7 +18,7 @@ pub mod stream;
 pub use constants::*;
 pub use credit::CreditState;
 pub use error::ProtocolError;
-pub use frame::FrameHeader;
+pub use frame::{CreditBytesPayload, FrameHeader};
 pub use mtu::IbPmtu;
 pub use probe::{PingPayload, PongPayload};
 pub use reorder::{DrainResult, ReorderBuffer};

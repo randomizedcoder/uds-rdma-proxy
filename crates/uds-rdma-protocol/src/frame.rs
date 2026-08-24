@@ -119,6 +119,49 @@ impl FrameHeader {
     }
 }
 
+/// gap #6 Phase 2 (PR2): CREDIT-BYTES CONTROL payload.
+///
+/// A CONTROL frame carrying `CTRL_FLAG_CREDIT_BYTES` puts a u64 cumulative
+/// `rx_bytes_delivered` (the absolute high-water mark the receiver has handed
+/// to the app) in the frame payload -- the first CONTROL frame with a non-zero
+/// payload. The sender applies grants as `tx_bytes_acked = max(tx_bytes_acked,
+/// granted)`, so a cumulative-absolute value is idempotent under lost/reordered
+/// grants. Mirrors `urp_credit_bytes_encode` / `urp_credit_bytes_decode` in
+/// kernel/urp_frame.h.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreditBytesPayload {
+    pub cumulative_bytes: u64,
+}
+
+impl CreditBytesPayload {
+    /// Encode into `buf` as 8 bytes, little-endian.
+    pub fn encode(&self, buf: &mut [u8]) -> Result<(), ProtocolError> {
+        if buf.len() < CREDIT_BYTES_PAYLOAD_SIZE {
+            return Err(ProtocolError::BufferTooShort {
+                need: CREDIT_BYTES_PAYLOAD_SIZE,
+                have: buf.len(),
+            });
+        }
+        buf[0..8].copy_from_slice(&self.cumulative_bytes.to_le_bytes());
+        Ok(())
+    }
+
+    /// Decode from the first 8 bytes of `buf`, little-endian.
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtocolError> {
+        if buf.len() < CREDIT_BYTES_PAYLOAD_SIZE {
+            return Err(ProtocolError::BufferTooShort {
+                need: CREDIT_BYTES_PAYLOAD_SIZE,
+                have: buf.len(),
+            });
+        }
+        Ok(Self {
+            cumulative_bytes: u64::from_le_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,6 +197,49 @@ mod tests {
             credits_granted: 64,
             payload_length: 0,
         });
+    }
+
+    #[test]
+    fn roundtrip_control_credit_bytes() {
+        // The header of a CREDIT-BYTES CONTROL frame: payload_length = 8.
+        roundtrip(&FrameHeader {
+            stream_id: 7,
+            sequence_number: 0,
+            frame_type: FRAME_TYPE_CONTROL,
+            flags: CTRL_FLAG_CREDIT_BYTES,
+            credits_granted: 0,
+            payload_length: CREDIT_BYTES_PAYLOAD_SIZE as u32,
+        });
+    }
+
+    #[test]
+    fn credit_bytes_payload_roundtrip() {
+        for v in [0u64, 1, 8192, u64::MAX, 0x0102_0304_0506_0708] {
+            let p = CreditBytesPayload {
+                cumulative_bytes: v,
+            };
+            let mut buf = [0u8; CREDIT_BYTES_PAYLOAD_SIZE];
+            p.encode(&mut buf).unwrap();
+            assert_eq!(CreditBytesPayload::decode(&buf).unwrap(), p);
+        }
+    }
+
+    #[test]
+    fn credit_bytes_payload_byte_layout() {
+        let p = CreditBytesPayload {
+            cumulative_bytes: 0x0807_0605_0403_0201,
+        };
+        let mut buf = [0u8; CREDIT_BYTES_PAYLOAD_SIZE];
+        p.encode(&mut buf).unwrap();
+        assert_eq!(&buf, &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+    }
+
+    #[test]
+    fn credit_bytes_payload_too_short() {
+        assert_eq!(
+            CreditBytesPayload::decode(&[0u8; 7]),
+            Err(ProtocolError::BufferTooShort { need: 8, have: 7 })
+        );
     }
 
     #[test]
@@ -249,6 +335,7 @@ mod tests {
             CTRL_FLAG_QP_ENABLE,
             CTRL_FLAG_STREAM_WINDOW,
             CTRL_FLAG_AUTH,
+            CTRL_FLAG_CREDIT_BYTES,
         ] {
             let h = FrameHeader {
                 stream_id: 0,

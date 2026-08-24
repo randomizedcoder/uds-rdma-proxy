@@ -117,4 +117,20 @@ urp_acceptor_slot_decide(bool have_peer_index, unsigned int peer_qp_index,
 	return slot_occupied ? URP_SLOT_REUSE : URP_SLOT_FRESH;
 }
 
+/*
+ * gap #6 Phase 2 (PR2): is byte-windowing flow control negotiated on this
+ * connection? Enabled only when THIS endpoint advertises support
+ * (@local_advertise, from the urp.window_bytes_advertise sysctl) AND the peer
+ * advertised the URP_CONN_CAP_WINDOW_BYTES capability in its CM private_data
+ * trailer (@peer_advertise). design 35 §35.3 interop gate: a byte-gated sender
+ * talking to a frame-credit-only receiver would block forever, so both sides
+ * must agree. PR2 only latches this bool (ep->window_negotiated); PR3's sender
+ * gate / grant emission consume it.
+ */
+static inline bool
+urp_window_negotiate(bool local_advertise, bool peer_advertise)
+{
+	return local_advertise && peer_advertise;
+}
+
 #endif /* _URP_CONN_PLAN_H */
