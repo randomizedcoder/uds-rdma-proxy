@@ -314,6 +314,17 @@ Ranges are real run-to-run spread, not measurement slop — see finding 1.
 would push higher). `ib_write_bw` unavailable (not in nixpkgs / not on the
 hosts), so the raw-RDMA fabric ceiling is not yet measured.
 
+> **Superseded for the copy path by [design 37 §37.4](37-high-throughput-clustering.md#374-measured-results--jumbo-mtu--large-frames-2026-08-25)
+> (2026-08-25).** With **jumbo MTU 9700** (RoCE PMTU 1024→4096) and the
+> `buffer_size` cap raised to 1 MiB, the single-stream copy path reaches
+> **1912.8 MB/s at 256 KiB (61 % of line, 103 % of jumbo `iperf2 -P1` = 1862 MB/s)**
+> — not the 52.7 MB/s above — riding the already-merged design-35 pump (fps ~29k,
+> not ~1000). Goodput peaks near 128–256 KiB then falls to a **copy wall** at
+> 512 KiB–1 MiB; the zero-copy fast path climbs to **97.6 % of line** where the copy
+> path falls. So Option A (frame size) plus jumbo is a far bigger lever than this
+> 1500-MTU phase-0 measured; Option B/F2 remain for the small-frame and aggregate
+> cases.
+
 **Verdict — post/serialization-bound, not copy-bound.** Goodput scales strongly
 with bytes-per-frame (4 KB→64 KB lifts it ~6.6→52.7 MB/s ≈ 8×) while the
 single-kthread frame rate stays in the ~700–2900 fps band and does **not** grow
