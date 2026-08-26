@@ -62,7 +62,7 @@ Highlights:
 | 34 | Bulk throughput | ✅ Measured on hardware; copy-vs-zero-copy captured |
 | 35 | Windowing / flow control | 🟢 Phase 1 (pump completion waitqueue) merged; further windowing spec'd |
 | 36 | CUBIC congestion control | 📝 Design-only, LATER (fabric near-lossless, path is pump-bound) |
-| 37 | High-throughput cluster data plane (beat TCP per stream) | 🟢 Jumbo MTU 9700 + `buffer_size` cap→1 MiB landed; single-stream jumbo: copy 1913 MB/s @256K (103% of TCP), fast 3050 MB/s @512K (97.6% line). Multi-SGE + F2 aggregate next |
+| 37 | High-throughput cluster data plane (beat TCP per stream) | 🟢 Jumbo MTU 9700 + `buffer_size` cap→1 MiB landed; single-stream jumbo: copy 1913 MB/s @256K (103% of TCP), fast 3050 MB/s @512K (97.6% line). Interruptible fast REGISTER HW-validated. F2 harness built (`.#urp-f2-matrix`) — copy path is **membw-capped ~1900 MB/s, NOT additive** (flat N=1→4); Option B **measured-justified** (2 KiB post-bound at 423k fps, ~0.56 core). Multi-SGE (path Y) + fast-path F2 next |
 
 ## Redpanda over UDS-over-RDMA
 
