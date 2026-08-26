@@ -352,8 +352,26 @@ ceiling you need the **zero-copy fast path** (no `memcpy`, bounded by NIC line r
 not membw), *then* F2 to fill the NIC. F2's additivity is a property of the zero-copy
 path, not a general one. (¹ At N=8 the 16 bench processes over-subscribe the 6
 isolated cores; only 5/8 sinks reported and the aggregate fell to ~1195 MB/s —
-scheduler contention, not the transport. A fast-path F2 sweep is the natural
-follow-up to measure true additivity above the copy wall.)
+scheduler contention, not the transport.)
+
+**Measured — F2 IS additive on the *zero-copy* path, to line rate (2026-08-26, `.#urp-fast-f2-matrix`).**
+The complement of the above, run the same way but with N independent `--kind fast`
+endpoint pairs (`urp-bench --mode uring-cmd`), 64 KiB frames:
+
+| streams N | aggregate goodput | % of 25 GbE line | per-stream |
+| --------- | ----------------- | ---------------- | ---------- |
+| 1 | 1408 MB/s | 45.1 % | 1408 |
+| 2 | 2104 MB/s | 67.3 % | 1052 |
+| 4 | 2925 MB/s | 93.6 % | 731 |
+| 8 | **3066 MB/s** | **98.1 %** | 383 |
+
+With no software copy, the shared membw bottleneck is gone: aggregate goodput
+**scales 1408 → 3066 MB/s and saturates the NIC at N=8 (98 % of 25 GbE)**, all 8/8
+sinks reporting (zero-copy barely touches the cores, so the process over-subscription
+that capped the copy path at N=8 does not bite). **This is the design's payoff in one
+table**: one zero-copy stream is the per-stream win, and F2 then *does* multiply it to
+fill the line — additivity is real precisely where the copy is removed. Copy-path F2
+re-divides a fixed ~1900 MB/s pie; fast-path F2 fills the 25 GbE line.
 
 ## 37.7 The lever ladder, prioritized for the per-stream win
 
@@ -369,7 +387,7 @@ stream," with status. Latency effect noted because the goal is both.
 | 5 | **Byte-windowing** (Option C / [d35](35-windowing-flow-control.md)) | oversend / RNR storm | makes the peak *sustainable* (not higher) | removes sawtooth | **built (9/9 GREEN)** |
 | 6 | **Adaptive frame sizing** (§37.5a) | latency↔throughput + copy wall | keeps small frames at low load, caps at the sweet spot | preserves low-load latency | design sketch; (a) natural adaptivity free, (b) gated on numbers |
 | 7 | **Inline sends** (`IB_SEND_INLINE` <64 B) ([d13 §13.5](13-performance.md)) | tiny-frame DMA+CQE | control-message latency | small-msg RTT | not built |
-| 8 | **F2 scale-out** ([§37.6](#376-scale-out-f2--additive-not-the-way-we-beat-tcp)) | single-QP NIC headroom | **additive on the fast path only** — copy path is membw-capped (measured flat ~1900 MB/s, N=1→4, 2026-08-26) | per-stream tail preserved | harness built (`.#urp-f2-matrix`); fast-path sweep next |
+| 8 | **F2 scale-out** ([§37.6](#376-scale-out-f2--additive-not-the-way-we-beat-tcp)) | single-QP NIC headroom | **additive on the fast path — measured 1408→3066 MB/s = 98 % line at N=8**; copy path membw-capped ~1900 (flat) | per-stream tail preserved | **both harnesses built + measured (2026-08-26)** (`.#urp-f2-matrix`, `.#urp-fast-f2-matrix`) |
 | 9 | **Option D** one-sided WRITE ring ([d34 §34.3](34-bulk-throughput.md#option-d--one-sided-rdma-write-into-a-peer-registered-ring-effort-l-risk-high)) | recv-copy/SRQ ceiling | removes the copy wall on the copy path | — | deferred (trigger: copy-path large-frame wall matters) |
 | 10 | **CUBIC cwnd** ([d36](36-congestion-control-cubic.md)) | congestion (none yet) | none until congestion-bound | — | deferred (trigger: offered load > fabric) |
 

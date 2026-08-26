@@ -96,6 +96,9 @@
         # N independent streams, one per endpoint pair; sums sink goodputs.
         # `nix run .#urp-f2-matrix`.
         urpF2Matrix = import ./nix/urp-f2-matrix.nix { inherit pkgs; };
+        # Zero-copy twin of urp-f2-matrix (design 37 §37.6): N independent fast
+        # endpoint pairs, `urp-bench --mode uring-cmd`. `nix run .#urp-fast-f2-matrix`.
+        urpFastF2Matrix = import ./nix/urp-fast-f2-matrix.nix { inherit pkgs; };
         # Multi-QP reorder validation (status.md gap #1): sweep num_qps, assert
         # reorder-insertions>0 + byte-exact delivery. `nix run .#urp-reorder-matrix`.
         urpReorderMatrix = import ./nix/urp-reorder-matrix.nix { inherit pkgs; };
@@ -240,6 +243,9 @@
           # F2 aggregate / N-flow throughput (design 34 F2, 37 §37.6; needs boxes):
           #   nix run .#urp-f2-matrix -- <acceptor> <initiator> <acceptor-ip>
           urp-f2-matrix = urpF2Matrix;
+          # Zero-copy twin of the F2 runner (design 37 §37.6; needs boxes):
+          #   nix run .#urp-fast-f2-matrix -- <acceptor> <initiator> <acceptor-ip>
+          urp-fast-f2-matrix = urpFastF2Matrix;
           # Multi-QP reorder validation over RoCEv2 (status gap #1; needs boxes):
           #   nix run .#urp-reorder-matrix -- <acceptor> <initiator> <acceptor-ip>
           urp-reorder-matrix = urpReorderMatrix;
