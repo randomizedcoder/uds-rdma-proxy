@@ -25,7 +25,12 @@ pub const URP_BUFFER_COUNT_MIN: u32 = 16;
 // uapi/linux/urp.h URP_BUFFER_SIZE_MIN (an expression there, so it is excluded
 // from the uapi_constants_match_kernel_header token-parity test below).
 pub const URP_BUFFER_SIZE_MIN: u32 = 68;
-pub const URP_BUFFER_SIZE_MAX: u32 = 65536;
+// = 1 MiB. A software/allocation ceiling, not a wire limit (payload_length is a
+// u32 and the NIC segments large RC messages itself). Large slots are high-order
+// compound pages, so pair with a small buffer_count. Kept in step with the
+// kernel's uapi/linux/urp.h URP_BUFFER_SIZE_MAX (checked by the token-parity
+// test below). See design 37.
+pub const URP_BUFFER_SIZE_MAX: u32 = 1048576;
 
 pub const URP_DEFAULT_PORT: u16 = 4791;
 

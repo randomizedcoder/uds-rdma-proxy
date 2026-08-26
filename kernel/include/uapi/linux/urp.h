@@ -99,7 +99,19 @@
  * silently accepted -- and urp_resolve_buf_size() also clamps as a backstop.
  */
 #define URP_BUFFER_SIZE_MIN	(URP_FRAME_HEADER_SIZE + URP_PONG_PAYLOAD_SIZE)
-#define URP_BUFFER_SIZE_MAX	65536
+/*
+ * The ceiling is a software/allocation choice, not a wire or hardware limit:
+ * payload_length on the wire is a u32 (urp_frame.h), and RoCEv2 RC segments a
+ * single large message into PMTU packets in the NIC (ConnectX-4 Lx reports
+ * max_msg_sz = 1 GiB). Since the copy pump is frame-rate-bound (design 34
+ * §34.5.1), a larger slot moves proportionally more bytes per frame. 1 MiB is
+ * the current cap; slots this large are backed by high-order compound pages
+ * (page_pool order = get_order(buffer_size)), so pair a large buffer_size with a
+ * small buffer_count and expect high-order allocation to be best-effort. A
+ * scatter-gather (multi-SGE, max_sge=30) large-frame path is the production
+ * follow-up that removes the high-order-alloc dependency (design 37).
+ */
+#define URP_BUFFER_SIZE_MAX	1048576
 
 /* Defaults applied when attribute absent in NEW_ENDPOINT */
 #define URP_NUM_QPS_DEFAULT	1
