@@ -47,6 +47,7 @@
 #include <linux/fs.h>
 #include <linux/mm.h>
 #include <linux/slab.h>
+#include <linux/kref.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
 #include <linux/scatterlist.h>
@@ -333,12 +334,44 @@ static void urp_cmd_pool_release(struct urp_cmd_ctx *ctx)
 /* uring_cmd handlers.                                                      */
 /* ----------------------------------------------------------------------- */
 
-/* Synchronous completion cookie for the REG_MR work request below. */
+/*
+ * Upper bound on how long a REGISTER waits for its fast-registration WR to
+ * complete before giving up. A healthy QP completes REG_MR in microseconds;
+ * the timeout only bites when REGISTER is issued before the RC connection is
+ * up, so the WR sits un-drained in the send queue (the classic wedge). Paired
+ * with a killable wait so a fatal signal (the app being killed mid-REGISTER)
+ * unblocks the io-wq worker immediately rather than parking it uninterruptibly.
+ */
+#define URP_REG_MR_TIMEOUT_MS 5000
+
+/*
+ * Completion cookie for the REG_MR work request below. Heap-allocated and
+ * refcounted (not stack) so the waiter can bail out early -- on a fatal signal
+ * or timeout -- while the WR is still in flight: the CQ callback may fire long
+ * afterwards (when the QP finally connects, or as IB_WC_WR_FLUSH_ERR on QP
+ * teardown) and must find live memory to complete()/free. Two refs: one held by
+ * the waiter, one by the CQ callback; the last put frees, and dereg's an
+ * abandoned MR only once its WR has drained (see urp_cmd_reg_mr_sync).
+ */
 struct urp_reg_wait {
 	struct ib_cqe		cqe;
 	struct completion	done;
 	int			status;
+	struct kref		ref;
+	struct ib_mr		*mr;	/* non-NULL only if abandoned: dereg here */
 };
+
+static void urp_reg_wait_release(struct kref *ref)
+{
+	struct urp_reg_wait *rw = container_of(ref, struct urp_reg_wait, ref);
+
+	/* Set only on the abandon path, where the caller was told NOT to dereg.
+	 * The last put runs after the CQ callback fired (WR drained), so the MR
+	 * is no longer referenced by an in-flight WR and is safe to release. */
+	if (rw->mr)
+		ib_dereg_mr(rw->mr);
+	kfree(rw);
+}
 
 static void urp_cmd_reg_mr_done(struct ib_cq *cq, struct ib_wc *wc)
 {
@@ -346,36 +379,68 @@ static void urp_cmd_reg_mr_done(struct ib_cq *cq, struct ib_wc *wc)
 
 	rw->status = (wc->status == IB_WC_SUCCESS) ? 0 : -EIO;
 	complete(&rw->done);
+	kref_put(&rw->ref, urp_reg_wait_release);
 }
 
 /*
  * Register @mr with the HCA via a fast-registration work request on @qp and
- * wait for its completion. RDMA guarantees every posted WR completes (success
- * or IB_WC_WR_FLUSH_ERR on QP teardown), so the uninterruptible wait cannot
- * hang -- the stack cookie stays valid until the CQ callback fires complete().
+ * wait for its completion.
+ *
+ * Returns 0 once the MR is live (caller keeps @mr), or a negative errno:
+ *   - a hard failure (ib_post_send error, or WC error -EIO) means the WR is
+ *     drained and the caller still owns @mr (must dereg it);
+ *   - -ETIMEDOUT / -ERESTARTSYS means the WR is STILL IN FLIGHT and this helper
+ *     has taken ownership of @mr via the deferred releaser -- the caller MUST
+ *     NOT dereg @mr in that case (see urp_cmd_map_pool).
  */
 static int urp_cmd_reg_mr_sync(struct ib_qp *qp, struct ib_mr *mr)
 {
-	struct urp_reg_wait rw;
+	struct urp_reg_wait *rw;
 	struct ib_reg_wr rwr = {};
+	long tmo;
 	int ret;
 
-	init_completion(&rw.done);
-	rw.cqe.done = urp_cmd_reg_mr_done;
+	rw = kzalloc(sizeof(*rw), GFP_KERNEL);
+	if (!rw)
+		return -ENOMEM;
+	init_completion(&rw->done);
+	kref_init(&rw->ref);		/* ref 1: the waiter (this function) */
+	kref_get(&rw->ref);		/* ref 2: the CQ callback */
+	rw->cqe.done = urp_cmd_reg_mr_done;
 
 	rwr.wr.opcode	  = IB_WR_REG_MR;
-	rwr.wr.wr_cqe	  = &rw.cqe;
+	rwr.wr.wr_cqe	  = &rw->cqe;
 	rwr.wr.send_flags = IB_SEND_SIGNALED;
 	rwr.mr		  = mr;
 	rwr.key		  = mr->lkey;
 	rwr.access	  = IB_ACCESS_LOCAL_WRITE;
 
 	ret = ib_post_send(qp, &rwr.wr, NULL);
-	if (ret)
+	if (ret) {
+		/* WR never posted: the CQ callback will never run, so drop its
+		 * ref here too. rw->mr stays NULL -- the caller owns @mr. */
+		kref_put(&rw->ref, urp_reg_wait_release);
+		kref_put(&rw->ref, urp_reg_wait_release);
 		return ret;
+	}
 
-	wait_for_completion(&rw.done);
-	return rw.status;
+	tmo = wait_for_completion_killable_timeout(&rw->done,
+						   msecs_to_jiffies(URP_REG_MR_TIMEOUT_MS));
+	if (tmo > 0) {
+		/* Completed: WR drained. @mr is live (status 0) or errored; the
+		 * caller owns @mr either way. */
+		ret = rw->status;
+		kref_put(&rw->ref, urp_reg_wait_release);
+		return ret;
+	}
+
+	/* Abandoned: killed (tmo < 0) or timed out (tmo == 0) with the WR still
+	 * in flight. Hand @mr to the deferred releaser so it is dereg'd only
+	 * after the WR finally drains, then drop the waiter's ref. The waiter's
+	 * ref kept rw alive across this store, so this is UAF-free. */
+	rw->mr = mr;
+	kref_put(&rw->ref, urp_reg_wait_release);
+	return (tmo == 0) ? -ETIMEDOUT : -ERESTARTSYS;
 }
 
 /*
@@ -454,8 +519,15 @@ static int urp_cmd_map_pool(struct urp_cmd_ctx *ctx, struct page **pages,
 	 */
 	ib_update_fast_reg_key(mr, ib_inc_rkey(mr->lkey) & 0xff);
 	ret = urp_cmd_reg_mr_sync(qp, mr);
-	if (ret)
+	if (ret) {
+		/* On abandonment (killed/timed out) the REG_MR WR may still be in
+		 * flight and urp_cmd_reg_mr_sync has taken ownership of @mr for a
+		 * deferred dereg; do NOT dereg it here. Hard errors leave @mr with
+		 * us to release via err_mr. */
+		if (ret == -ETIMEDOUT || ret == -ERESTARTSYS)
+			goto err_unmap;
 		goto err_mr;
+	}
 
 	ctx->ep		= ep;
 	ctx->ib_dev	= ep->ib_dev;
