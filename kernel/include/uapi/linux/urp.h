@@ -20,6 +20,16 @@
 #define URP_FRAME_TYPE_CONTROL	0x01
 #define URP_FRAME_TYPE_PROBE	0x02
 
+/*
+ * QP health-probe payload sizes (carried inside a URP_FRAME_TYPE_PROBE frame;
+ * byte layout + encoders in kernel/urp_frame.h). Wire constants -- they match
+ * crates/uds-rdma-protocol/src/probe.rs. A PONG is the largest control frame
+ * urp ever emits (URP_FRAME_HEADER_SIZE + URP_PONG_PAYLOAD_SIZE == 68), which
+ * sets the receive-buffer floor below (URP_BUFFER_SIZE_MIN).
+ */
+#define URP_PING_PAYLOAD_SIZE	32
+#define URP_PONG_PAYLOAD_SIZE	48
+
 /* Data flags */
 #define URP_DATA_FLAG_SYN	(1 << 0)
 #define URP_DATA_FLAG_FIN	(1 << 1)
@@ -76,8 +86,32 @@
 #define URP_NUM_QPS_MIN		1
 #define URP_BUFFER_COUNT_MIN	16
 #define URP_BUFFER_COUNT_MAX	65536	/* hard cap: bounds the pool allocation */
-#define URP_BUFFER_SIZE_MIN	URP_FRAME_HEADER_SIZE
-#define URP_BUFFER_SIZE_MAX	65536
+/*
+ * A receive buffer must hold the largest frame the peer can send. DATA frames
+ * are bounded by buffer_size itself (payload = buffer_size - header), but the
+ * fixed-size QP health-probe PONG is URP_FRAME_HEADER_SIZE + URP_PONG_PAYLOAD_SIZE
+ * (== 68) regardless of buffer_size. A smaller buffer overflows on the very first
+ * PONG -- the receiver raises an ib "local length error", NAKs, and the sender's
+ * QP tears down into a reconnect crash-loop (observed on hp1<->hp3 at
+ * buffer_size=64: only 64 of a 68-byte PONG fits). So the floor is the PONG size,
+ * not the bare header. The netlink policy (urp_buffer_size_range, urp_netlink.c)
+ * enforces this floor -- a request below it is rejected with ERANGE rather than
+ * silently accepted -- and urp_resolve_buf_size() also clamps as a backstop.
+ */
+#define URP_BUFFER_SIZE_MIN	(URP_FRAME_HEADER_SIZE + URP_PONG_PAYLOAD_SIZE)
+/*
+ * The ceiling is a software/allocation choice, not a wire or hardware limit:
+ * payload_length on the wire is a u32 (urp_frame.h), and RoCEv2 RC segments a
+ * single large message into PMTU packets in the NIC (ConnectX-4 Lx reports
+ * max_msg_sz = 1 GiB). Since the copy pump is frame-rate-bound (design 34
+ * §34.5.1), a larger slot moves proportionally more bytes per frame. 1 MiB is
+ * the current cap; slots this large are backed by high-order compound pages
+ * (page_pool order = get_order(buffer_size)), so pair a large buffer_size with a
+ * small buffer_count and expect high-order allocation to be best-effort. A
+ * scatter-gather (multi-SGE, max_sge=30) large-frame path is the production
+ * follow-up that removes the high-order-alloc dependency (design 37).
+ */
+#define URP_BUFFER_SIZE_MAX	1048576
 
 /* Defaults applied when attribute absent in NEW_ENDPOINT */
 #define URP_NUM_QPS_DEFAULT	1

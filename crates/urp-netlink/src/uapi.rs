@@ -19,8 +19,18 @@ pub const URP_PASSWORD_MAX: usize = 16;
 pub const URP_NUM_QPS_MAX: u32 = 32;
 pub const URP_NUM_QPS_MIN: u32 = 1;
 pub const URP_BUFFER_COUNT_MIN: u32 = 16;
-pub const URP_BUFFER_SIZE_MIN: u32 = 20;
-pub const URP_BUFFER_SIZE_MAX: u32 = 65536;
+// = URP_FRAME_HEADER_SIZE (20) + URP_PONG_PAYLOAD_SIZE (48). A recv buffer must
+// hold the largest frame urp emits (a PONG, 68 bytes); a smaller one overflows
+// on the first PONG and crash-loops the QP. Kept in step with the kernel's
+// uapi/linux/urp.h URP_BUFFER_SIZE_MIN (an expression there, so it is excluded
+// from the uapi_constants_match_kernel_header token-parity test below).
+pub const URP_BUFFER_SIZE_MIN: u32 = 68;
+// = 1 MiB. A software/allocation ceiling, not a wire limit (payload_length is a
+// u32 and the NIC segments large RC messages itself). Large slots are high-order
+// compound pages, so pair with a small buffer_count. Kept in step with the
+// kernel's uapi/linux/urp.h URP_BUFFER_SIZE_MAX (checked by the token-parity
+// test below). See design 37.
+pub const URP_BUFFER_SIZE_MAX: u32 = 1048576;
 
 pub const URP_DEFAULT_PORT: u16 = 4791;
 

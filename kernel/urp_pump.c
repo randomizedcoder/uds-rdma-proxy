@@ -29,6 +29,14 @@
 #define URP_SEND_WAIT_MAX_MS	100
 
 /*
+ * gap #6 Phase 2 (PR3): byte-window sender-gate liveness backstop. After this
+ * many URP_SEND_WAIT_MAX_MS timeouts with no window room (5 s), post
+ * best-effort to break a potential send-pool-exhaustion deadlock (see the gate
+ * in urp_stream_tx_fn). Never reached under normal grant flow.
+ */
+#define URP_WINDOW_STALL_BUDGET	50
+
+/*
  * Post one IB_WR_SEND of @len bytes (header included) at DMA/MR address @addr
  * with local key @lkey on @qp, completing through @cqe. A single SGE: the
  * pump's pool buffers are physically contiguous compound pages, and the
@@ -342,11 +350,77 @@ static int urp_stream_tx_fn(void *data)
 			continue;
 		}
 
-		/* Per-stream credit consume (best-effort, same rules as
-		 * the legacy ep->conn pump above).
-		 */
-		if (urp_credit_consume(&stream->credit) == -EAGAIN)
-			atomic64_inc(&ep->stats.credit_stalls);
+		if (READ_ONCE(ep->window_negotiated)) {
+			/*
+			 * gap #6 Phase 2 (PR3): byte-window sender gate (design
+			 * 35 §35.3). Block until this frame fits the in-flight
+			 * window instead of the best-effort frame-credit consume.
+			 * tx_bytes is this kthread's own counter (single writer);
+			 * tx_bytes_acked is bumped by the receive path and read
+			 * here (READ_ONCE). The stall is counted once per episode;
+			 * the bounded wait re-checks terminal conditions (stop /
+			 * UDS close / disconnect) so a peer that stops granting
+			 * cannot wedge the pump forever (§35.8).
+			 */
+			if (!urp_window_has_room(atomic64_read(&stream->tx_bytes),
+						 READ_ONCE(stream->tx_bytes_acked),
+						 READ_ONCE(stream->window_bytes),
+						 len)) {
+				/*
+				 * Liveness safety valve (§35.8): a window-blocked
+				 * sender holds this send buffer, so if EVERY send
+				 * buffer of an endpoint is held by blocked senders
+				 * the receive path could fail to allocate a buffer
+				 * to emit grants -- a pool-exhaustion deadlock. The
+				 * grant emit is non-blocking + cumulative so it
+				 * self-heals the instant any buffer frees, but as a
+				 * hard backstop we cap the total block time and then
+				 * post best-effort (degrading to the pre-PR3
+				 * behaviour only under genuine grant starvation,
+				 * never under normal grant flow). Grants arrive in
+				 * sub-ms on a healthy fabric, so the budget is never
+				 * reached in practice.
+				 */
+				unsigned int stalls = 0;
+
+				atomic64_inc(&ep->stats.credit_stalls);
+				while (!urp_window_has_room(
+						atomic64_read(&stream->tx_bytes),
+						READ_ONCE(stream->tx_bytes_acked),
+						READ_ONCE(stream->window_bytes),
+						len)) {
+					wait_event_interruptible_timeout(ep->send_wq,
+						urp_window_has_room(
+							atomic64_read(&stream->tx_bytes),
+							READ_ONCE(stream->tx_bytes_acked),
+							READ_ONCE(stream->window_bytes),
+							len) ||
+						kthread_should_stop() ||
+						!stream->uds_sock ||
+						!READ_ONCE(ep->connected),
+						msecs_to_jiffies(URP_SEND_WAIT_MAX_MS));
+					if (kthread_should_stop() ||
+					    !stream->uds_sock ||
+					    !READ_ONCE(ep->connected)) {
+						urp_buf_free_send(ep, buf);
+						goto stream_tx_stop;
+					}
+					if (++stalls >= URP_WINDOW_STALL_BUDGET) {
+						pr_warn_ratelimited(
+							"stream %u window stalled %ums; posting best-effort\n",
+							stream->id,
+							stalls * URP_SEND_WAIT_MAX_MS);
+						break;
+					}
+				}
+			}
+		} else {
+			/* Per-stream credit consume (best-effort, same rules as
+			 * the legacy ep->conn pump above).
+			 */
+			if (urp_credit_consume(&stream->credit) == -EAGAIN)
+				atomic64_inc(&ep->stats.credit_stalls);
+		}
 
 		ret = urp_post_frame(ep, qp->qp, buf,
 				     URP_FRAME_HEADER_SIZE + len);
@@ -363,6 +437,7 @@ static int urp_stream_tx_fn(void *data)
 		atomic64_inc(&qp->tx_frames);
 	}
 
+stream_tx_stop:	/* byte-window gate aborted on stop / UDS close / disconnect */
 	pr_debug("stream %u TX pump stopped\n", stream->id);
 	return 0;
 }
@@ -586,5 +661,41 @@ int urp_emit_credit_frame(struct urp_endpoint *ep, struct urp_qp *qp,
 	ret = urp_post_frame(ep, qp->qp, buf, URP_FRAME_HEADER_SIZE);
 	if (ret)
 		pr_warn_ratelimited("CREDIT frame post_send failed: %d\n", ret);
+	return ret;
+}
+
+/*
+ * gap #6 Phase 2 (PR3): emit a CONTROL/CREDIT-BYTES grant. Unlike the u16
+ * header credit above, this carries the receiver's cumulative rx_bytes_delivered
+ * high-water as a u64 in the frame payload (design 35 §35.3). The sender applies
+ * it with max(), so a lost/reordered/duplicate grant is idempotent -- there is
+ * no retransmit or ack of the grant itself.
+ */
+int urp_emit_credit_bytes_frame(struct urp_endpoint *ep, struct urp_qp *qp,
+				u32 stream_id, u64 cumulative_bytes)
+{
+	struct urp_buffer *buf;
+	int ret;
+
+	if (!qp || !qp->qp)
+		return 0;
+
+	buf = urp_buf_alloc_send(ep);
+	if (!buf) {
+		atomic64_inc(&ep->stats.credit_stalls);
+		return -ENOBUFS;
+	}
+
+	urp_frame_encode(buf->data, stream_id, 0, URP_FRAME_TYPE_CONTROL,
+			 URP_CTRL_FLAG_CREDIT_BYTES, 0,
+			 URP_CREDIT_BYTES_PAYLOAD_SIZE);
+	urp_credit_bytes_encode(buf->data + URP_FRAME_HEADER_SIZE,
+				cumulative_bytes);
+
+	ret = urp_post_frame(ep, qp->qp, buf,
+			     URP_FRAME_HEADER_SIZE + URP_CREDIT_BYTES_PAYLOAD_SIZE);
+	if (ret)
+		pr_warn_ratelimited("CREDIT-BYTES frame post_send failed: %d\n",
+				    ret);
 	return ret;
 }

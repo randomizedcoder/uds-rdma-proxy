@@ -62,6 +62,7 @@ Highlights:
 | 34 | Bulk throughput | ✅ Measured on hardware; copy-vs-zero-copy captured |
 | 35 | Windowing / flow control | 🟢 Phase 1 (pump completion waitqueue) merged; further windowing spec'd |
 | 36 | CUBIC congestion control | 📝 Design-only, LATER (fabric near-lossless, path is pump-bound) |
+| 37 | High-throughput cluster data plane (beat TCP per stream) | 🟢 Jumbo MTU 9700 + `buffer_size` cap→1 MiB landed; single-stream jumbo: copy 1913 MB/s @256K (103% of TCP), fast 3050 MB/s @512K (97.6% line). Multi-SGE + F2 aggregate next |
 
 ## Redpanda over UDS-over-RDMA
 
@@ -244,21 +245,35 @@ Genuinely open:
    its CM machinery. The design-33 initiator bring-up rework (lazy connect /
    retry) likely supersedes it, but this specific multi-initiator-in-one-module
    case has not been explicitly re-verified.
-6. **Multi-QP data path unstable on real hardware (found 2026-08-23).** The first
-   multi-QP data transfer on hp1↔hp3 (`.#urp-reorder-matrix`, sweeping
-   `num_qps ∈ {1,4,8}`) wedges: only single-QP/4096 delivers cleanly (`BENCH_OK
-   verify=full`, `drops=0`, `rx≈1.5M`); every multi-QP cell errors out. dmesg
-   shows a **connect-handshake race** (acceptor `rejecting extra CONNECT_REQUEST
-   (8 >= 8 QPs)`, initiator QPs `CM down (rejected)` / retry storm) and **RC
-   transport-retry exhaustion** (`send completion error: transport retry counter
-   exceeded` — fabric loss under multi-QP bursts; no PFC/ECN/congestion control).
-   QPs erroring mid-stream open permanent sequence gaps → the reorder window
-   overflows → `reorder_drops` explode → delivery wedges. **Every real-hardware
-   result to date — including the design-32 128/128 matrix — used `num_qps=1`;
-   multi-QP has never carried clean data on the boxes.** Fixing it needs the
-   acceptor multi-QP slot/connect race resolved and congestion control (design 36)
-   before multi-QP is viable. Repro (and the reorder hardware-exercise tool once
-   the path is stable): `nix run .#urp-reorder-matrix -- hp1 hp3 10.10.2.1`.
+6. **Multi-QP data path — FIXED for realistic frames (found 2026-08-23, resolved
+   2026-08-24).** The first multi-QP transfer on hp1↔hp3 (`.#urp-reorder-matrix`,
+   sweeping `num_qps ∈ {1,4,8}`) wedged on **two independent root causes**, both
+   now fixed: (A) a **connect-handshake race** — the acceptor allocated QP slots
+   from a bare monotonic counter with no per-QP identity, so concurrent per-QP
+   retries collided (`rejecting extra CONNECT_REQUEST (8 >= 8 QPs)` / retry storm);
+   fixed by identity-based slot alloc carrying `qp_index` in the CM private_data
+   (PR #60). (B) **no real flow control** — the credit gate was best-effort (posted
+   at zero credits), so N QPs flooded the shared SRQ → RNR → `transport retry
+   counter exceeded` → permanent sequence gaps → `reorder_drops` explode; fixed by
+   **byte-windowing** (design 35 §35.3): a blocking per-stream sender gate bounding
+   in-flight bytes + cumulative-absolute CREDIT-BYTES grants, both peers negotiating
+   the capability in the CM trailer (PR #61 wire/default-off, PR3 gate/behaviour-on).
+   Two further HW-only bugs surfaced and fixed under PR3: a **SYN-race** (a DATA
+   frame arriving before its stream's SYN on a different QP was dropped → gap the
+   windowed sender can't refill → deadlock; fixed by implicit stream creation) and
+   the **reorder depth coupling** for tiny frames (MIN_FRAME 64→16). A third,
+   **pre-existing** bug then surfaced at the smallest sweep size: a QP-health
+   **PONG frame is 68 bytes** (`URP_FRAME_HEADER_SIZE 20 + URP_PONG_PAYLOAD_SIZE
+   48`) but `buffer_size=64` posts 64-byte recv buffers, so the first PONG overran
+   the buffer → ib `local length error` → NAK → `remote invalid request` → QP
+   crash-loop (windowing-independent: it reproduced with `advertise=0`, and per-QP
+   so it failed even at `num_qps=1`). Fixed by raising `URP_BUFFER_SIZE_MIN` to
+   `URP_FRAME_HEADER_SIZE + URP_PONG_PAYLOAD_SIZE` (= 68) — the netlink policy now
+   rejects sub-68 buffers with ERANGE rather than letting them crash-loop.
+   **HW result: reorder-matrix 9/9 GREEN** — every cell (68 / 4096 / 65516 ×
+   `num_qps ∈ {1,4,8}`) passes `BENCH_OK verify=full`, `reorder_drops=0`,
+   `buffer_alloc_fails=0`, no dmesg WARN, no deadlock (byte window took drops
+   millions→0). Repro: `nix run .#urp-reorder-matrix -- hp1 hp3 10.10.2.1`.
 7. **Roadmap (not gaps, deferred by design).** urp-fast PR6 (Rust backend) / PR7
    (Seastar); design 35 further windowing; design 36 CUBIC congestion control
    (now motivated by gap #6 — multi-QP bursts exhaust RC transport retries, so the

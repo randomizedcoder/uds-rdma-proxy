@@ -80,7 +80,7 @@ pub struct AddArgs {
     #[arg(long)]
     pub buffer_count: Option<u32>,
 
-    /// Buffer size (20..65536).
+    /// Buffer size (68..1048576).
     #[arg(long)]
     pub buffer_size: Option<u32>,
 

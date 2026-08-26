@@ -22,6 +22,15 @@ for the full picture):
 - **Kernel data path** — k0 echo → multi-QP + SRQ + credit flow control +
   per-stream reorder → **initiator multi-stream** (many concurrent UDS
   connections multiplexed over a shared QP set).
+- **Byte-windowing flow control** — a blocking per-stream sender gate bounding
+  in-flight bytes, with cumulative-absolute `CREDIT-BYTES` grants (capability-
+  negotiated, so it falls back to frame credits with an older peer). This is what
+  makes the **multi-QP data path stable under sustained load on real hardware**
+  (see [docs/design/35-windowing-flow-control.md](docs/design/35-windowing-flow-control.md)).
+- **Zero-copy fast path** (optional, `CONFIG_URP_FAST`; `urp add --kind fast`) —
+  an `io_uring` `uring_cmd` interface that REGISTERs a userspace buffer pool and
+  moves payload with no kernel copy
+  ([docs/design/31-urp-fast-zero-copy.md](docs/design/31-urp-fast-zero-copy.md)).
 - **Control plane** — `urp add/remove/show/stats/drain/monitor` over generic
   netlink; per-endpoint `/proc/urp/<name>/stats`.
 - **QP health probes + PSK auth** (SHA-256 in `rdma_cm` private_data).
@@ -32,6 +41,12 @@ for the full picture):
   cross-arch (x86_64 KVM / aarch64 TCG), a kernel-version matrix (6.1/6.6/6.12/
   7.1), and a **KASAN + KMEMLEAK + lockdep** sanitizer pass (clean under a
   12-concurrent-stream burst).
+- **Real RoCEv2 hardware** — validated end-to-end on a two-host 25 GbE testbed
+  (Mellanox `mlx5`): byte-exact `urp-bench` transfers and a multi-QP reorder
+  sweep (`num_qps ∈ {1,4,8}` × frame sizes) that passes `BENCH_OK verify=full`
+  with zero drops. See
+  [docs/design/32-real-hardware-integration-testing.md](docs/design/32-real-hardware-integration-testing.md)
+  and [docs/design/34-bulk-throughput.md](docs/design/34-bulk-throughput.md).
 - **Static analysis** — hermetic Nix targets for sparse, smatch,
   checkpatch --strict, W=1, coccicheck, clippy, rustfmt
   (`nix build .#analysis-all`); all clean except a small documented
@@ -67,6 +82,11 @@ nix run  .#test-redpanda-produce-consume    # full produce/consume
 nix run  .#fuzz-classify -- -max_total_time=60   # RX frame classifier
 nix run  .#fuzz-rx-seq   -- -max_total_time=60   # RX state-machine pipeline
 nix run  .#fuzz-reorder  -- -max_total_time=60   # C reorder backend
+
+# Benchmark + real-hardware sweeps (the *-matrix runners take two hosts + an IP):
+nix run  .#urp-bench-local                              # single-host io_uring bench
+nix run  .#urp-reorder-matrix -- <acc-host> <init-host> <acc-ip>  # multi-QP reorder sweep
+nix run  .#urp-bw-matrix      -- <acc-host> <init-host> <acc-ip>  # bulk-throughput sweep
 ```
 
 To build the module against your **running** kernel, see the `buildUrpKo`
@@ -80,8 +100,13 @@ To build the module against your **running** kernel, see the `buildUrpKo`
 - **[docs/KERNEL-MODULE-PLAN.md](docs/KERNEL-MODULE-PLAN.md)** — phased
   implementation plan; **[status.md](status.md)** — current status.
 - **[docs/BENCHMARKING.md](docs/BENCHMARKING.md)** — how the buffer geometry
-  (`buffer_count`/`buffer_size`) is benchmarked and the emulated-harness results
-  (⚠️ soft-RoCE VM numbers, not a performance baseline; real RoCEv2-hardware
-  testing is a TODO).
+  (`buffer_count`/`buffer_size`) is benchmarked (soft-RoCE VM numbers are a
+  functional harness, not a performance baseline).
+- **Performance & flow control** — the `urp-bench` io_uring benchmark
+  ([design 30](docs/design/30-urp-bench-io-uring.md)), the zero-copy fast path
+  ([design 31](docs/design/31-urp-fast-zero-copy.md)), real-hardware results
+  ([design 32](docs/design/32-real-hardware-integration-testing.md)), bulk
+  throughput ([design 34](docs/design/34-bulk-throughput.md)), and byte-windowing
+  flow control ([design 35](docs/design/35-windowing-flow-control.md)).
 
 > Prototype / research code. Not production-hardened.

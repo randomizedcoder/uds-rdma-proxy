@@ -162,11 +162,27 @@ int urp_stream_create(struct urp_endpoint *ep, u32 stream_id,
 	mutex_init(&s->lock);
 	urp_credit_init(&s->credit, ep->num_bufs / 2);
 
-	/* Reorder buffer is per-stream because each stream has its own
-	 * sequence space (design 09 section 9.6). Capped at 256 -- well above
-	 * any reasonable ECMP path-skew burst.
+	/*
+	 * gap #6 Phase 2 (PR3): byte-windowing flow-control state (design 35
+	 * §35.3). window_bytes is the live sysctl value clamped to range; the
+	 * sender gate (urp_stream_tx_fn) and grant emitter (urp_recv_done) read
+	 * these once the connection negotiates the window (ep->window_negotiated).
+	 * A sysctl change takes effect on newly created streams.
 	 */
-	s->reorder = urp_reorder_alloc(0, 256);
+	s->window_bytes = urp_window_clamp(READ_ONCE(urp_window_bytes));
+	s->tx_bytes_acked = 0;
+	s->last_window_grant = 0;
+
+	/*
+	 * Reorder buffer is per-stream (each stream has its own sequence space,
+	 * design 09 §9.6). Its depth is coupled to the byte window (design 35
+	 * §35.3): it must hold every frame the window admits, else an in-window
+	 * burst would be spuriously dropped. Nodes are allocated on demand, so a
+	 * high cap costs nothing until buffered. urp_reorder_depth_for_window()
+	 * clamps to [256, 65536]; a 1 MiB window -> 256, matching the old default.
+	 */
+	s->reorder = urp_reorder_alloc(0,
+				       urp_reorder_depth_for_window(s->window_bytes));
 	if (!s->reorder) {
 		mutex_destroy(&s->lock);
 		kfree(s);
@@ -422,8 +438,27 @@ int urp_stream_rx_dispatch(struct urp_endpoint *ep, u32 stream_id, u8 flags,
 			return ret;
 	} else {
 		s = urp_stream_lookup(ep, stream_id);
-		if (!s)
-			return -ENOENT;
+		if (!s) {
+			/*
+			 * gap #6 Phase 2 (PR3): multi-QP wire reordering can land
+			 * a DATA frame at the acceptor BEFORE the stream's SYN --
+			 * they travel on different QPs (round-robin) and complete
+			 * out of order. Dropping the early frame (the old -ENOENT)
+			 * left a permanent hole the per-stream reorder buffer,
+			 * keyed by seq, could never fill; byte-windowing then made
+			 * it fatal (the blocked sender cannot flood past it and
+			 * there is no retransmit). Instead create the stream
+			 * implicitly -- the SYN flag is advisory, and the reorder
+			 * buffer still delivers seq 0 first whenever it arrives,
+			 * with the real SYN handled idempotently. A stray RST for
+			 * an unknown stream stays a no-op.
+			 */
+			if (flags & URP_DATA_FLAG_RST)
+				return -ENOENT;
+			ret = urp_stream_rx_syn(ep, stream_id, &s);
+			if (ret)
+				return ret;
+		}
 	}
 
 	if (flags & URP_DATA_FLAG_RST) {

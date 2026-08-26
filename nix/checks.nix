@@ -369,6 +369,35 @@ in
     '';
   };
 
+  # gap #6 Phase 2 (PR3): userspace twin of the byte-window flow-control
+  # arithmetic (kernel/urp_window.h) -- sender-gate room, grant threshold,
+  # grant idempotence (max()), window clamp, reorder-depth coupling. Fast
+  # sandboxed gate; KUnit re-runs the same predicates in-VM. The two must always
+  # agree. Pure arithmetic -- no RDMA/rbtree/alloc.
+  urp-window-units = pkgs.stdenv.mkDerivation {
+    name = "urp-window-units";
+    src = pkgs.lib.fileset.toSource {
+      root = ../.;
+      fileset = pkgs.lib.fileset.unions [
+        ../kernel/urp_window.h
+        ../tools/urp-window-units.c
+      ];
+    };
+    buildPhase = ''
+      $CC -Wall -Wextra -Werror -O2 -I kernel \
+        -o urp-window-units \
+        tools/urp-window-units.c
+    '';
+    doCheck = true;
+    checkPhase = ''
+      ./urp-window-units
+    '';
+    installPhase = ''
+      mkdir -p $out
+      touch $out/passed
+    '';
+  };
+
   # NOTE: miri requires network access to build its sysroot (fetches cfg-if for std).
   # This is incompatible with Nix's sandbox. Run miri via devshell instead:
   #   nix develop --command cargo miri test -p uds-rdma-protocol

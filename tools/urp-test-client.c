@@ -41,10 +41,12 @@
 #include "urp_fuzz_shim.h"
 
 /*
- * Registered buffers span the largest slot an endpoint can have
- * (URP_BUFFER_SIZE_MAX 65536) so the `bigframe` mode can prove that an endpoint
- * created with a large buffer_size actually carries a single >4076-byte payload
- * (design 29 Gap 2). Small-frame modes (echo/latency/reorder) are unaffected.
+ * Registered buffers span a representative large slot (64 KiB) so the `bigframe`
+ * mode can prove that an endpoint created with a large buffer_size actually
+ * carries a single >4076-byte payload (design 29 Gap 2). This is deliberately
+ * below URP_BUFFER_SIZE_MAX (now 1 MiB) — a 64 KiB slot allocates reliably in the
+ * memory-constrained microVM pair test, whereas MiB-scale high-order allocations
+ * do not. Small-frame modes (echo/latency/reorder) are unaffected.
  */
 #define BUF_SIZE		65536
 #define MAX_PAYLOAD		(BUF_SIZE - URP_FRAME_HEADER_SIZE)
