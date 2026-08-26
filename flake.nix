@@ -92,6 +92,10 @@
         # One-way bulk-throughput runner (design 34): sink-measured goodput +
         # iperf2/ib_write_bw baselines. `nix run .#urp-bw-matrix`.
         urpBwMatrix = import ./nix/urp-bw-matrix.nix { inherit pkgs; };
+        # F2 aggregate / N-flow runner (design 34 Option F2, design 37 §37.6):
+        # N independent streams, one per endpoint pair; sums sink goodputs.
+        # `nix run .#urp-f2-matrix`.
+        urpF2Matrix = import ./nix/urp-f2-matrix.nix { inherit pkgs; };
         # Multi-QP reorder validation (status.md gap #1): sweep num_qps, assert
         # reorder-insertions>0 + byte-exact delivery. `nix run .#urp-reorder-matrix`.
         urpReorderMatrix = import ./nix/urp-reorder-matrix.nix { inherit pkgs; };
@@ -233,6 +237,9 @@
           # Bulk-throughput sweep (design 34):
           #   nix run .#urp-bw-matrix -- <acceptor> <initiator> <acceptor-ip>
           urp-bw-matrix = urpBwMatrix;
+          # F2 aggregate / N-flow throughput (design 34 F2, 37 §37.6; needs boxes):
+          #   nix run .#urp-f2-matrix -- <acceptor> <initiator> <acceptor-ip>
+          urp-f2-matrix = urpF2Matrix;
           # Multi-QP reorder validation over RoCEv2 (status gap #1; needs boxes):
           #   nix run .#urp-reorder-matrix -- <acceptor> <initiator> <acceptor-ip>
           urp-reorder-matrix = urpReorderMatrix;

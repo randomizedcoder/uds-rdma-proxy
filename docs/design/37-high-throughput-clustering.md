@@ -198,6 +198,28 @@ This is the lever that lifts the **small/mid-frame** single-flow ceiling — exa
 where TCP's TSO/GSO batching currently wins. Applied to the fast path it should
 pull 16 KB and 4 KB up toward line and push 64 KB from 68 % past it.
 
+**Measured small-frame ceiling + Option-B go/no-go (2026-08-26, copy path, `.#urp-bw-matrix`).**
+Single stream, `num_qps=1`, `reorder_drops=0`:
+
+| frame | goodput | fps | cpu_us/msg | % of 25 GbE |
+| ----- | ------- | --- | ---------- | ----------- |
+| 1 KiB | 147 MB/s | 163k | 1.01 | 4.7 % |
+| 2 KiB | 772 MB/s | **423k** | 1.32 | 24.7 % |
+| 64 KiB | 1981 MB/s | 32k | 16.4 | 63.4 % |
+
+**Verdict: BUILD Option B.** At 2 KiB the pump sustains ~423k fps consuming only
+~0.56 of one core (423k × 1.32 µs) — i.e. the small-frame ceiling is **post/doorbell/
+CQE overhead, not CPU or membw**, with ample idle cores. That is exactly Option B's
+target: cutting CQE traffic (selective signaling) and doorbells (multi-WR) should
+convert the idle headroom into more fps and lift small-frame goodput toward line.
+The design-35 completion waitqueue already lifted the *large*-frame fps ~1000 → ~32k;
+Option B is the next step for the small/mid regime. (Orthogonal pre-existing anomaly
+observed the same session: 4 KiB and 16 KiB copy-path runs stall the source early
+via credit backpressure — `rx_delivered` collapses to ~33–81k frames vs 2.1 M at
+2 KiB — and never FIN, so no `BENCH_OK`; 1 K/2 K/64 K are clean. This is a copy-path
+credit-stall quirk at mid frame sizes, independent of Option B, worth a separate
+look.)
+
 **Limiter 2 — the copy itself (copy path only).** Two `AF_UNIX` copies on TX/RX
 plus the SRQ recv-slot copy. **The lever is the zero-copy fast path
 ([design 31](31-urp-fast-zero-copy.md), built + HW-validated)** — the reason the
@@ -309,6 +331,30 @@ open N connections regardless; `urp` simply gives each one its own hardware-orde
 QP. Scale-out is cheap here (mostly workload/harness sharding over existing
 machinery), so it lands *after* the per-stream win, as amplification.
 
+**Measured — F2 aggregate is NOT additive on the *copy* path (2026-08-26, `.#urp-f2-matrix`).**
+N genuinely independent streams (one endpoint pair each — own port/QP/pump/reorder,
+`reorder_drops=0` throughout), 256 KiB frames, summed sink goodput on hp1↔hp3:
+
+| streams N | aggregate goodput | % of 25 GbE line | per-stream |
+| --------- | ----------------- | ---------------- | ---------- |
+| 1 | 1912 MB/s | 61.2 % | 1912 |
+| 2 | 1946 MB/s | 62.3 % | 973 |
+| 4 | 1906 MB/s | 61.0 % | 476 |
+| 8 | (contention-limited¹) | — | — |
+
+The aggregate is **flat at ~1900 MB/s regardless of N**, and per-stream goodput
+halves as N doubles — the classic signature of a **shared bottleneck**, not
+per-stream state. That bottleneck is the copy itself (Limiter 2): the copy path's
+per-frame `memcpy` saturates this box's memory-copy bandwidth at ~1900 MB/s, so
+adding streams re-divides the same pie. **On the copy path, F2 does not add
+throughput** — which sharpens the whole thesis: to go past the single-stream copy
+ceiling you need the **zero-copy fast path** (no `memcpy`, bounded by NIC line rate,
+not membw), *then* F2 to fill the NIC. F2's additivity is a property of the zero-copy
+path, not a general one. (¹ At N=8 the 16 bench processes over-subscribe the 6
+isolated cores; only 5/8 sinks reported and the aggregate fell to ~1195 MB/s —
+scheduler contention, not the transport. A fast-path F2 sweep is the natural
+follow-up to measure true additivity above the copy wall.)
+
 ## 37.7 The lever ladder, prioritized for the per-stream win
 
 One table, ordered by how directly each lever serves "one stream beats one TCP
@@ -319,11 +365,11 @@ stream," with status. Latency effect noted because the goal is both.
 | 1 | **Jumbo MTU + raised frame-size cap** (§37.4) | RoCE PMTU + per-frame amortization | **copy path 1.7 %→61 % line (past TCP); fast 68 %→97.6 %** | neutral | **built + measured (2026-08-25)** |
 | 2 | **Zero-copy fast path** (Option E / [d31](31-urp-fast-zero-copy.md)) | copies 1–4 | **≈97.6 % line @ jumbo, clears the copy wall** | 4.1× lower @64 KB | **built + HW-validated** |
 | 3 | **Multi-SGE large frames** (`max_sge=30`) — production twin of #1 | high-order alloc fragility | same goodput, robust (no order-8 alloc) | neutral | **next (path Y; #1 prototype uses high-order slots)** |
-| 4 | **Option B: selective signaling + multi-WR + coalesce** ([d34 §34.3](34-bulk-throughput.md#option-b--optimize-the-two-sided-send-pump-in-place-effort-m-risk-medium)) — pump **and** fast post loop | per-frame CQE/doorbell | lifts the *small/mid*-frame points + fast 64 KB toward its ceiling | slight coalesce cost | not built (no longer needed to clear TCP) |
+| 4 | **Option B: selective signaling + multi-WR + coalesce** ([d34 §34.3](34-bulk-throughput.md#option-b--optimize-the-two-sided-send-pump-in-place-effort-m-risk-medium)) — pump **and** fast post loop | per-frame CQE/doorbell | lifts the *small/mid*-frame points + fast 64 KB toward its ceiling | slight coalesce cost | not built; **measured-justified (2026-08-26)** — 2 KiB is post-bound at ~423k fps using only ~0.56 core (§37.5) |
 | 5 | **Byte-windowing** (Option C / [d35](35-windowing-flow-control.md)) | oversend / RNR storm | makes the peak *sustainable* (not higher) | removes sawtooth | **built (9/9 GREEN)** |
 | 6 | **Adaptive frame sizing** (§37.5a) | latency↔throughput + copy wall | keeps small frames at low load, caps at the sweet spot | preserves low-load latency | design sketch; (a) natural adaptivity free, (b) gated on numbers |
 | 7 | **Inline sends** (`IB_SEND_INLINE` <64 B) ([d13 §13.5](13-performance.md)) | tiny-frame DMA+CQE | control-message latency | small-msg RTT | not built |
-| 8 | **F2 scale-out** ([§37.6](#376-scale-out-f2--additive-not-the-way-we-beat-tcp)) | single-QP NIC headroom | **additive** — fills line, maps to partitions/shards | per-stream tail preserved | not built |
+| 8 | **F2 scale-out** ([§37.6](#376-scale-out-f2--additive-not-the-way-we-beat-tcp)) | single-QP NIC headroom | **additive on the fast path only** — copy path is membw-capped (measured flat ~1900 MB/s, N=1→4, 2026-08-26) | per-stream tail preserved | harness built (`.#urp-f2-matrix`); fast-path sweep next |
 | 9 | **Option D** one-sided WRITE ring ([d34 §34.3](34-bulk-throughput.md#option-d--one-sided-rdma-write-into-a-peer-registered-ring-effort-l-risk-high)) | recv-copy/SRQ ceiling | removes the copy wall on the copy path | — | deferred (trigger: copy-path large-frame wall matters) |
 | 10 | **CUBIC cwnd** ([d36](36-congestion-control-cubic.md)) | congestion (none yet) | none until congestion-bound | — | deferred (trigger: offered load > fabric) |
 
