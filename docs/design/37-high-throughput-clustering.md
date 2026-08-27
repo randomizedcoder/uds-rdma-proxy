@@ -151,6 +151,13 @@ Three findings, each a direct answer to the thesis:
    `cpu_us_per_msg` climbs 19 → 158 as the per-frame `memcpy` and UDS fragmentation
    dominate. Bigger is *not* always better: direct evidence for **adaptive frame
    sizing with a cap** (§37.5a) and for zero-copy at large frames.
+   **Superseded (2026-08-26, lever #4a):** the copy wall was mostly the RX
+   reorder + gather copies (5 payload copies for an in-order 1 MiB frame), not a
+   hard membw limit. The in-order RX copy-elision bypass (§34.2) cuts that to 1
+   copy and the copy path now *rises* through 1 MiB: **1 MiB 809.6→3056 MB/s
+   (97.8 % line)**, 512 KiB 3053, i.e. the copy path now tracks the fast path for
+   a single in-order stream. Adaptive sizing is no longer needed to dodge a
+   large-frame copy wall on the in-order path (it survives only for latency).
 3. **The fast path nearly saturates the link on one stream.** Zero-copy *climbs*
    exactly where the copy path falls: **3050.8 MB/s at 512 KiB = 97.6 % of 25 GbE**,
    one stream, `syscalls_per_msg=0.5`, `cpu_us_per_msg=2.3`. Jumbo also lifted its
@@ -352,7 +359,17 @@ adding streams re-divides the same pie. **On the copy path, F2 does not add
 throughput** — which sharpens the whole thesis: to go past the single-stream copy
 ceiling you need the **zero-copy fast path** (no `memcpy`, bounded by NIC line rate,
 not membw), *then* F2 to fill the NIC. F2's additivity is a property of the zero-copy
-path, not a general one. (¹ At N=8 the 16 bench processes over-subscribe the 6
+path, not a general one.
+
+**Update (2026-08-26, lever #4a):** the ~1900 MB/s figure was inflated by *four*
+redundant RX copies per in-order frame (gather + 3 reorder-buffer copies). The
+in-order RX copy-elision bypass (§34.2) removes them, so a *single* in-order copy
+stream now reaches **3056 MB/s (97.8 % line)** at 1 MiB — the box's real
+single-copy membw is far above 1900. The F2 aggregate measurements above predate
+the bypass and still describe *multi-stream* copy-path behavior (each stream now
+carries only one copy, so the shared-membw pie is correspondingly larger); the
+zero-copy path remains the way to fill the line without any copy. Re-running the
+copy-path F2 matrix on top of the bypass is follow-up work. (¹ At N=8 the 16 bench processes over-subscribe the 6
 isolated cores; only 5/8 sinks reported and the aggregate fell to ~1195 MB/s —
 scheduler contention, not the transport.)
 
@@ -386,6 +403,7 @@ stream," with status. Latency effect noted because the goal is both.
 | 2 | **Zero-copy fast path** (Option E / [d31](31-urp-fast-zero-copy.md)) | copies 1–4 | **≈97.6 % line @ jumbo, clears the copy wall** | 4.1× lower @64 KB | **built + HW-validated** |
 | 3 | **Multi-SGE large frames** (`max_sge=30`) — production twin of #1 | high-order alloc fragility | same goodput, robust (no order-8 alloc) | neutral | **built + HW-validated (2026-08-26)** — chunked buffers, 1 MiB from 16×64 KiB chunks, reassembled 100 % / reorder_drops 0, no high-order alloc; single-chunk path unchanged (1943 MB/s). PRs #67 (3a) + #68 (3b) |
 | 4 | **Option B: selective signaling + multi-WR + coalesce** ([d34 §34.3](34-bulk-throughput.md#option-b--optimize-the-two-sided-send-pump-in-place-effort-m-risk-medium)) — pump **and** fast post loop | per-frame CQE/doorbell | lifts the *small/mid*-frame points + fast 64 KB toward its ceiling | slight coalesce cost | not built; **measured-justified (2026-08-26)** — 2 KiB is post-bound at ~423k fps using only ~0.56 core (§37.5) |
+| 4a | **In-order RX copy-elision** (§34.2) — copy-path RX twin of #3 | reorder + gather copies on the in-order path | **RX payload copies 5→1 @1 MiB (4→1 small); copy path 1 MiB 1079→3056 MB/s = 97.8 % line, blows past the ~1900 membw "ceiling"** | lower RX (no gather/reorder staging) | **built + HW-validated (2026-08-26)** — `seq==next_expected` delivered straight from recv chunks via multi-kvec `sendmsg` (`urp_rx_send_uds_sg`) + `urp_reorder_advance`; out-of-order path unchanged; single-QP 65 KiB→1 MiB all 93–98 % line, drops 0, 100 % reassembled; reorder-matrix 9/9 verify=full PASS (qps 1/4/8); app-transparent, no wire change |
 | 5 | **Byte-windowing** (Option C / [d35](35-windowing-flow-control.md)) | oversend / RNR storm | makes the peak *sustainable* (not higher) | removes sawtooth | **built (9/9 GREEN)** |
 | 6 | **Adaptive frame sizing** (§37.5a) | latency↔throughput + copy wall | keeps small frames at low load, caps at the sweet spot | preserves low-load latency | design sketch; (a) natural adaptivity free, (b) gated on numbers |
 | 7 | **Inline sends** (`IB_SEND_INLINE` <64 B) ([d13 §13.5](13-performance.md)) | tiny-frame DMA+CQE | control-message latency | small-msg RTT | not built |

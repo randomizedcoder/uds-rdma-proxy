@@ -66,6 +66,19 @@ Five key facts bound throughput:
    (4076-byte payload; max 65516), buffer_count 1024 split **static 50/50** →
    512 send + 512 recv buffers.
 
+**RX in-order copy-elision (implemented).** Copies 3b (reorder) and the path-Y
+gather were both paid on *every* stream frame, even in-order ones: the reorder
+buffer's insert→pending→drained→out staging is three payload memcpys, and a
+multi-chunk frame was first gathered into `recv_scratch`. Since a single QP is
+always in order (and multi-QP mostly is), `urp_recv_done` now takes a fast path
+when `seq == next_expected`: it delivers straight from the recv chunk pages via a
+multi-kvec `kernel_sendmsg` (`urp_rx_send_uds_sg`, `kernel/urp_rdma.c`), then
+`urp_reorder_advance()`s the cursor and drains any now-contiguous buffered
+frames. This cuts the RX payload copies from **5→1** at 1 MiB (**4→1** for small
+single-chunk frames) — only copy 5 (into the peer socket) remains. Out-of-order
+frames keep the gather+reorder path. App-transparent, no wire change; the byte
+window's grant accounting is unaffected (`rx_bytes` is bumped identically).
+
 **The arithmetic:** the symmetric-echo peak of 165 MB/s ÷ 4076 B ≈ **~40k
 frames/s** put a first bound on the serial kthread. But the one-way stream
 measurement (§34.5.1) came in **far lower — ~1000 frames/s for 64 KB frames,

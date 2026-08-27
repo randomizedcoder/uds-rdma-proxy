@@ -385,6 +385,9 @@ static void run_reorder_scenario(struct kunit *test,
 					    (size_t)op->seq,
 					    "%s op %u: drain_pending", sc->name, j);
 			break;
+		case ROP_ADVANCE:
+			urp_reorder_advance(rb);
+			break;
 		default:
 			break;
 		}

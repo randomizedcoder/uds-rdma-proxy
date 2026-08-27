@@ -647,6 +647,44 @@ static int urp_rx_send_uds(struct urp_endpoint *ep, struct urp_stream *s,
 }
 
 /*
+ * Deliver @payload_len payload bytes straight from a received buffer's chunk
+ * pages to the UDS socket, gathering them in the multi-kvec kernel_sendmsg
+ * itself (SOCK_STREAM, so N kvecs == one contiguous send). This is the
+ * in-order RX copy-elision fast path (seq == next_expected): it skips both the
+ * chunk->recv_scratch gather and the reorder buffer's insert/drain copies, so
+ * the payload is copied exactly once -- into the peer's socket buffer. For a
+ * single-chunk buffer it reduces to one kvec {buf->data + header, payload_len},
+ * byte-identical to urp_rx_send_uds(). Accounts the frame identically to
+ * urp_rx_send_uds() (rx_bytes feeds the byte-window grant at the call site).
+ */
+static int urp_rx_send_uds_sg(struct urp_endpoint *ep, struct urp_stream *s,
+			      struct socket *uds, struct urp_buffer *buf,
+			      u32 payload_len)
+{
+	struct msghdr msg = {};
+	struct kvec kv[URP_MAX_SGE];
+	u32 nkv;
+	int ret;
+
+	if (payload_len == 0)
+		return 0;	/* bare FIN: nothing to send; seq still consumed */
+
+	nkv = urp_frame_fill_kvecs_len(ep, buf, kv, payload_len);
+
+	ret = kernel_sendmsg(uds, &msg, kv, nkv, payload_len);
+	if (ret < 0) {
+		pr_err_ratelimited("kernel_sendmsg (sg) failed: %d\n", ret);
+		return ret;
+	}
+
+	atomic64_add(payload_len, &ep->stats.rx_bytes);
+	atomic64_inc(&ep->stats.rx_frames);
+	if (s)
+		atomic64_add(payload_len, &s->rx_bytes);
+	return 0;
+}
+
+/*
  * Stream delivery through the per-stream reorder buffer (design 29 Gap 1
  * fix). Multi-QP arrival skew means frames can complete out of sequence;
  * feeding them through s->reorder keyed by @seq and draining the in-order
@@ -885,45 +923,82 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 	}
 
 	/*
-	 * Deliver the payload to the UDS socket. Stream frames pass through
-	 * the per-stream reorder buffer (design 29 Gap 1) so multi-QP arrival
-	 * skew is corrected before delivery; the legacy k0 path is a single
-	 * in-order QP and delivers directly.
+	 * Deliver the payload to the UDS socket.
 	 *
-	 * design 37 path Y: a frame that spans >1 chunk arrives scattered, so
-	 * gather it into the endpoint's contiguous recv_scratch first. A frame
-	 * that fits chunk 0 (every small frame, and every frame on a single-chunk
-	 * endpoint) is delivered straight from buf->data with no extra copy --
-	 * byte-identical to the pre-chunked path. The reorder drain needs a
-	 * buf_size staging area too; buf->data (chunk 0) is only chunk_size, so
-	 * multi-chunk endpoints stage the drain through recv_scratch instead
-	 * (safe: reorder insert copies the payload out before the drain writes).
+	 * In-order copy-elision fast path (the common case): when the frame is
+	 * the next expected sequence number -- always true on a single QP, and
+	 * the great majority on multi-QP -- deliver it straight from the recv
+	 * chunk pages via urp_rx_send_uds_sg(). This skips BOTH the path-Y gather
+	 * into recv_scratch AND the reorder buffer's insert/drain copies: the
+	 * payload is copied exactly once, into the peer's socket buffer. We then
+	 * advance the reorder cursor and drain any buffered frames that just
+	 * became contiguous. The legacy k0 connection is a single in-order QP, so
+	 * it always takes the _sg path too.
+	 *
+	 * Out-of-order / duplicate frames (seq != next_expected) fall to the slow
+	 * path: gather a multi-chunk frame into the endpoint's contiguous
+	 * recv_scratch (path Y -- a scattered frame needs a contiguous pointer for
+	 * the reorder node), then urp_rx_deliver_stream() inserts it and drains.
+	 * A frame that fits chunk 0 (every small frame, single-chunk endpoints)
+	 * needs no gather -- it is passed straight from buf->data.
 	 */
-	{
-		const u8 *payload = buf->data + URP_FRAME_HEADER_SIZE;
-		u8 *drain_scratch = buf->data;
+	if (rx_stream) {
+		u64 seq = urp_frame_decode_seq(buf->data);
 
-		if (buf->num_chunks > 1) {
-			drain_scratch = ep->recv_scratch;
-			if (URP_FRAME_HEADER_SIZE + payload_len > ep->chunk_size) {
-				u8 *cp[URP_MAX_SGE];
-				u32 j;
+		if (seq == urp_reorder_next_expected(rx_stream->reorder)) {
+			/* FAST: no gather, no reorder copies. Deliver straight
+			 * from the recv chunks, then advance + drain any pending
+			 * frames that just became contiguous. The drain stages
+			 * through a buf_size scratch: ep->recv_scratch on
+			 * multi-chunk endpoints, else buf->data (chunk 0 == a
+			 * full buf_size slot), which the _sg send above has
+			 * already copied out of, so reusing it is safe.
+			 */
+			u8 *drain_scratch = (buf->num_chunks > 1) ?
+					    ep->recv_scratch : buf->data;
 
-				for (j = 0; j < buf->num_chunks; j++)
-					cp[j] = page_address(buf->pages[j]);
-				urp_gather_payload(cp, buf->num_chunks,
-						   ep->chunk_size,
-						   ep->recv_scratch, payload_len);
-				payload = ep->recv_scratch;
+			urp_rx_send_uds_sg(ep, rx_stream, uds, buf, payload_len);
+			urp_reorder_advance(rx_stream->reorder);
+
+			for (;;) {
+				u64 dseq;
+				size_t dlen = ep->buf_size;
+
+				if (urp_reorder_drain_next(rx_stream->reorder,
+							   &dseq,
+							   drain_scratch,
+							   &dlen))
+					break;
+				urp_rx_send_uds(ep, rx_stream, uds,
+						drain_scratch, (u32)dlen);
 			}
-		}
+		} else {
+			/* SLOW: gather (if scattered) then insert + drain. */
+			const u8 *payload = buf->data + URP_FRAME_HEADER_SIZE;
+			u8 *drain_scratch = buf->data;
 
-		if (rx_stream)
-			urp_rx_deliver_stream(ep, rx_stream, uds,
-					      urp_frame_decode_seq(buf->data),
+			if (buf->num_chunks > 1) {
+				drain_scratch = ep->recv_scratch;
+				if (URP_FRAME_HEADER_SIZE + payload_len >
+				    ep->chunk_size) {
+					u8 *cp[URP_MAX_SGE];
+					u32 j;
+
+					for (j = 0; j < buf->num_chunks; j++)
+						cp[j] = page_address(buf->pages[j]);
+					urp_gather_payload(cp, buf->num_chunks,
+							   ep->chunk_size,
+							   ep->recv_scratch,
+							   payload_len);
+					payload = ep->recv_scratch;
+				}
+			}
+			urp_rx_deliver_stream(ep, rx_stream, uds, seq,
 					      payload, payload_len, drain_scratch);
-		else
-			urp_rx_send_uds(ep, NULL, uds, payload, payload_len);
+		}
+	} else {
+		/* Legacy k0: single in-order QP, deliver straight from chunks. */
+		urp_rx_send_uds_sg(ep, NULL, uds, buf, payload_len);
 	}
 
 	/*
