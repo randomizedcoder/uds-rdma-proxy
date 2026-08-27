@@ -244,10 +244,12 @@ tuning levers, both now applied and measured (§37.4): **jumbo MTU** lifts the R
 `active_mtu` 1024 → 4096 (4× fewer RoCE packets/frame), and **raising the
 `buffer_size` cap** lets one copy-path frame carry far more bytes — which, because
 the copy path is frame-rate-bound, scales goodput almost linearly up to the copy
-wall. The prototype uses high-order `page_pool` slots; the **production large-frame
-path is multi-SGE gather** — the NIC's `max_sge=30` lets one logical frame span up
-to 30 pages with no high-order allocation (and composes with Option B's coalesced
-reads). This is the cheapest lever and it is what put the copy path past TCP.
+wall. The prototype used high-order `page_pool` slots; the **production large-frame
+path is multi-SGE gather**, now **built + HW-validated** (Lever #3, PRs #67+#68) —
+the NIC's `max_sge=30` lets one logical frame span up to ~30 chunks with no
+high-order allocation (a 1 MiB frame from 16×64 KiB chunks; composes with Option
+B's coalesced reads). This is the cheapest lever and it is what put the copy path
+past TCP.
 
 **What one stream reaches (measured, §37.4).** With jumbo + large frames alone the
 **fast path already hits 97.6 % of 25 GbE on one stream** (512 KiB) and the **copy
@@ -382,7 +384,7 @@ stream," with status. Latency effect noted because the goal is both.
 |---|-------|---------|-------------------|---------|--------|
 | 1 | **Jumbo MTU + raised frame-size cap** (§37.4) | RoCE PMTU + per-frame amortization | **copy path 1.7 %→61 % line (past TCP); fast 68 %→97.6 %** | neutral | **built + measured (2026-08-25)** |
 | 2 | **Zero-copy fast path** (Option E / [d31](31-urp-fast-zero-copy.md)) | copies 1–4 | **≈97.6 % line @ jumbo, clears the copy wall** | 4.1× lower @64 KB | **built + HW-validated** |
-| 3 | **Multi-SGE large frames** (`max_sge=30`) — production twin of #1 | high-order alloc fragility | same goodput, robust (no order-8 alloc) | neutral | **next (path Y; #1 prototype uses high-order slots)** |
+| 3 | **Multi-SGE large frames** (`max_sge=30`) — production twin of #1 | high-order alloc fragility | same goodput, robust (no order-8 alloc) | neutral | **built + HW-validated (2026-08-26)** — chunked buffers, 1 MiB from 16×64 KiB chunks, reassembled 100 % / reorder_drops 0, no high-order alloc; single-chunk path unchanged (1943 MB/s). PRs #67 (3a) + #68 (3b) |
 | 4 | **Option B: selective signaling + multi-WR + coalesce** ([d34 §34.3](34-bulk-throughput.md#option-b--optimize-the-two-sided-send-pump-in-place-effort-m-risk-medium)) — pump **and** fast post loop | per-frame CQE/doorbell | lifts the *small/mid*-frame points + fast 64 KB toward its ceiling | slight coalesce cost | not built; **measured-justified (2026-08-26)** — 2 KiB is post-bound at ~423k fps using only ~0.56 core (§37.5) |
 | 5 | **Byte-windowing** (Option C / [d35](35-windowing-flow-control.md)) | oversend / RNR storm | makes the peak *sustainable* (not higher) | removes sawtooth | **built (9/9 GREEN)** |
 | 6 | **Adaptive frame sizing** (§37.5a) | latency↔throughput + copy wall | keeps small frames at low load, caps at the sweet spot | preserves low-load latency | design sketch; (a) natural adaptivity free, (b) gated on numbers |
@@ -414,8 +416,9 @@ Numeric goals, per-stream first, with §37.4 status:
 
 **Decision tree (updated by the results):**
 1. Per-stream head-to-head (§37.9): **done — both paths beat single-stream TCP at
-   ≥ 128 KiB.** The thesis holds; the natural next step is F2 (T4) for the aggregate
-   deployment picture, plus the multi-SGE production large-frame path (Lever #3).
+   ≥ 128 KiB.** The thesis holds; F2 (T4) is measured (§37.6) and the multi-SGE
+   production large-frame path (Lever #3) is **built + HW-validated** — the
+   order-8 alloc fragility of the #1 prototype is gone.
 2. To also win at **4–16 KiB** on the copy path, build Lever #4 (Option B). Lower
    priority now that cluster-relevant frame sizes already clear TCP.
 3. The **copy wall** at 512 KiB–1 MiB is real (§37.4) but avoided by capping frame
