@@ -1133,6 +1133,100 @@ static void test_ep_max_payload(struct kunit *test)
 				    i, cases[i].slot);
 }
 
+/*
+ * Chunk-geometry derivation (design 37 path Y). urp_resolve_chunks picks the
+ * smallest reliably-allocatable chunk (<= ~64 KiB) whose count fits the device
+ * SGE budget, growing the chunk only when the budget forces it. Assumes 4 KiB
+ * base pages (the numbers are order-relative); skipped otherwise.
+ */
+static void test_resolve_chunks(struct kunit *test)
+{
+	const struct { u32 buf; u32 max_sge; u32 want_chunk; u32 want_n; } cases[] = {
+		/* <= 64 KiB stays a single SGE -- identical to the pre-chunked path */
+		{ 4096,			30,	4096,	1 },
+		{ 65536,		30,	65536,	1 },
+		{ 65516,		30,	65536,	1 },	/* rounds up to one 64 KiB chunk */
+		/* 128 KiB: two 64 KiB chunks instead of an order-5 compound page */
+		{ 131072,		30,	65536,	2 },
+		/* 1 MiB: sixteen 64 KiB chunks -- no order-8 allocation */
+		{ 1048576,		30,	65536,	16 },
+		/* a tight SGE budget forces a larger (higher-order) chunk */
+		{ 1048576,		8,	131072,	8 },
+		{ 1048576,		4,	262144,	4 },
+		/* sub-page slot: one page */
+		{ URP_BUFFER_SIZE_MIN,	30,	4096,	1 },
+	};
+	int i;
+
+	if (PAGE_SIZE != 4096)
+		kunit_skip(test, "chunk sizes assume 4 KiB base pages");
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		u32 cs = 0;
+		u32 n = urp_resolve_chunks(cases[i].buf, cases[i].max_sge, &cs);
+
+		KUNIT_EXPECT_EQ_MSG(test, n, cases[i].want_n,
+				    "chunks case %d (buf=%u max_sge=%u)",
+				    i, cases[i].buf, cases[i].max_sge);
+		KUNIT_EXPECT_EQ_MSG(test, cs, cases[i].want_chunk,
+				    "chunk_size case %d (buf=%u max_sge=%u)",
+				    i, cases[i].buf, cases[i].max_sge);
+		/* invariants: chunks cover the whole slot and fit the budget */
+		KUNIT_EXPECT_GE(test, n * cs, cases[i].buf);
+		KUNIT_EXPECT_LE(test, n, cases[i].max_sge);
+	}
+}
+
+/*
+ * Scatter then gather one frame's payload over the chunked layout (design 37
+ * path Y) and assert a byte-exact round-trip: the 20-byte header region of
+ * chunk 0 is never touched, and lengths at chunk boundaries / 0 / max all
+ * reassemble identically. Drives the same pure helpers the RX/TX paths use.
+ */
+static void test_gather_scatter_roundtrip(struct kunit *test)
+{
+	enum { NCH = 4, CS = 256 };
+	const u32 cap = NCH * CS - URP_FRAME_HEADER_SIZE;
+	const u32 lens[] = {
+		0, 1,
+		CS - URP_FRAME_HEADER_SIZE,	/* exactly fills chunk 0 */
+		CS - URP_FRAME_HEADER_SIZE + 1,	/* spills one byte into chunk 1 */
+		CS, 2 * CS, cap,		/* boundary + full capacity */
+	};
+	u8 *backing = kunit_kzalloc(test, NCH * CS, GFP_KERNEL);
+	u8 *src = kunit_kzalloc(test, cap, GFP_KERNEL);
+	u8 *dst = kunit_kzalloc(test, cap, GFP_KERNEL);
+	u8 *chunks[NCH];
+	int i, j;
+
+	KUNIT_ASSERT_NOT_NULL(test, backing);
+	KUNIT_ASSERT_NOT_NULL(test, src);
+	KUNIT_ASSERT_NOT_NULL(test, dst);
+	for (j = 0; j < NCH; j++)
+		chunks[j] = backing + j * CS;
+
+	for (i = 0; i < ARRAY_SIZE(lens); i++) {
+		u32 len = lens[i], k, got;
+
+		for (k = 0; k < len; k++)
+			src[k] = (u8)(k ^ (k >> 3) ^ 0x5a);
+		memset(backing, 0xee, NCH * CS);
+		memset(dst, 0, cap);
+
+		got = urp_scatter_payload(chunks, NCH, CS, src, len);
+		KUNIT_EXPECT_EQ_MSG(test, got, len, "scatter len %u", len);
+		/* chunk 0's header region is reserved, never written */
+		for (k = 0; k < URP_FRAME_HEADER_SIZE; k++)
+			KUNIT_EXPECT_EQ_MSG(test, chunks[0][k], 0xee,
+					    "header byte %u (len %u)", k, len);
+
+		got = urp_gather_payload(chunks, NCH, CS, dst, len);
+		KUNIT_EXPECT_EQ_MSG(test, got, len, "gather len %u", len);
+		KUNIT_EXPECT_EQ_MSG(test, memcmp(dst, src, len), 0,
+				    "roundtrip mismatch at len %u", len);
+	}
+}
+
 /* ---- Test suite registration ---- */
 
 /*
@@ -1779,6 +1873,8 @@ static struct kunit_case urp_test_cases[] = {
 	KUNIT_CASE(test_resolve_num_bufs),
 	KUNIT_CASE(test_resolve_buf_size),
 	KUNIT_CASE(test_ep_max_payload),
+	KUNIT_CASE(test_resolve_chunks),
+	KUNIT_CASE(test_gather_scatter_roundtrip),
 	/* design 31 section 31.10: urp-fast uring_cmd trust boundary */
 	KUNIT_CASE(test_cmd_validate_data),
 	KUNIT_CASE(test_cmd_validate_reg),

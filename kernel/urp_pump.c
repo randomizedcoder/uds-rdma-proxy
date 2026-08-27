@@ -145,6 +145,29 @@ static int urp_post_frame(struct urp_endpoint *ep, struct ib_qp *qp,
 }
 
 /*
+ * Build the scatter kvec list to read one frame's payload off the UDS socket
+ * into @buf's chunks (design 37 path Y). The 20-byte header reserves the front
+ * of chunk 0, so chunk 0 takes chunk_size - header bytes and chunks 1..N-1 take
+ * a full chunk each. Returns the kvec count (== buf->num_chunks). Total
+ * capacity is num_chunks*chunk_size - header >= buf_size - header = the
+ * max_payload the caller passes to kernel_recvmsg, so a full frame always fits.
+ * At num_chunks == 1 this is one kvec of ep->buf_size - header -- unchanged.
+ */
+static u32 urp_frame_fill_kvecs(struct urp_endpoint *ep, struct urp_buffer *buf,
+				struct kvec *kv)
+{
+	u32 off = URP_FRAME_HEADER_SIZE;
+	u32 j;
+
+	for (j = 0; j < buf->num_chunks; j++) {
+		kv[j].iov_base = (u8 *)page_address(buf->pages[j]) + off;
+		kv[j].iov_len = ep->chunk_size - off;
+		off = 0;
+	}
+	return buf->num_chunks;
+}
+
+/*
  * TX pump kthread.
  *
  * Reads data from the UDS socket, wraps it in a frame header, and posts
@@ -159,11 +182,12 @@ static int urp_tx_thread_fn(void *data)
 		struct urp_buffer *buf;
 		struct urp_qp *qp;
 		struct msghdr msg = {};
-		struct kvec iov;
+		struct kvec kv[URP_MAX_SGE];
+		u32 nkv;
 		int ret;
 		u32 len;
-		/* Per-endpoint slot cap: buf->data is ep->buf_size bytes, so
-		 * header + max_payload fills it exactly.
+		/* Per-endpoint frame cap: header + max_payload == buf_size,
+		 * scattered across the buffer's chunks (design 37 path Y).
 		 */
 		u32 max_payload = urp_ep_max_payload(ep->buf_size);
 
@@ -174,11 +198,10 @@ static int urp_tx_thread_fn(void *data)
 			continue;
 		}
 
-		/* Read from UDS into the buffer payload area (after header) */
-		iov.iov_base = buf->data + URP_FRAME_HEADER_SIZE;
-		iov.iov_len = max_payload;
+		/* Read from UDS into the buffer chunks (after the header). */
+		nkv = urp_frame_fill_kvecs(ep, buf, kv);
 
-		ret = kernel_recvmsg(conn->uds_sock, &msg, &iov, 1,
+		ret = kernel_recvmsg(conn->uds_sock, &msg, kv, nkv,
 				     max_payload, 0);
 		if (ret <= 0) {
 			urp_buf_free_send(ep, buf);
@@ -312,7 +335,8 @@ static int urp_stream_tx_fn(void *data)
 		struct urp_buffer *buf;
 		struct urp_qp *qp;
 		struct msghdr msg = {};
-		struct kvec iov;
+		struct kvec kv[URP_MAX_SGE];
+		u32 nkv;
 		u8 flags = 0;
 		int ret;
 		u32 len;
@@ -344,10 +368,9 @@ static int urp_stream_tx_fn(void *data)
 				continue;
 		}
 
-		iov.iov_base = buf->data + URP_FRAME_HEADER_SIZE;
-		iov.iov_len = max_payload;
+		nkv = urp_frame_fill_kvecs(ep, buf, kv);
 
-		ret = kernel_recvmsg(stream->uds_sock, &msg, &iov, 1,
+		ret = kernel_recvmsg(stream->uds_sock, &msg, kv, nkv,
 				     max_payload, 0);
 		if (ret <= 0) {
 			urp_buf_free_send(ep, buf);
