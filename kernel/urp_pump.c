@@ -153,18 +153,42 @@ static int urp_post_frame(struct urp_endpoint *ep, struct ib_qp *qp,
  * max_payload the caller passes to kernel_recvmsg, so a full frame always fits.
  * At num_chunks == 1 this is one kvec of ep->buf_size - header -- unchanged.
  */
+/*
+ * Build a kvec[] covering exactly @payload_len payload bytes spread across
+ * the buffer's chunks. Chunk 0 skips the URP_FRAME_HEADER_SIZE header; each
+ * subsequent chunk contributes its full chunk_size until @payload_len is
+ * satisfied (last chunk short). Unused chunks are dropped. Returns the number
+ * of kvecs written (>= 1 for a non-empty payload; 0 for payload_len == 0).
+ * Used both to size a TX read (payload_len == max_payload) and to deliver a
+ * received frame straight from the recv chunks (the in-order RX bypass).
+ */
+u32 urp_frame_fill_kvecs_len(struct urp_endpoint *ep, struct urp_buffer *buf,
+			     struct kvec *kv, u32 payload_len)
+{
+	u32 off = URP_FRAME_HEADER_SIZE;
+	u32 remaining = payload_len;
+	u32 nkv = 0;
+	u32 j;
+
+	for (j = 0; j < buf->num_chunks && remaining; j++) {
+		u32 avail = ep->chunk_size - off;
+		u32 take = min(remaining, avail);
+
+		kv[nkv].iov_base = (u8 *)page_address(buf->pages[j]) + off;
+		kv[nkv].iov_len = take;
+		nkv++;
+		remaining -= take;
+		off = 0;
+	}
+	return nkv;
+}
+
 static u32 urp_frame_fill_kvecs(struct urp_endpoint *ep, struct urp_buffer *buf,
 				struct kvec *kv)
 {
-	u32 off = URP_FRAME_HEADER_SIZE;
-	u32 j;
-
-	for (j = 0; j < buf->num_chunks; j++) {
-		kv[j].iov_base = (u8 *)page_address(buf->pages[j]) + off;
-		kv[j].iov_len = ep->chunk_size - off;
-		off = 0;
-	}
-	return buf->num_chunks;
+	/* Read capacity == header-less payload across every chunk. */
+	return urp_frame_fill_kvecs_len(ep, buf, kv,
+					urp_ep_max_payload(ep->buf_size));
 }
 
 /*

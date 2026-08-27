@@ -852,6 +852,15 @@ int  urp_post_recv_raw(struct ib_qp *qp, u64 addr, u32 len, u32 lkey,
 int  urp_post_frame_sg(struct ib_qp *qp, struct ib_sge *sges, u32 num_sge,
 		       struct ib_cqe *cqe);
 
+/* Build a kvec[] covering exactly @payload_len payload bytes spread across a
+ * chunked buffer's pages (chunk 0 offset past the frame header). Returns the
+ * kvec count written. Used by the TX read (payload_len == max_payload) and the
+ * in-order RX bypass (deliver a received frame straight from the recv chunks,
+ * design 37 / copy-elision). @kv must have room for URP_MAX_SGE entries.
+ */
+u32  urp_frame_fill_kvecs_len(struct urp_endpoint *ep, struct urp_buffer *buf,
+			      struct kvec *kv, u32 payload_len);
+
 /* Decode an ib_port_attr active_speed/active_width into link rate in Mb/s
  * (urp_rdma.c). Pure table; feeds BDP window sizing. Declared for KUnit.
  */

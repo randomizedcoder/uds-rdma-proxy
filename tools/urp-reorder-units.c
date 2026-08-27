@@ -127,6 +127,9 @@ static void run_scenario(const struct reorder_scenario *sc)
 			CHECK_EQ(urp_reorder_drain_pending(rb), op->seq,
 				 "%s op %u: drain_pending", sc->name, j);
 			break;
+		case ROP_ADVANCE:
+			urp_reorder_advance(rb);
+			break;
 		default:
 			break;
 		}

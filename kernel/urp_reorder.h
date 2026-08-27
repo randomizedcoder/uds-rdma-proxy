@@ -60,6 +60,14 @@ int urp_reorder_insert(struct urp_reorder *rb, u64 seq,
 int urp_reorder_drain_next(struct urp_reorder *rb, u64 *out_seq,
 			   u8 *out_data, size_t *inout_len);
 
+/*
+ * Advance next_expected by one without an insert, for a frame the caller
+ * delivered out-of-band (the in-order RX bypass, seq == next_expected).
+ * Saturates at U64_MAX. Any pending frames that become contiguous are moved
+ * onto the drain queue (pop via urp_reorder_drain_next). NULL-safe.
+ */
+void urp_reorder_advance(struct urp_reorder *rb);
+
 /* The next sequence number expected for in-order delivery. */
 u64 urp_reorder_next_expected(const struct urp_reorder *rb);
 

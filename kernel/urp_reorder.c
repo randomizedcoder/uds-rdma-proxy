@@ -213,6 +213,25 @@ int urp_reorder_insert(struct urp_reorder *rb, u64 seq,
 	return 0;
 }
 
+void urp_reorder_advance(struct urp_reorder *rb)
+{
+	if (!rb)
+		return;
+
+	/*
+	 * The caller has already delivered next_expected out-of-band -- the
+	 * in-order RX bypass in urp_recv_done() sends the frame straight from
+	 * the recv chunk pages to the UDS socket, skipping the insert/drain
+	 * copies. Bump the cursor (saturating at U64_MAX to match
+	 * urp_reorder_drain_prefix() and the Rust twin's saturating_add), then
+	 * migrate any pending frames that just became contiguous onto the
+	 * drain queue so a subsequent urp_reorder_drain_next() releases them.
+	 */
+	if (rb->next_expected != U64_MAX)
+		rb->next_expected++;
+	urp_reorder_drain_prefix(rb);
+}
+
 int urp_reorder_drain_next(struct urp_reorder *rb, u64 *out_seq,
 			   u8 *out_data, size_t *inout_len)
 {

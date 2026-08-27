@@ -33,6 +33,9 @@ enum rop_kind {
 	ROP_EXP_NEXT,		/* assert next_expected == @seq */
 	ROP_EXP_GAP,		/* assert gap_count (pending) == @seq */
 	ROP_EXP_DRAINPEND,	/* assert drain_pending (drained-not-popped) == @seq */
+	ROP_ADVANCE,		/* advance next_expected out-of-band (in-order RX
+				 * bypass): caller delivered next_expected without
+				 * an insert; drains any now-contiguous pending */
 };
 
 struct rop {
@@ -145,6 +148,28 @@ static const struct reorder_scenario urp_reorder_scenarios[] = {
 	{ "seq_saturates", U64_MAX, 16, {		/* Rust reorder_ops regression */
 		{ ROP_INSERT, U64_MAX, 1 },
 		{ ROP_EXP_NEXT, U64_MAX },
+	} },
+	/*
+	 * ADVANCE: the in-order RX bypass primitive. The caller delivered
+	 * next_expected out-of-band (straight from the recv chunk pages,
+	 * skipping the insert/drain copies), so advance() bumps the cursor and
+	 * migrates any now-contiguous pending frames onto the drain queue.
+	 */
+	{ "advance_basic", 0, 64, {
+		{ ROP_ADVANCE },			/* delivered seq 0 out-of-band */
+		{ ROP_EXP_NEXT, 1 }, { ROP_EXP_GAP, 0 },
+	} },
+	{ "advance_drains_pending", 0, 64, {
+		{ ROP_INSERT, 1, 1 }, { ROP_INSERT, 2, 1 },	/* gap at 0 */
+		{ ROP_EXP_GAP, 2 }, { ROP_EXP_NEXT, 0 },
+		{ ROP_ADVANCE },			/* delivered seq 0 => drains 1,2 */
+		{ ROP_EXP_NEXT, 3 }, { ROP_EXP_GAP, 0 }, { ROP_EXP_DRAINPEND, 2 },
+		{ ROP_DRAIN, 1, 1 }, { ROP_DRAIN, 2, 1 },
+		{ ROP_EXP_DRAINPEND, 0 },
+	} },
+	{ "advance_saturates", U64_MAX, 16, {
+		{ ROP_ADVANCE },
+		{ ROP_EXP_NEXT, U64_MAX },		/* saturated, no overflow */
 	} },
 };
 

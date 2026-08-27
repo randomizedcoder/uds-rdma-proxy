@@ -86,6 +86,26 @@ impl ReorderBuffer {
         })
     }
 
+    /// Advance `next_expected` by one for a frame the caller delivered
+    /// out-of-band (the in-order RX bypass: `seq == next_expected` is sent
+    /// straight to the app without passing through the buffer). Returns any
+    /// pending frames that just became contiguous, in order. Saturates at
+    /// `u64::MAX`. Mirrors `urp_reorder_advance()` in kernel/urp_reorder.c.
+    pub fn advance(&mut self) -> DrainResult {
+        self.next_expected = self.next_expected.saturating_add(1);
+
+        let mut delivered = Vec::new();
+        while let Some(payload) = self.pending.remove(&self.next_expected) {
+            delivered.push((self.next_expected, payload));
+            self.next_expected = self.next_expected.saturating_add(1);
+        }
+
+        DrainResult {
+            delivered,
+            gap_count: self.pending.len(),
+        }
+    }
+
     /// The next sequence number expected for in-order delivery.
     #[inline]
     pub fn next_expected(&self) -> u64 {
@@ -239,6 +259,89 @@ mod tests {
         assert_eq!(r.delivered.len(), 1);
         assert_eq!(r.delivered[0].0, u64::MAX);
         assert_eq!(rb.next_expected(), u64::MAX); // saturated, no overflow
+    }
+
+    // advance(): the in-order RX bypass primitive. Delivering
+    // next_expected out-of-band then advance() must leave the buffer in the
+    // same state as an insert() of that frame would. Mirrors the ADVANCE
+    // rows in the shared op-script table (kernel/urp_reorder_cases.h) and
+    // urp_reorder_advance() in kernel/urp_reorder.c.
+    #[test]
+    fn advance_basic() {
+        let mut rb = ReorderBuffer::new(0, 64);
+        // Deliver seq 0 out-of-band, then advance: nothing pending to drain.
+        let r = rb.advance();
+        assert!(r.delivered.is_empty());
+        assert_eq!(r.gap_count, 0);
+        assert_eq!(rb.next_expected(), 1);
+    }
+
+    #[test]
+    fn advance_drains_contiguous_pending() {
+        let mut rb = ReorderBuffer::new(0, 64);
+        // seq 1,2 arrive out of order (gap at 0), stay buffered.
+        assert!(rb.insert(1, vec![1]).unwrap().delivered.is_empty());
+        assert!(rb.insert(2, vec![2]).unwrap().delivered.is_empty());
+        assert_eq!(rb.pending_count(), 2);
+
+        // Deliver seq 0 via the bypass, then advance: 1 and 2 become
+        // contiguous and are returned in order.
+        let r = rb.advance();
+        assert_eq!(r.delivered, vec![(1, vec![1]), (2, vec![2])]);
+        assert_eq!(r.gap_count, 0);
+        assert_eq!(rb.next_expected(), 3);
+        assert!(rb.is_empty());
+    }
+
+    #[test]
+    fn advance_at_u64_max_saturates() {
+        let mut rb = ReorderBuffer::new(u64::MAX, 16);
+        let r = rb.advance();
+        assert!(r.delivered.is_empty());
+        assert_eq!(rb.next_expected(), u64::MAX); // saturated, no overflow
+    }
+
+    // Equivalence: for a mixed permutation, delivering each in-order frame
+    // via advance() (the bypass) yields the identical ordered byte stream as
+    // routing every frame through insert(). This is the core correctness
+    // claim of the RX bypass.
+    #[test]
+    fn advance_equivalence_with_insert() {
+        // Arrival order 2,0,1,4,3 over seqs 0..5.
+        let arrival = [2u64, 0, 1, 4, 3];
+
+        // Reference: everything through insert().
+        let mut via_insert = ReorderBuffer::new(0, 64);
+        let mut ref_stream = Vec::new();
+        for &seq in &arrival {
+            for (s, p) in via_insert.insert(seq, vec![seq as u8]).unwrap().delivered {
+                ref_stream.push((s, p));
+            }
+        }
+
+        // Bypass: an arriving frame with seq == next_expected is delivered
+        // out-of-band and advance()d; others go through insert().
+        let mut via_bypass = ReorderBuffer::new(0, 64);
+        let mut bypass_stream = Vec::new();
+        for &seq in &arrival {
+            if seq == via_bypass.next_expected() {
+                bypass_stream.push((seq, vec![seq as u8])); // delivered directly
+                for (s, p) in via_bypass.advance().delivered {
+                    bypass_stream.push((s, p));
+                }
+            } else {
+                for (s, p) in via_bypass.insert(seq, vec![seq as u8]).unwrap().delivered {
+                    bypass_stream.push((s, p));
+                }
+            }
+        }
+
+        assert_eq!(ref_stream, bypass_stream);
+        assert_eq!(via_bypass.next_expected(), via_insert.next_expected());
+        // Full 0..5 stream delivered in order.
+        let expected: Vec<(u64, Vec<u8>)> =
+            (0..5).map(|s| (s, vec![s as u8])).collect();
+        assert_eq!(bypass_stream, expected);
     }
 
     // Parity with the C twin's shared op-script table
