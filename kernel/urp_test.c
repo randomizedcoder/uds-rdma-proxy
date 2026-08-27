@@ -979,6 +979,67 @@ static void test_window_clamp(struct kunit *test)
 			(u64)URP_WINDOW_BYTES_MAX);
 }
 
+static void test_window_for_stream(struct kunit *test)
+{
+	const u64 SYS = URP_WINDOW_BYTES_DEFAULT;	/* 1 MiB sysctl floor */
+	const u32 TF = URP_WINDOW_TARGET_FRAMES;	/* 8 */
+	const u64 FB = URP_WINDOW_FALLBACK_RTT_NS;	/* 100 us */
+
+	/* Small frame, deep pool, no BDP (link 0): sysctl floor dominates. */
+	KUNIT_EXPECT_EQ(test, urp_window_for_stream(SYS, 4096, 1024, 0, 0), SYS);
+
+	/* 1 MiB frame, tiny network RTT: BDP small -> the frame-count floor
+	 * (8 x 1 MiB) keeps it pipelined. link=25 Gb/s, rtt=20 us ->
+	 * BDP = 25000*20000/8000 = 62500 << 8 MiB.
+	 */
+	KUNIT_EXPECT_EQ(test, urp_window_for_stream(SYS, 1u << 20, 128,
+						    25000, 20000),
+			(u64)TF << 20);
+
+	/* High link rate scales the window via BDP. 400 Gb/s x 100 us =
+	 * 400000*100000/8000 = 5,000,000 bytes, above the 1 MiB floors; deep
+	 * pool (4096 bufs -> 2048 recv x 4 KiB = 8 MiB) doesn't cap it.
+	 */
+	KUNIT_EXPECT_EQ(test, urp_window_for_stream(SYS, 4096, 4096,
+						    400000, FB),
+			(u64)400000 * FB / 8000);
+
+	/* Shallow pool caps in-flight at recv-pool bytes: 8 bufs -> 4 recv
+	 * x 1 MiB = 4 MiB, below the 8 MiB frame floor.
+	 */
+	KUNIT_EXPECT_EQ(test, urp_window_for_stream(SYS, 1u << 20, 8, 0, 0),
+			(u64)4 << 20);
+
+	/* Result clamped to MAX: 800 Gb/s x 100 us = 10 MB is fine, but a
+	 * pathologically large BDP saturates. link=800 Gb/s, rtt=20 ms ->
+	 * 800000*20000000/8000 = 2 GiB > 1 GiB MAX (deep pool: 65536 bufs ->
+	 * 32768 recv x 64 KiB = 2 GiB, so the pool doesn't cap first).
+	 */
+	KUNIT_EXPECT_EQ(test, urp_window_for_stream(SYS, 1u << 16, 65536,
+						    800000, 20000000ULL),
+			(u64)URP_WINDOW_BYTES_MAX);
+
+	/* A large explicit sysctl still wins when it exceeds BDP + floor. */
+	KUNIT_EXPECT_EQ(test, urp_window_for_stream(64ULL << 20, 1u << 20, 256,
+						    25000, 20000),
+			(u64)64 << 20);
+}
+
+static void test_link_speed_mbps(struct kunit *test)
+{
+	/* EDR 1x == 25 GbE (the test HW); NDR 8x ~= 800 GbE. */
+	KUNIT_EXPECT_EQ(test, urp_link_speed_mbps(IB_SPEED_EDR, IB_WIDTH_1X),
+			25781u);
+	KUNIT_EXPECT_EQ(test, urp_link_speed_mbps(IB_SPEED_EDR, IB_WIDTH_4X),
+			25781u * 4);
+	KUNIT_EXPECT_EQ(test, urp_link_speed_mbps(IB_SPEED_HDR, IB_WIDTH_2X),
+			53125u * 2);
+	KUNIT_EXPECT_EQ(test, urp_link_speed_mbps(IB_SPEED_NDR, IB_WIDTH_4X),
+			106250u * 4);
+	/* Unknown speed -> 0 (BDP term drops). */
+	KUNIT_EXPECT_EQ(test, urp_link_speed_mbps(0, IB_WIDTH_1X), 0u);
+}
+
 static void test_reorder_depth_for_window(struct kunit *test)
 {
 	/* 1 MiB / 16 = 65536 -> at the ceiling. */
@@ -1852,6 +1913,8 @@ static struct kunit_case urp_test_cases[] = {
 	KUNIT_CASE(test_window_should_grant),
 	KUNIT_CASE(test_window_apply_grant),
 	KUNIT_CASE(test_window_clamp),
+	KUNIT_CASE(test_window_for_stream),
+	KUNIT_CASE(test_link_speed_mbps),
 	KUNIT_CASE(test_reorder_depth_for_window),
 	/* design 32: acceptor connection plan (eager-connect gate) */
 	KUNIT_CASE(test_acceptor_eager_connect),

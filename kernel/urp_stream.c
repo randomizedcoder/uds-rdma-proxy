@@ -130,6 +130,27 @@ static void urp_stream_rcu_free(struct rcu_head *rcu)
 }
 
 /*
+ * A representative round-trip for BDP window sizing: the largest per-QP
+ * rtt_ewma_ns across the endpoint's QPs (max = the most conservative / largest
+ * window). Falls back to URP_WINDOW_FALLBACK_RTT_NS before any PROBE/PONG
+ * sample exists. RoCE RTT is low and stable across link speeds, so the BDP term
+ * scales with link rate, not RTT.
+ */
+static u64 urp_ep_repr_rtt_ns(struct urp_endpoint *ep)
+{
+	u64 rtt = 0;
+	u32 i;
+
+	for (i = 0; i < ep->num_qps; i++) {
+		u64 r = READ_ONCE(ep->qps[i].rtt_ewma_ns);
+
+		if (r > rtt)
+			rtt = r;
+	}
+	return rtt ? rtt : URP_WINDOW_FALLBACK_RTT_NS;
+}
+
+/*
  * Allocate and insert a new stream entry. The caller may already have
  * a stream_id (e.g. for the receiver side of a SYN), or pass 0 to ask
  * for the next allocated id (sender side). On success the new stream
@@ -164,12 +185,19 @@ int urp_stream_create(struct urp_endpoint *ep, u32 stream_id,
 
 	/*
 	 * gap #6 Phase 2 (PR3): byte-windowing flow-control state (design 35
-	 * §35.3). window_bytes is the live sysctl value clamped to range; the
-	 * sender gate (urp_stream_tx_fn) and grant emitter (urp_recv_done) read
-	 * these once the connection negotiates the window (ep->window_negotiated).
-	 * A sysctl change takes effect on newly created streams.
+	 * §35.3). window_bytes is resolved from the live sysctl value and this
+	 * endpoint's frame geometry: at least the sysctl window, but raised for
+	 * large slots so a big frame pipelines instead of stop-and-waiting (a
+	 * fixed 1 MiB window made 1 MiB frames run at ~800 MB/s; scaling lifts it
+	 * to ~1090 -- see urp_window_for_stream). The sender gate
+	 * (urp_stream_tx_fn) and grant emitter (urp_recv_done) read these once the
+	 * connection negotiates the window (ep->window_negotiated). A sysctl
+	 * change takes effect on newly created streams.
 	 */
-	s->window_bytes = urp_window_clamp(READ_ONCE(urp_window_bytes));
+	s->window_bytes = urp_window_for_stream(READ_ONCE(urp_window_bytes),
+						ep->buf_size, ep->num_bufs,
+						ep->link_mbps,
+						urp_ep_repr_rtt_ns(ep));
 	s->tx_bytes_acked = 0;
 	s->last_window_grant = 0;
 
