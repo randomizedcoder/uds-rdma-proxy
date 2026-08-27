@@ -173,6 +173,50 @@ static inline u8 urp_frame_decode_flags(const void *buf)
 }
 
 /*
+ * Chunked-frame payload layout (design 37 path Y). A logical frame is gathered
+ * from @nchunks physically-separate chunks of @chunk_size bytes each; the
+ * 20-byte header occupies the start of chunk 0, so the payload begins at
+ * chunk 0 + header and continues into chunks 1..N-1. These two helpers are the
+ * canonical scatter/gather over that layout, kept pure (operate on plain byte
+ * pointers, no page/DMA infrastructure) so KUnit and the userspace units can
+ * round-trip them. @chunks[i] is the byte base of chunk i. Both return the
+ * number of payload bytes copied (== min(@len, available capacity)).
+ */
+static inline u32 urp_scatter_payload(u8 * const *chunks, u32 nchunks,
+				      u32 chunk_size, const u8 *src, u32 len)
+{
+	u32 copied = 0, j = 0, off = URP_FRAME_HEADER_SIZE;
+
+	while (copied < len && j < nchunks) {
+		u32 avail = chunk_size - off;
+		u32 n = avail < (len - copied) ? avail : (len - copied);
+
+		memcpy(chunks[j] + off, src + copied, n);
+		copied += n;
+		off = 0;
+		j++;
+	}
+	return copied;
+}
+
+static inline u32 urp_gather_payload(u8 * const *chunks, u32 nchunks,
+				     u32 chunk_size, u8 *dst, u32 len)
+{
+	u32 copied = 0, j = 0, off = URP_FRAME_HEADER_SIZE;
+
+	while (copied < len && j < nchunks) {
+		u32 avail = chunk_size - off;
+		u32 n = avail < (len - copied) ? avail : (len - copied);
+
+		memcpy(dst + copied, chunks[j] + off, n);
+		copied += n;
+		off = 0;
+		j++;
+	}
+	return copied;
+}
+
+/*
  * Pure RX frame classifier (design 28 E1). Extracts the classify/validate/
  * route decision out of urp_recv_done so it can be table-tested in KUnit
  * without an ib_wc / DMA buffer, fuzzed in userspace (design 27 F1), and

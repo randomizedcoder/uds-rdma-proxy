@@ -188,7 +188,7 @@ static int urp_bufs_init(struct urp_endpoint *ep, struct ib_device *dev)
 
 	ep->num_chunks = num_chunks;
 	ep->chunk_size = chunk_size;
-	ep->max_frame  = num_chunks * chunk_size;
+	ep->max_frame  = ep->buf_size;	/* logical frame size; chunks back it */
 
 	INIT_LIST_HEAD(&ep->send_free);
 	INIT_LIST_HEAD(&ep->recv_free);
@@ -228,6 +228,19 @@ static int urp_bufs_init(struct urp_endpoint *ep, struct ib_device *dev)
 			list_add_tail(&buf->list, &ep->recv_free);
 	}
 
+	/*
+	 * A multi-chunk frame is scattered across chunks on the wire; RX gathers
+	 * it into this buf_size staging buffer before classify/reorder/delivery.
+	 * kvmalloc: 1 MiB is a fine vmalloc (CPU-only, never DMA'd) even when the
+	 * contiguous kmalloc we are avoiding for the pool would fail. Single
+	 * chunk needs no gather -- leave it NULL.
+	 */
+	if (ep->num_chunks > 1) {
+		ep->recv_scratch = kvmalloc(ep->buf_size, GFP_KERNEL);
+		if (!ep->recv_scratch)
+			goto err;
+	}
+
 	return 0;
 
 err:
@@ -250,6 +263,9 @@ static void urp_bufs_cleanup(struct urp_endpoint *ep, struct ib_device *dev)
 
 	for (i = 0; i < ep->num_bufs; i++)
 		urp_buf_backing_free(ep, dev, &ep->bufs[i]);
+
+	kvfree(ep->recv_scratch);
+	ep->recv_scratch = NULL;
 
 	page_pool_destroy(ep->page_pool);
 	ep->page_pool = NULL;
@@ -818,18 +834,43 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 	 * Deliver the payload to the UDS socket. Stream frames pass through
 	 * the per-stream reorder buffer (design 29 Gap 1) so multi-QP arrival
 	 * skew is corrected before delivery; the legacy k0 path is a single
-	 * in-order QP and delivers directly. The recv buffer doubles as the
-	 * reorder drain staging area -- safe because insert copies the payload
-	 * out before we drain back into it.
+	 * in-order QP and delivers directly.
+	 *
+	 * design 37 path Y: a frame that spans >1 chunk arrives scattered, so
+	 * gather it into the endpoint's contiguous recv_scratch first. A frame
+	 * that fits chunk 0 (every small frame, and every frame on a single-chunk
+	 * endpoint) is delivered straight from buf->data with no extra copy --
+	 * byte-identical to the pre-chunked path. The reorder drain needs a
+	 * buf_size staging area too; buf->data (chunk 0) is only chunk_size, so
+	 * multi-chunk endpoints stage the drain through recv_scratch instead
+	 * (safe: reorder insert copies the payload out before the drain writes).
 	 */
-	if (rx_stream)
-		urp_rx_deliver_stream(ep, rx_stream, uds,
-				      urp_frame_decode_seq(buf->data),
-				      buf->data + URP_FRAME_HEADER_SIZE,
-				      payload_len, buf->data);
-	else
-		urp_rx_send_uds(ep, NULL, uds,
-				buf->data + URP_FRAME_HEADER_SIZE, payload_len);
+	{
+		const u8 *payload = buf->data + URP_FRAME_HEADER_SIZE;
+		u8 *drain_scratch = buf->data;
+
+		if (buf->num_chunks > 1) {
+			drain_scratch = ep->recv_scratch;
+			if (URP_FRAME_HEADER_SIZE + payload_len > ep->chunk_size) {
+				u8 *cp[URP_MAX_SGE];
+				u32 j;
+
+				for (j = 0; j < buf->num_chunks; j++)
+					cp[j] = page_address(buf->pages[j]);
+				urp_gather_payload(cp, buf->num_chunks,
+						   ep->chunk_size,
+						   ep->recv_scratch, payload_len);
+				payload = ep->recv_scratch;
+			}
+		}
+
+		if (rx_stream)
+			urp_rx_deliver_stream(ep, rx_stream, uds,
+					      urp_frame_decode_seq(buf->data),
+					      payload, payload_len, drain_scratch);
+		else
+			urp_rx_send_uds(ep, NULL, uds, payload, payload_len);
+	}
 
 	/*
 	 * Per-QP RX accounting + credit for the frame received on wc->qp,

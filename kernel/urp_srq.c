@@ -24,15 +24,23 @@ int urp_post_srq_recv(struct urp_endpoint *ep, struct urp_buffer *buf)
 {
 	struct ib_recv_wr wr = {};
 	const struct ib_recv_wr *bad_wr;
-	u32 j;
+	u32 j, remaining;
 
 	/*
-	 * A frame lands across the buffer's chunks (design 37 path Y); arm the
-	 * full chunk length on every SGE so the largest frame fits. At
+	 * A frame lands across the buffer's chunks (design 37 path Y). Arm the
+	 * SGE lengths to sum to exactly ep->buf_size (the last chunk short if
+	 * buf_size isn't a chunk multiple), so total recv capacity stays the
+	 * logical slot -- a completion's byte_len can never exceed buf_size, the
+	 * invariant urp_classify_frame's overrun guard relies on. At
 	 * num_chunks == 1 this is one SGE of ep->buf_size -- unchanged.
 	 */
-	for (j = 0; j < buf->num_chunks; j++)
-		buf->sges[j].length = ep->chunk_size;
+	remaining = ep->buf_size;
+	for (j = 0; j < buf->num_chunks; j++) {
+		u32 clen = min(remaining, ep->chunk_size);
+
+		buf->sges[j].length = clen;
+		remaining -= clen;
+	}
 	buf->cqe.done = urp_recv_done_for_srq;
 
 	wr.wr_cqe = &buf->cqe;

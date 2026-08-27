@@ -103,6 +103,26 @@ typedef struct sockaddr urp_sockaddr_t;
 #define URP_MAX_PAYLOAD		(URP_BUFFER_SIZE_MAX - URP_FRAME_HEADER_SIZE)
 
 /*
+ * URP_MAX_SGE - upper bound on the SGEs (chunks) that back one frame buffer.
+ * The runtime count (ep->num_chunks) is clamped to min(this, dev->attrs.max_sge);
+ * this is only a sanity ceiling on the auto-derived chunk count (design 37 path Y:
+ * one logical frame gathered from num_chunks page-sized chunks instead of one
+ * high-order compound page). 30 is the ConnectX-4 Lx max_sge; 32 leaves slack.
+ */
+#define URP_MAX_SGE		32
+
+/*
+ * Target chunk size for path Y. Chunks are capped near this so a large frame is
+ * gathered from several reliably-allocatable chunks instead of one high-order
+ * compound page: 64 KiB is order-4 on a 4 KiB-page host (vs order-8 for a 1 MiB
+ * slot), which almost never fails under fragmentation. The cap is only raised
+ * above this if the resulting chunk count would exceed the device's SGE budget
+ * (see urp_resolve_chunks); expressed in bytes so it stays correct on hosts with
+ * larger base pages.
+ */
+#define URP_CHUNK_TARGET_BYTES	65536
+
+/*
  * Pure per-endpoint sizing resolvers (table-tested in urp_test.c). Kept inline
  * and side-effect-free so the KUnit suite can pin every boundary without a live
  * RDMA device.
@@ -141,19 +161,29 @@ static inline u32 urp_ep_max_payload(u32 buf_size)
 static inline u32 urp_resolve_chunks(u32 buf_size, u32 max_sge,
 				     u32 *out_chunk_size)
 {
-	(void)max_sge;
-	*out_chunk_size = buf_size;
-	return 1;
-}
+	/*
+	 * Start at the smaller of the whole slot and the ~64 KiB target, so a
+	 * slot that already fits one target chunk (buf_size <= 64 KiB) stays a
+	 * single SGE -- byte-identical to the pre-chunked path. Then grow the
+	 * chunk order only while the chunk count would exceed the SGE budget, so
+	 * we use the smallest reliably-allocatable chunk that still fits max_sge.
+	 */
+	unsigned int order = min_t(unsigned int, get_order(buf_size),
+				   get_order(URP_CHUNK_TARGET_BYTES));
+	u32 chunk_size = (u32)PAGE_SIZE << order;
+	u32 nchunks = DIV_ROUND_UP(buf_size, chunk_size);
 
-/*
- * URP_MAX_SGE - upper bound on the SGEs (chunks) that back one frame buffer.
- * The runtime count (ep->num_chunks) is clamped to min(this, dev->attrs.max_sge);
- * this is only a sanity ceiling on the auto-derived chunk count (design 37 path Y:
- * one logical frame gathered from num_chunks page-sized chunks instead of one
- * high-order compound page). 30 is the ConnectX-4 Lx max_sge; 32 leaves slack.
- */
-#define URP_MAX_SGE		32
+	if (max_sge == 0)
+		max_sge = 1;
+	while (nchunks > max_sge && chunk_size < buf_size) {
+		order++;
+		chunk_size = (u32)PAGE_SIZE << order;
+		nchunks = DIV_ROUND_UP(buf_size, chunk_size);
+	}
+
+	*out_chunk_size = chunk_size;
+	return nchunks;
+}
 
 /*
  * struct urp_buffer - DMA-mapped buffer for RDMA send/recv
@@ -583,7 +613,16 @@ struct urp_endpoint {
 	 */
 	u32			num_chunks;	/* SGEs (chunks) per buffer (>= 1) */
 	u32			chunk_size;	/* bytes per chunk */
-	u32			max_frame;	/* num_chunks * chunk_size (>= buf_size) */
+	u32			max_frame;	/* logical max frame == buf_size */
+	/*
+	 * RX reassembly staging, buf_size bytes (kvmalloc: may exceed a
+	 * kmalloc-friendly order but is CPU-only, never DMA'd). Used only when a
+	 * frame spans >1 chunk -- gather the scattered payload contiguous before
+	 * classify/reorder/delivery, and as the reorder-drain staging area.
+	 * Recv completions are serialized on the single recv CQ, so one per
+	 * endpoint is race-free. NULL when num_chunks == 1 (no gather needed).
+	 */
+	void			*recv_scratch;
 	struct list_head	send_free;
 	struct list_head	recv_free;
 	spinlock_t		send_lock;	/* protects send_free */
