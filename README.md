@@ -14,10 +14,73 @@ CLI (`urp`) that drives it over generic netlink. Everything is built and tested
 with Nix; **no RDMA hardware is required** — the test suites run on soft-RoCE
 (`rdma_rxe`).
 
+## Highlights
+
+**One `urp` stream beats one TCP stream — on both paths — with a transparent,
+drop-in Unix-socket interface.** Two ways to use it:
+
+- **Transparent copy path** — any program that speaks a Unix socket gets an RDMA
+  fast path with **zero code changes**. `read()`/`write()` a UDS as usual.
+- **Zero-copy fast path** — RDMA-aware programs REGISTER their own buffer pool
+  over `io_uring` and the NIC DMAs payload directly in/out with **no kernel
+  copy**.
+
+### Measured performance
+
+Single-stream, real hardware — **Mellanox ConnectX-4 Lx, 25 GbE RoCEv2**
+(hp1↔hp3), line rate 3125 MB/s. Not soft-RoCE.
+
+| Path | Peak single-stream goodput | Small-message RTT | App changes |
+|---|---|---|---|
+| **Transparent copy** | **3056 MB/s @ 1 MiB — 97.8 % of line** | ≈ 25 µs p50 / 29 µs p99 | **none** |
+| **Zero-copy fast** | **3051 MB/s @ 512 K — 97.6 % of line** (→ 3066 MB/s / 98 % of line across 8 streams) | ≈ 23 µs p50 / 31 µs p99; up to **4.1× lower** than copy at 64 KB | opt-in `io_uring` |
+| TCP (`iperf2`, same link) | ~1900 MB/s — 61 % of line | — | — |
+
+Both `urp` paths sustain **~1.6× a single TCP flow** and clear ~98 % of the NIC.
+Frames range from **68 B to 1 MiB** each (default 4 KiB; jumbo MTU 9700); large
+frames are gathered from page-sized chunks via multi-SGE, so no fragile
+high-order allocation. Per-stream flow-control windows are **BDP-adaptive**
+(link × RTT), self-sizing from 25 GbE up to 800 GbE.
+
+### Feature checklist
+
+| Feature | State |
+|---|---|
+| Transparent **UDS-over-RoCEv2** tunnel (no app changes) | ✅ real-HW validated |
+| **Zero-copy** `io_uring` fast path (pinned pool, `uring_cmd`) | ✅ real-HW validated |
+| Multi-QP + SRQ + credit flow control + **per-stream reorder** + connection multiplexing | ✅ real-HW validated |
+| **Byte-windowing** flow control + **BDP-adaptive** window sizing (25→800 GbE) | ✅ real-HW validated |
+| Large frames via **multi-SGE chunked buffers** (up to 1 MiB, no order-8 alloc) | ✅ real-HW validated |
+| **PSK authentication** (SHA-256 in `rdma_cm` private_data) + QP health probes (PING/PONG, RTT EWMA) | ✅ built |
+| Connection **retry / recovery** (capped backoff, reconnect-on-drop, silent-drop probe→retry, lazy connect) | ✅ HW-verified (gRPC rendezvous code-complete) |
+| Generic-netlink **control CLI** (`urp add/remove/show/stats/drain/monitor`) | ✅ built |
+| Real **Redpanda / Kafka** produce+consume over the tunnel, byte-verified | ✅ (soft-RoCE loopback) |
+| C++ / **Seastar** zero-copy demo client; **CUBIC** congestion control | 📝 designed, roadmap |
+
+### Engineering quality
+
+- **Real-hardware proof** — ConnectX-4 Lx 25 GbE testbed: **128/128 `BENCH_OK
+  verify=full`** (byte-exact) benchmark matrix, plus multi-QP reorder sweeps.
+- **MicroVM pair tests** — two independent-kernel VMs tunneling URP↔URP over
+  soft-RoCE, **cross-arch** (x86_64 KVM, aarch64 + riscv64 TCG).
+- **Kernel-version matrix** — mainline + 6.1 / 6.6 / 6.12 LTS build gates on
+  every push.
+- **Sanitizers** — a **KASAN + KMEMLEAK + lockdep + KCOV** pair-test pass, clean
+  under a 12-concurrent-stream burst.
+- **Fuzzing** — every attack surface (frame classifier, RX state machine, reorder
+  backend, coverage-guided netlink, hostile-peer RDMA wire); **3 real
+  memory-safety bugs found and fixed**.
+- **Static analysis** — hermetic Nix targets for sparse, smatch,
+  `checkpatch --strict`, `W=1`/`W=12`, coccinelle, clippy, rustfmt
+  (`nix build .#analysis-all`); all clean bar a small documented checkpatch
+  residual.
+- **Everything is Nix** — reproducible builds, tests, and benchmarks; **no RDMA
+  hardware required** to develop.
+
 ## Status
 
-Actively developed. Highlights validated so far (see **[status.md](status.md)**
-for the full picture):
+Actively developed. What's validated so far, with design-doc links (see
+**[status.md](status.md)** for the full picture):
 
 - **Kernel data path** — k0 echo → multi-QP + SRQ + credit flow control +
   per-stream reorder → **initiator multi-stream** (many concurrent UDS
@@ -27,6 +90,14 @@ for the full picture):
   negotiated, so it falls back to frame credits with an older peer). This is what
   makes the **multi-QP data path stable under sustained load on real hardware**
   (see [docs/design/35-windowing-flow-control.md](docs/design/35-windowing-flow-control.md)).
+- **Line-rate single stream (design 37)** — **one `urp` stream beats one TCP
+  stream**. With jumbo MTU (9700) and large frames — gathered from page-sized
+  chunks via multi-SGE ("path Y", no fragile high-order allocation) — plus
+  **BDP-adaptive per-stream windows** (link×RTT, self-sizing from 25 GbE up to
+  800 GbE) and an **in-order RX copy-elision bypass** (RX payload copies 5→1),
+  the *transparent* copy path reaches **~98% of 25 GbE line at 1 MiB**
+  (3056 MB/s), matching the zero-copy fast path — with no application changes.
+  See [docs/design/37-high-throughput-clustering.md](docs/design/37-high-throughput-clustering.md).
 - **Zero-copy fast path** (optional, `CONFIG_URP_FAST`; `urp add --kind fast`) —
   an `io_uring` `uring_cmd` interface that REGISTERs a userspace buffer pool and
   moves payload with no kernel copy
@@ -106,7 +177,9 @@ To build the module against your **running** kernel, see the `buildUrpKo`
   ([design 30](docs/design/30-urp-bench-io-uring.md)), the zero-copy fast path
   ([design 31](docs/design/31-urp-fast-zero-copy.md)), real-hardware results
   ([design 32](docs/design/32-real-hardware-integration-testing.md)), bulk
-  throughput ([design 34](docs/design/34-bulk-throughput.md)), and byte-windowing
-  flow control ([design 35](docs/design/35-windowing-flow-control.md)).
+  throughput ([design 34](docs/design/34-bulk-throughput.md)), byte-windowing
+  flow control ([design 35](docs/design/35-windowing-flow-control.md)), and the
+  high-throughput / beat-TCP-per-stream data plane
+  ([design 37](docs/design/37-high-throughput-clustering.md)).
 
 > Prototype / research code. Not production-hardened.
