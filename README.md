@@ -37,9 +37,15 @@ for the full picture):
 - **Real Redpanda over UDS-over-RDMA** — a real `rpk` client ↔ real Redpanda
   broker: **metadata** *and* **full produce/consume** round-trip over the RDMA
   tunnel (payload verified byte-for-byte).
+- **Kernel version support** — the module builds and is tested against the
+  three current LTS series **6.1 / 6.6 / 6.12** *and* the latest mainline
+  (nixos-unstable `linuxPackages_latest`, currently **7.2**). CI compiles
+  `urp.ko` against every one of them on each push; the microVM pair test boots
+  the latest kernel and the hardware testbed runs it too (see the version
+  matrix in [ci.yml](.github/workflows/ci.yml)).
 - **Testing** — single-host soft-RoCE integration, a 2-VM microVM pair harness,
-  cross-arch (x86_64 KVM / aarch64 TCG), a kernel-version matrix (6.1/6.6/6.12/
-  7.1), and a **KASAN + KMEMLEAK + lockdep** sanitizer pass (clean under a
+  cross-arch (x86_64 KVM / aarch64 TCG), the kernel-version matrix above, and a
+  **KASAN + KMEMLEAK + lockdep** sanitizer pass (clean under a
   12-concurrent-stream burst).
 - **Real RoCEv2 hardware** — validated end-to-end on a two-host 25 GbE testbed
   (Mellanox `mlx5`): byte-exact `urp-bench` transfers and a multi-QP reorder
