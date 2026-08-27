@@ -130,21 +130,55 @@ static inline u32 urp_ep_max_payload(u32 buf_size)
 }
 
 /*
+ * Derive the chunk geometry for a buf_size on a device advertising @max_sge
+ * scatter-gather entries (design 37 path Y). Returns the chunk count and writes
+ * the per-chunk byte size to @out_chunk_size; the frame is gathered from that
+ * many physically-separate page-sized chunks instead of one high-order compound
+ * page. PR 3a pins one chunk == the whole slot, so this is byte-identical to the
+ * pre-chunked path (max_sge unused yet). PR 3b picks the smallest chunk whose
+ * count fits min(max_sge, URP_MAX_SGE). Pure and side-effect free (table-tested).
+ */
+static inline u32 urp_resolve_chunks(u32 buf_size, u32 max_sge,
+				     u32 *out_chunk_size)
+{
+	(void)max_sge;
+	*out_chunk_size = buf_size;
+	return 1;
+}
+
+/*
+ * URP_MAX_SGE - upper bound on the SGEs (chunks) that back one frame buffer.
+ * The runtime count (ep->num_chunks) is clamped to min(this, dev->attrs.max_sge);
+ * this is only a sanity ceiling on the auto-derived chunk count (design 37 path Y:
+ * one logical frame gathered from num_chunks page-sized chunks instead of one
+ * high-order compound page). 30 is the ConnectX-4 Lx max_sge; 32 leaves slack.
+ */
+#define URP_MAX_SGE		32
+
+/*
  * struct urp_buffer - DMA-mapped buffer for RDMA send/recv
- * @list:     free list linkage
- * @page:     backing kernel page
- * @dma_addr: DMA address for RDMA operations
- * @data:     kernel virtual address (page_address(page))
- * @sge:      scatter-gather entry (pre-filled for RDMA)
- * @cqe:      CQ completion callback (per-buffer, set to send_done or recv_done)
- * @index:    buffer index (for debugging)
+ *
+ * A buffer backs one logical frame. It is gathered from @num_chunks physically
+ * separate page-sized chunks (design 37 path Y), each covered by one pre-filled
+ * SGE, so large frames need no high-order allocation. @pages and @sges are
+ * heap arrays of exactly @num_chunks entries (sges[j].addr doubles as the chunk
+ * DMA address). The single-chunk case (@num_chunks == 1) is byte-identical to
+ * the pre-chunked path: one page, one SGE spanning the whole slot.
+ *
+ * @list:       free list linkage
+ * @pages:      num_chunks backing pages (heap array)
+ * @sges:       num_chunks pre-filled SGEs; sges[j].addr is the chunk DMA address
+ * @num_chunks: chunks (SGEs) backing this buffer (>= 1)
+ * @data:       KVA of chunk 0 (page_address(pages[0])); the frame header lives here
+ * @cqe:        CQ completion callback (per-buffer, set to send_done or recv_done)
+ * @index:      buffer index (for debugging)
  */
 struct urp_buffer {
 	struct list_head	list;
-	struct page		*page;
-	dma_addr_t		dma_addr;
+	struct page		**pages;
+	struct ib_sge		*sges;
+	u32			num_chunks;
 	void			*data;
-	struct ib_sge		sge;
 	struct ib_cqe		cqe;
 	u32			index;
 };
@@ -540,6 +574,16 @@ struct urp_endpoint {
 	struct urp_buffer	*bufs;
 	u32			num_bufs;
 	u32			buf_size;	/* live DMA slot bytes (from buffer_size) */
+	/*
+	 * Chunking (design 37 path Y). Each pool buffer is gathered from
+	 * num_chunks page-sized chunks so a max_frame logical frame needs no
+	 * high-order allocation. Derived once at urp_bufs_init from buf_size and
+	 * the device's max_sge. PR 3a pins num_chunks == 1 (chunk == whole slot),
+	 * so max_frame == chunk_size == buf_size and behavior is unchanged.
+	 */
+	u32			num_chunks;	/* SGEs (chunks) per buffer (>= 1) */
+	u32			chunk_size;	/* bytes per chunk */
+	u32			max_frame;	/* num_chunks * chunk_size (>= buf_size) */
 	struct list_head	send_free;
 	struct list_head	recv_free;
 	spinlock_t		send_lock;	/* protects send_free */
@@ -752,6 +796,12 @@ int  urp_post_frame_raw(struct ib_qp *qp, u64 addr, u32 len, u32 lkey,
  * buffer directly on the endpoint QP; caller owns the ownership bookkeeping.
  */
 int  urp_post_recv_raw(struct ib_qp *qp, u64 addr, u32 len, u32 lkey,
+		       struct ib_cqe *cqe);
+/* Post one multi-SGE IB_WR_SEND gathering @num_sge chunks (from @sges, lengths
+ * pre-set by the caller) completing through @cqe. Used by the pump for chunked
+ * pool buffers (design 37 path Y). Caller owns DMA-sync and bookkeeping.
+ */
+int  urp_post_frame_sg(struct ib_qp *qp, struct ib_sge *sges, u32 num_sge,
 		       struct ib_cqe *cqe);
 
 /* CQ completion callbacks (urp_rdma.c) -- used by pump when posting sends */

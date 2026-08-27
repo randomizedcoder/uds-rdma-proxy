@@ -64,6 +64,27 @@ int urp_post_frame_raw(struct ib_qp *qp, u64 addr, u32 len, u32 lkey,
 }
 
 /*
+ * Post one IB_WR_SEND gathering @num_sge chunks from @sges (each entry's addr,
+ * length and lkey already set by the caller) completing through @cqe. This is
+ * the chunked pool-buffer poster (design 37 path Y): a logical frame spans
+ * num_chunks physically-separate chunks. At num_sge == 1 it is exactly
+ * urp_post_frame_raw. Does no DMA-sync/bookkeeping -- the caller owns both.
+ */
+int urp_post_frame_sg(struct ib_qp *qp, struct ib_sge *sges, u32 num_sge,
+		      struct ib_cqe *cqe)
+{
+	struct ib_send_wr wr = {};
+
+	wr.wr_cqe = cqe;
+	wr.sg_list = sges;
+	wr.num_sge = num_sge;
+	wr.opcode = IB_WR_SEND;
+	wr.send_flags = IB_SEND_SIGNALED;
+
+	return ib_post_send(qp, &wr, NULL);
+}
+
+/*
  * Post one recv WR of @len bytes landing at DMA/MR address @addr with local key
  * @lkey on @qp, completing through @cqe. The urp-fast zero-copy RECV path
  * (design 31 PR4) arms an app-donated pool buffer directly on the endpoint QP
@@ -96,14 +117,28 @@ int urp_post_recv_raw(struct ib_qp *qp, u64 addr, u32 len, u32 lkey,
 static int urp_post_frame(struct urp_endpoint *ep, struct ib_qp *qp,
 			  struct urp_buffer *buf, u32 len)
 {
+	u32 remaining = len;
+	u32 n;
 	int ret;
 
-	ib_dma_sync_single_for_device(ep->ib_dev, buf->dma_addr, len,
-				      DMA_TO_DEVICE);
+	/*
+	 * Spread the framed bytes (@len, header included) across the buffer's
+	 * chunks: chunk 0 first (it carries the 20-byte header), then as many
+	 * more chunks as @len needs. Set each used SGE's length and DMA-sync
+	 * exactly those bytes. At num_chunks == 1 this is one SGE of @len,
+	 * byte-identical to the pre-chunked path.
+	 */
+	for (n = 0; n < buf->num_chunks && remaining; n++) {
+		u32 clen = min(remaining, ep->chunk_size);
+
+		buf->sges[n].length = clen;
+		ib_dma_sync_single_for_device(ep->ib_dev, buf->sges[n].addr,
+					      clen, DMA_TO_DEVICE);
+		remaining -= clen;
+	}
 
 	buf->cqe.done = urp_send_done;
-	ret = urp_post_frame_raw(qp, buf->dma_addr, len, buf->sge.lkey,
-				 &buf->cqe);
+	ret = urp_post_frame_sg(qp, buf->sges, n, &buf->cqe);
 	if (ret)
 		urp_buf_free_send(ep, buf);
 	return ret;
