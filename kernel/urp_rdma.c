@@ -66,20 +66,108 @@
  * called at endpoint teardown, just before page_pool_destroy.
  */
 
+/*
+ * Free the chunk backing (pages + SGE array) of one buffer. Safe to call on a
+ * partially-allocated buffer (NULL entries are skipped) and idempotent.
+ */
+static void urp_buf_backing_free(struct urp_endpoint *ep, struct ib_device *dev,
+				 struct urp_buffer *buf)
+{
+	u32 j;
+
+	if (buf->pages) {
+		for (j = 0; j < buf->num_chunks; j++) {
+			if (!buf->pages[j])
+				continue;
+			ib_dma_unmap_page(dev, buf->sges[j].addr, ep->chunk_size,
+					  DMA_BIDIRECTIONAL);
+			page_pool_put_page(ep->page_pool, buf->pages[j], -1, false);
+			buf->pages[j] = NULL;
+		}
+	}
+	kfree(buf->pages);
+	kfree(buf->sges);
+	buf->pages = NULL;
+	buf->sges = NULL;
+	buf->data = NULL;
+}
+
+/*
+ * Allocate the chunk backing for one buffer: num_chunks page-sized chunks from
+ * the pool, each DMA-mapped and given a pre-filled SGE (lkey is filled later,
+ * after PD creation). On failure everything already taken is released and
+ * -ENOMEM is returned. At num_chunks == 1 this is one page mapped over the
+ * whole slot -- identical to the pre-chunked path.
+ */
+static int urp_buf_backing_alloc(struct urp_endpoint *ep, struct ib_device *dev,
+				 struct urp_buffer *buf)
+{
+	u32 j;
+
+	buf->num_chunks = ep->num_chunks;
+	buf->pages = kcalloc(ep->num_chunks, sizeof(*buf->pages), GFP_KERNEL);
+	buf->sges  = kcalloc(ep->num_chunks, sizeof(*buf->sges), GFP_KERNEL);
+	if (!buf->pages || !buf->sges)
+		goto err;
+
+	for (j = 0; j < ep->num_chunks; j++) {
+		dma_addr_t dma;
+
+		buf->pages[j] = page_pool_dev_alloc_pages(ep->page_pool);
+		if (!buf->pages[j]) {
+			pr_err("page_pool_dev_alloc_pages failed for buf %u chunk %u\n",
+			       buf->index, j);
+			goto err;
+		}
+		dma = ib_dma_map_page(dev, buf->pages[j], 0, ep->chunk_size,
+				      DMA_BIDIRECTIONAL);
+		if (ib_dma_mapping_error(dev, dma)) {
+			pr_err("ib_dma_map_page failed for buf %u chunk %u\n",
+			       buf->index, j);
+			page_pool_put_page(ep->page_pool, buf->pages[j], -1, false);
+			buf->pages[j] = NULL;
+			goto err;
+		}
+		buf->sges[j].addr = dma;
+		buf->sges[j].length = ep->chunk_size;
+		/* lkey filled after PD creation */
+	}
+	buf->data = page_address(buf->pages[0]);	/* chunk 0: header lives here */
+	return 0;
+
+err:
+	urp_buf_backing_free(ep, dev, buf);
+	return -ENOMEM;
+}
+
 static int urp_bufs_init(struct urp_endpoint *ep, struct ib_device *dev)
 {
+	/*
+	 * Clamp chunk count to the tightest per-WR SGE cap across all the queues
+	 * a frame flows through: send (SQ), recv (RQ, urp-fast path) and the
+	 * shared SRQ (bulk recv). A chunk that no queue can post would truncate
+	 * the frame.
+	 */
+	u32 dev_max_sge = min3((u32)dev->attrs.max_send_sge,
+			       (u32)dev->attrs.max_recv_sge,
+			       (u32)dev->attrs.max_srq_sge);
+	u32 chunk_size;
+	u32 num_chunks = urp_resolve_chunks(ep->buf_size, dev_max_sge,
+					    &chunk_size);
 	struct page_pool_params pp = {
 		.flags		= 0,	/* no DMA mapping -- see comment above */
 		/*
-		 * order covers the whole slot: for the default 4096-byte slot on
-		 * a 4K-page host this is 0 (one page, unchanged); a larger
-		 * buffer_size raises it so each slot is one physically-contiguous
-		 * compound page. A high-order allocation can fail under memory
-		 * fragmentation -- page_pool returns NULL and activation fails
-		 * cleanly rather than corrupting anything.
+		 * order covers ONE chunk. PR 3a pins num_chunks == 1 so
+		 * chunk_size == buf_size and this is get_order(buf_size),
+		 * unchanged: the default 4096-byte slot is order 0 (one page); a
+		 * larger buffer_size raises it so each slot is one physically-
+		 * contiguous compound page. A high-order allocation can fail
+		 * under memory fragmentation -- page_pool returns NULL and
+		 * activation fails cleanly. PR 3b derives smaller chunks so large
+		 * frames avoid the high-order allocation entirely.
 		 */
-		.order		= get_order(ep->buf_size),
-		.pool_size	= ep->num_bufs,
+		.order		= get_order(chunk_size),
+		.pool_size	= ep->num_bufs * num_chunks,
 		/*
 		 * Phase 4 Step 2: NUMA-aware allocation. When the
 		 * underlying NIC has a real PCI parent we can read its
@@ -93,10 +181,14 @@ static int urp_bufs_init(struct urp_endpoint *ep, struct ib_device *dev)
 				   : NUMA_NO_NODE),
 		.dev		= NULL,
 		.dma_dir	= DMA_BIDIRECTIONAL,
-		.max_len	= ep->buf_size,
+		.max_len	= chunk_size,
 		.offset		= 0,
 	};
 	int i;
+
+	ep->num_chunks = num_chunks;
+	ep->chunk_size = chunk_size;
+	ep->max_frame  = num_chunks * chunk_size;
 
 	INIT_LIST_HEAD(&ep->send_free);
 	INIT_LIST_HEAD(&ep->recv_free);
@@ -124,27 +216,10 @@ static int urp_bufs_init(struct urp_endpoint *ep, struct ib_device *dev)
 		struct urp_buffer *buf = &ep->bufs[i];
 
 		buf->index = i;
-		buf->page = page_pool_dev_alloc_pages(ep->page_pool);
-		if (!buf->page) {
-			pr_err("page_pool_dev_alloc_pages failed for buf %d\n", i);
-			goto err;
-		}
-
-		buf->data = page_address(buf->page);
-		buf->dma_addr = ib_dma_map_page(dev, buf->page, 0,
-						ep->buf_size, DMA_BIDIRECTIONAL);
-		if (ib_dma_mapping_error(dev, buf->dma_addr)) {
-			pr_err("ib_dma_map_page failed for buf %d\n", i);
-			page_pool_put_page(ep->page_pool, buf->page, -1, false);
-			buf->page = NULL;
-			goto err;
-		}
-
-		buf->sge.addr = buf->dma_addr;
-		buf->sge.length = ep->buf_size;
-		/* lkey set after PD creation */
-
 		INIT_LIST_HEAD(&buf->list);
+
+		if (urp_buf_backing_alloc(ep, dev, buf))
+			goto err;
 
 		/* Split: first half send, second half recv */
 		if (i < ep->num_bufs / 2)
@@ -156,16 +231,9 @@ static int urp_bufs_init(struct urp_endpoint *ep, struct ib_device *dev)
 	return 0;
 
 err:
-	for (i = i - 1; i >= 0; i--) {
-		struct urp_buffer *buf = &ep->bufs[i];
-
-		if (buf->page) {
-			ib_dma_unmap_page(dev, buf->dma_addr, ep->buf_size,
-					  DMA_BIDIRECTIONAL);
-			page_pool_put_page(ep->page_pool, buf->page, -1, false);
-			buf->page = NULL;
-		}
-	}
+	/* buf[i] freed itself on failure; unwind the ones already committed */
+	for (i = i - 1; i >= 0; i--)
+		urp_buf_backing_free(ep, dev, &ep->bufs[i]);
 	page_pool_destroy(ep->page_pool);
 	ep->page_pool = NULL;
 	kfree(ep->bufs);
@@ -180,17 +248,8 @@ static void urp_bufs_cleanup(struct urp_endpoint *ep, struct ib_device *dev)
 	if (!ep->page_pool)
 		return;
 
-	for (i = 0; i < ep->num_bufs; i++) {
-		struct urp_buffer *buf = &ep->bufs[i];
-
-		if (!buf->page)
-			continue;
-
-		ib_dma_unmap_page(dev, buf->dma_addr, ep->buf_size,
-				  DMA_BIDIRECTIONAL);
-		page_pool_put_page(ep->page_pool, buf->page, -1, false);
-		buf->page = NULL;
-	}
+	for (i = 0; i < ep->num_bufs; i++)
+		urp_buf_backing_free(ep, dev, &ep->bufs[i]);
 
 	page_pool_destroy(ep->page_pool);
 	ep->page_pool = NULL;
@@ -338,8 +397,13 @@ static int urp_endpoint_setup_shared(struct urp_endpoint *ep,
 	if (ret)
 		goto err_pd;
 
-	for (i = 0; i < ep->num_bufs; i++)
-		ep->bufs[i].sge.lkey = ep->pd->local_dma_lkey;
+	for (i = 0; i < ep->num_bufs; i++) {
+		struct urp_buffer *buf = &ep->bufs[i];
+		u32 j;
+
+		for (j = 0; j < buf->num_chunks; j++)
+			buf->sges[j].lkey = ep->pd->local_dma_lkey;
+	}
 
 	/*
 	 * Shared CQs sized so completions don't back up under N QPs of
@@ -430,8 +494,16 @@ static int urp_qp_create_on_cm_id(struct urp_endpoint *ep,
 		attr.srq = ep->srq;		/* Step 3: shared RQ */
 		attr.cap.max_recv_wr = 0;	/* recvs flow through SRQ */
 	}
-	attr.cap.max_send_sge = 1;
-	attr.cap.max_recv_sge = 1;
+	/*
+	 * A frame is gathered from ep->num_chunks page-sized chunks (design 37
+	 * path Y), so the QP must allow that many SGEs per WR on both sides.
+	 * ep->num_chunks was already derived under min(.., max_sge) in
+	 * urp_bufs_init; clamp again defensively. PR 3a: num_chunks == 1.
+	 */
+	attr.cap.max_send_sge = min_t(u32, ep->num_chunks,
+				      (u32)ep->ib_dev->attrs.max_send_sge);
+	attr.cap.max_recv_sge = min_t(u32, ep->num_chunks,
+				      (u32)ep->ib_dev->attrs.max_recv_sge);
 	attr.qp_type = IB_QPT_RC;
 	attr.sq_sig_type = IB_SIGNAL_ALL_WR;
 

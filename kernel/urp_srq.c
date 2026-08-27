@@ -24,13 +24,20 @@ int urp_post_srq_recv(struct urp_endpoint *ep, struct urp_buffer *buf)
 {
 	struct ib_recv_wr wr = {};
 	const struct ib_recv_wr *bad_wr;
+	u32 j;
 
-	buf->sge.length = ep->buf_size;
+	/*
+	 * A frame lands across the buffer's chunks (design 37 path Y); arm the
+	 * full chunk length on every SGE so the largest frame fits. At
+	 * num_chunks == 1 this is one SGE of ep->buf_size -- unchanged.
+	 */
+	for (j = 0; j < buf->num_chunks; j++)
+		buf->sges[j].length = ep->chunk_size;
 	buf->cqe.done = urp_recv_done_for_srq;
 
 	wr.wr_cqe = &buf->cqe;
-	wr.sg_list = &buf->sge;
-	wr.num_sge = 1;
+	wr.sg_list = buf->sges;
+	wr.num_sge = buf->num_chunks;
 
 	return ib_post_srq_recv(ep->srq, &wr, &bad_wr);
 }
@@ -83,7 +90,13 @@ int urp_srq_create(struct urp_endpoint *ep)
 
 	attr.event_handler = NULL;
 	attr.attr.max_wr = max_wr;
-	attr.attr.max_sge = 1;
+	/*
+	 * A recv frame is scattered across ep->num_chunks chunks (design 37
+	 * path Y), so the SRQ must allow that many SGEs per recv. Clamp to the
+	 * device's SRQ SGE limit. PR 3a: num_chunks == 1.
+	 */
+	attr.attr.max_sge = min_t(u32, ep->num_chunks,
+				  (u32)ep->ib_dev->attrs.max_srq_sge);
 	attr.attr.srq_limit = 0;
 
 	ep->srq = ib_create_srq(ep->pd, &attr);
