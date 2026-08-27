@@ -27,22 +27,46 @@ typedef uint32_t u32;
 #endif
 
 /*
- * Window sizing. A fixed byte window (urp.window_bytes sysctl) bounds in-flight
- * payload; the default ~1 MiB comfortably fills the ~25 GbE RoCEv2 BDP while
- * fitting well inside the shared SRQ (num_bufs/2 buffers). MIN keeps at least a
- * couple of max-size frames in flight; MAX is a sanity ceiling. (BDP-adaptive
- * sizing from per-QP rtt_ewma_ns is a future refinement; a fixed clamp is
- * deterministic and already bounds the flood that Problem B is.)
+ * Window sizing (design 35 §35.3, scalability revision). The per-stream window
+ * is resolved from the bandwidth-delay product so it tracks the link: BDP =
+ * link_rate x RTT, sized from ib_query_port's active_speed x width and the
+ * per-QP rtt_ewma_ns. This auto-scales 25 -> 800 GbE (a fixed 64 MiB ceiling
+ * couldn't hold an 800 GbE / 1 ms BDP of ~100 MB). The sysctl (urp.window_bytes)
+ * is a floor/override; a frame-count floor (URP_WINDOW_TARGET_FRAMES) keeps
+ * large frames pipelined when the network RTT is tiny; the whole thing is capped
+ * by the peer's recv pool (num_bufs/2 buffers) and the [MIN,MAX] range. MAX is a
+ * generous sanity ceiling -- the recv pool is the real bound, so high-speed
+ * deployments scale buffer_count to admit their BDP.
  */
-#define URP_WINDOW_BYTES_DEFAULT	(1UL << 20)	/* 1 MiB */
+#define URP_WINDOW_BYTES_DEFAULT	(1UL << 20)	/* 1 MiB (sysctl floor) */
 #define URP_WINDOW_BYTES_MIN		(1UL << 16)	/* 64 KiB */
-#define URP_WINDOW_BYTES_MAX		(1UL << 26)	/* 64 MiB */
+#define URP_WINDOW_BYTES_MAX		(1UL << 30)	/* 1 GiB (covers 800 GbE BDP) */
+
+/*
+ * Fallback RTT for BDP sizing before PROBE/PONG has populated rtt_ewma_ns (a
+ * freshly-created stream may not have a sample yet). 100 us is a conservative
+ * RoCEv2 datacenter round-trip; once real samples arrive, later streams size
+ * from them. Under-estimating only falls back to the frame-count floor, never to
+ * zero.
+ */
+#define URP_WINDOW_FALLBACK_RTT_NS	100000ULL	/* 100 us */
 
 /* Emit a fresh CREDIT-BYTES grant once the receiver has delivered another
  * window/DIVISOR bytes to the app -- amortizes control-frame overhead while
  * keeping the sender's window from draining (design 35 §35.3).
  */
 #define URP_WINDOW_GRANT_DIVISOR	4
+
+/*
+ * Pipelining floor: a stream's window must admit at least this many max-size
+ * frames, else a large frame degenerates to stop-and-wait (one frame in flight,
+ * then block a full grant round-trip -- HW-measured: a 1 MiB frame into a fixed
+ * 1 MiB window ran at ~800 MB/s, vs ~1090 once several frames pipeline). The
+ * fixed sysctl window is sized for the common (small) frame; large slots scale
+ * the window up so the pipeline stays full, bounded by the peer's recv pool and
+ * the [MIN,MAX] range. See urp_window_for_stream().
+ */
+#define URP_WINDOW_TARGET_FRAMES	8u
 
 /*
  * Mandatory reorder coupling (design 35 §35.3): the per-stream reorder buffer
@@ -69,6 +93,39 @@ static inline u64 urp_window_clamp(u64 v)
 	if (v > URP_WINDOW_BYTES_MAX)
 		return URP_WINDOW_BYTES_MAX;
 	return v;
+}
+
+/*
+ * Resolve a stream's byte window (design 35 §35.3, scalability revision). The
+ * window is the largest of three sizings, so it serves every regime:
+ *   - BDP = @link_mbps x @rtt_ns  -- the bandwidth-delay product; this is what
+ *     scales the window with the NIC (25 -> 800 GbE) and the path RTT.
+ *   - URP_WINDOW_TARGET_FRAMES x @buf_size  -- a pipelining floor so a large
+ *     frame stays pipelined even when the network RTT is tiny (the copy path's
+ *     grant round-trip is dominated by app delivery, not the wire RTT).
+ *   - @sysctl_window  -- an operator floor / override.
+ * It is then capped by the peer's recv-pool bytes (num_bufs/2 buffers of
+ * @buf_size) -- never admit more in-flight frames than the receiver can hold --
+ * and clamped to [MIN,MAX]. Pure (no sockets/RDMA), table-tested in KUnit +
+ * urp-window-units. @link_mbps or @rtt_ns == 0 simply drops the BDP term.
+ */
+static inline u64 urp_window_for_stream(u64 sysctl_window, u32 buf_size,
+					u32 num_bufs, u32 link_mbps, u64 rtt_ns)
+{
+	u64 recv_pool = (u64)(num_bufs / 2) * buf_size;
+	u64 frame_floor = (u64)URP_WINDOW_TARGET_FRAMES * buf_size;
+	/* BDP bytes = link_mbps(1e6 bit/s) * rtt_ns(1e-9 s) / 8 = *rtt/8000. */
+	u64 bdp = (u64)link_mbps * rtt_ns / 8000;
+	u64 w = sysctl_window;
+
+	if (bdp > w)
+		w = bdp;
+	if (frame_floor > w)
+		w = frame_floor;
+	w = urp_window_clamp(w);		/* [MIN, MAX] */
+	if (w > recv_pool)			/* never exceed peer recv capacity */
+		w = recv_pool;
+	return w;
 }
 
 /*

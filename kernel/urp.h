@@ -649,6 +649,15 @@ struct urp_endpoint {
 	bool			window_negotiated;
 
 	/*
+	 * Link rate (Mb/s) of the RoCE port, from ib_query_port at establish
+	 * (active_speed x active_width via urp_link_speed_mbps). Feeds BDP-based
+	 * window sizing (design 35 §35.3) so the window tracks the NIC from
+	 * 25 -> 800 GbE. 0 until queried -> the BDP term drops and the window
+	 * falls back to the frame-count floor / sysctl.
+	 */
+	u32			link_mbps;
+
+	/*
 	 * design 33 Phase 2: lazy connect-on-first-use. The initiator no longer
 	 * dials RDMA-CM at `urp add`; the first UDS client accept fires a
 	 * lifetime one-shot dial. connect_started is the latch (0 -> 1 via
@@ -842,6 +851,11 @@ int  urp_post_recv_raw(struct ib_qp *qp, u64 addr, u32 len, u32 lkey,
  */
 int  urp_post_frame_sg(struct ib_qp *qp, struct ib_sge *sges, u32 num_sge,
 		       struct ib_cqe *cqe);
+
+/* Decode an ib_port_attr active_speed/active_width into link rate in Mb/s
+ * (urp_rdma.c). Pure table; feeds BDP window sizing. Declared for KUnit.
+ */
+u32 urp_link_speed_mbps(u16 active_speed, u8 active_width);
 
 /* CQ completion callbacks (urp_rdma.c) -- used by pump when posting sends */
 void urp_send_done(struct ib_cq *cq, struct ib_wc *wc);

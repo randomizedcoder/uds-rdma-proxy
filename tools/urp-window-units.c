@@ -73,6 +73,24 @@ static void run_clamp(void)
 	CHECK_EQ(urp_window_clamp(~0ULL), URP_WINDOW_BYTES_MAX, "clamp saturated");
 }
 
+static void run_for_stream(void)
+{
+	const u64 SYS = URP_WINDOW_BYTES_DEFAULT;
+
+	/* No BDP (link 0): sysctl floor dominates for a small frame. */
+	CHECK_EQ(urp_window_for_stream(SYS, 4096, 1024, 0, 0), SYS,
+		 "for_stream sysctl floor");
+	/* Large frame, tiny RTT: frame-count floor keeps it pipelined. */
+	CHECK_EQ(urp_window_for_stream(SYS, 1u << 20, 128, 25000, 20000),
+		 (u64)URP_WINDOW_TARGET_FRAMES << 20, "for_stream frame floor");
+	/* High link rate scales via BDP. 400 Gb/s x 100 us = 5 MB. */
+	CHECK_EQ(urp_window_for_stream(SYS, 4096, 4096, 400000, 100000),
+		 (u64)400000 * 100000 / 8000, "for_stream BDP");
+	/* Shallow pool caps at recv-pool bytes (8 bufs -> 4 recv x 1 MiB). */
+	CHECK_EQ(urp_window_for_stream(SYS, 1u << 20, 8, 0, 0), (u64)4 << 20,
+		 "for_stream recv-pool cap");
+}
+
 static void run_reorder_depth(void)
 {
 	CHECK_EQ(urp_reorder_depth_for_window(1UL << 20), URP_REORDER_MAX_ENTRIES,
@@ -90,6 +108,7 @@ int main(void)
 	run_should_grant();
 	run_apply_grant();
 	run_clamp();
+	run_for_stream();
 	run_reorder_depth();
 
 	printf("urp-window-units: %d checks, %d failures\n", checks, failures);

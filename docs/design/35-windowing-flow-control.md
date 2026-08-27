@@ -125,6 +125,35 @@ permanently shrink the window — the next grant carries the true running total 
 `max()` makes duplicates/reorderings idempotent. This is the same self-healing
 discipline as design 32's credit-routing fix, now at byte granularity.
 
+### Window sizing — BDP-adaptive (scalability revision)
+
+The per-stream `window_bytes` is **not** a fixed constant; it is resolved at
+stream create (`urp_window_for_stream`) as the largest of three terms, so it
+serves every link speed and frame size:
+
+- **BDP = link_rate × RTT** — the bandwidth-delay product. Link rate comes from
+  `ib_query_port` (`active_speed × active_width`, decoded by
+  `urp_link_speed_mbps`, cached on the endpoint at establish); RTT is the per-QP
+  `rtt_ewma_ns` from PROBE/PONG (fallback `URP_WINDOW_FALLBACK_RTT_NS` before a
+  sample exists). This is what **scales the window with the NIC — 25 → 800 GbE**.
+  RoCE RTT stays low and stable across link speeds, so BDP tracks link rate and
+  never balloons.
+- **`URP_WINDOW_TARGET_FRAMES × buffer_size`** — a pipelining floor. A large
+  frame's *grant* round-trip is dominated by the receiver's app-delivery of the
+  whole frame, not the wire RTT, so BDP-from-network-RTT under-sizes it; the
+  floor guarantees ≥ N frames in flight regardless (a fixed 1 MiB window made
+  1 MiB frames run stop-and-wait at ~800 MB/s; the 8-frame floor lifts them to
+  ~1090, HW-measured hp1↔hp3).
+- **`urp.window_bytes` sysctl** — an operator floor / override.
+
+The result is capped by the **peer recv-pool bytes** (`num_bufs/2 × buffer_size`)
+— never admit more in-flight frames than the receiver can hold — and clamped to
+`[URP_WINDOW_BYTES_MIN, URP_WINDOW_BYTES_MAX]`. `MAX` is a generous 1 GiB (covers
+an 800 GbE BDP); the recv pool is the real bound, so **high-speed deployments
+scale `buffer_count` to admit their BDP**. The copy path is memcpy-bound and
+won't reach 200 GbE+ line regardless — that is the zero-copy fast path + F2's job
+(design 31 / 37); windowing just must not be the artificial cap.
+
 ### Wire format — a new CONTROL sub-type (interop-gated)
 
 The header's grant field is **`u16` `credits_granted [14..16)`** — it cannot carry

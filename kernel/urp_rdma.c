@@ -67,6 +67,60 @@
  */
 
 /*
+ * Decode an RDMA port's active_speed x active_width into a link rate in Mb/s.
+ * Per-lane rates are the IBTA signaling rates rounded to Mb/s; multiplied by the
+ * lane count (ib_width_enum_to_int). Covers SDR..NDR, which spans 25 GbE (EDR
+ * 1x) through 800 GbE (NDR 8x). Unknown speeds return 0 -> the BDP window term
+ * simply drops and sizing falls back to the frame-count floor. Pure table.
+ */
+u32 urp_link_speed_mbps(u16 active_speed, u8 active_width)
+{
+	int lanes = ib_width_enum_to_int(active_width);
+	u32 per_lane;
+
+	switch (active_speed) {
+	case IB_SPEED_SDR:	per_lane = 2500;	break;
+	case IB_SPEED_DDR:	per_lane = 5000;	break;
+	case IB_SPEED_QDR:	per_lane = 10000;	break;
+	case IB_SPEED_FDR10:	per_lane = 10313;	break;
+	case IB_SPEED_FDR:	per_lane = 14063;	break;
+	case IB_SPEED_EDR:	per_lane = 25781;	break;
+	case IB_SPEED_HDR:	per_lane = 53125;	break;
+	case IB_SPEED_NDR:	per_lane = 106250;	break;
+	default:		per_lane = 0;		break;
+	}
+	if (lanes < 1)
+		lanes = 1;
+	return per_lane * (u32)lanes;
+}
+
+/*
+ * Query the RoCE port link rate once the connection is up and cache it on the
+ * endpoint (feeds BDP window sizing). Uses any established QP's cm_id for the
+ * port number. Best-effort: on failure link_mbps stays 0 (BDP term drops).
+ */
+static void urp_ep_query_link(struct urp_endpoint *ep)
+{
+	struct ib_port_attr pa = {};
+	struct rdma_cm_id *id = NULL;
+	u32 i;
+
+	if (!ep->ib_dev)
+		return;
+	for (i = 0; i < ep->num_qps; i++) {
+		if (ep->qps[i].cm_id) {
+			id = ep->qps[i].cm_id;
+			break;
+		}
+	}
+	if (!id)
+		return;
+	if (ib_query_port(ep->ib_dev, id->port_num, &pa) == 0)
+		ep->link_mbps = urp_link_speed_mbps(pa.active_speed,
+						    pa.active_width);
+}
+
+/*
  * Free the chunk backing (pages + SGE array) of one buffer. Safe to call on a
  * partially-allocated buffer (NULL entries are skipped) and idempotent.
  */
@@ -1364,10 +1418,15 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 				ep->window_negotiated = urp_window_negotiate(
 					READ_ONCE(urp_window_bytes_advertise) != 0,
 					ep->qps[ctx->qp_index].peer_supports_window);
+				/* Cache link rate now (all QPs up) for BDP
+				 * window sizing at stream create (design 35).
+				 */
+				urp_ep_query_link(ep);
 				complete(&ep->cm_done);
-				pr_info("all %u QPs established (window=%s)\n",
+				pr_info("all %u QPs established (window=%s link=%u Mb/s)\n",
 					ep->num_qps,
-					ep->window_negotiated ? "on" : "off");
+					ep->window_negotiated ? "on" : "off",
+					ep->link_mbps);
 			}
 		}
 		break;
