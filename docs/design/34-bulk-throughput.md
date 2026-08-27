@@ -111,7 +111,12 @@ is worth pulling forward: an **asymmetric send/recv pool split** — the static
   is `num_bufs × buf_size` (8192 × 64 KB = **512 MB/endpoint**) — choose
   deliberately. `buffer_size=65536` → order-4 compound pages in the page_pool;
   high-order allocs can fail under fragmentation (already fails activation
-  cleanly).
+  cleanly). **Resolved (2026-08-26): the multi-SGE chunked-buffer path (design
+  37 Lever #3 / "path Y", PRs #67+#68) removes this dependency** — a frame ≥ ~64
+  KiB is now gathered from ≤`max_sge` reliably-allocatable 64 KiB chunks instead
+  of one high-order compound page, so 1 MiB slots provision with no order-8 alloc
+  (HW-validated: reassembled 100 %, reorder_drops 0). `buffer_size` still means
+  the logical frame; a slot ≤ 64 KiB stays a single chunk (unchanged).
 - **Interactions:** no protocol change; bigger frames make the existing
   256-frame reorder window cover far more bytes (a free win).
 
