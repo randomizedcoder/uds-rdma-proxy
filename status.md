@@ -1,14 +1,20 @@
 # Project Status
 
-_Last updated: 2026-08-23_
+_Last updated: 2026-08-26_
 
 ## Current state
 
-`main` is current through **PR #58**. The core thesis — UDS traffic tunneled
+`main` is current through **PR #71**. The core thesis — UDS traffic tunneled
 over RoCEv2 through an in-kernel module with no application changes — is fully
 delivered and **proven on real ConnectX-4 Lx 25GbE hardware** (not just soft-RoCE):
 a real Redpanda produce/consume round-trip and a **128/128 `BENCH_OK`
 `verify=full`** benchmark matrix both ride the tunnel end-to-end.
+
+The performance thesis is now also met: **one `urp` stream beats one TCP stream**,
+and on the *transparent* copy path (no app changes) a single in-order stream now
+reaches **~98% of 25 GbE line at 1 MiB** (3056 MB/s) — matching the zero-copy
+fast path — after jumbo MTU, large multi-SGE frames, BDP-adaptive windowing, and
+the in-order RX copy-elision bypass (design 37).
 
 Since the kernel-module plan (Phases 0–5) completed, work has been organised by
 numbered design doc rather than the original linear phase plan. The major
@@ -26,6 +32,14 @@ Highlights:
   REGISTER → `fast` endpoint kind → async SEND → zero-copy RECV, plus a
   `uring-cmd` bench backend and measured copy-vs-zero-copy numbers. PR1–PR5b
   merged and hardware-validated.
+- **Beat-TCP single-stream throughput (design 37)** — jumbo MTU 9700 + large
+  frames (`buffer_size`→1 MiB, gathered from page-sized chunks via multi-SGE
+  "path Y", no high-order alloc) + **BDP-adaptive per-stream windows** (link×RTT,
+  self-sizing 25→800 GbE) + the **in-order RX copy-elision bypass** (RX payload
+  copies 5→1). Result on hp1↔hp3: transparent copy path **1 MiB 1079→3056 MB/s
+  (97.8% line)**, all sizes 65 KiB–1 MiB 93–98% line, drops 0 — now tracking the
+  zero-copy path for one in-order stream. `.#urp-f2-matrix` shows the zero-copy
+  path is additive to **98% line at N=8**.
 - **Connection bring-up & recovery (design 33)** — bounded connect-retry with
   capped backoff, reconnect-on-drop, silent-drop probe→retry, and lazy
   connect-on-first-accept; all hardware-verified. A userland gRPC rendezvous
@@ -60,9 +74,9 @@ Highlights:
 | 32 | Real-hardware RoCEv2 integration | ✅ Matrix 128/128; extra probes + Results-caveat flip pending |
 | 33 | Initiator connection bring-up & recovery | 🟢 Phases 0–2 hardware-verified; Phase 3 (gRPC) code-complete, cold-boot verify pending |
 | 34 | Bulk throughput | ✅ Measured on hardware; copy-vs-zero-copy captured |
-| 35 | Windowing / flow control | 🟢 Phase 1 (pump completion waitqueue) merged; further windowing spec'd |
+| 35 | Windowing / flow control | ✅ Pump completion waitqueue + **byte-window flow control** (blocking per-stream sender gate, cumulative-absolute `CREDIT-BYTES` grants, capability-negotiated) built + HW-validated (9/9 GREEN); **BDP-adaptive window sizing** (link×RTT, MAX→1 GiB, scales 25→800 GbE) merged (PR #70) |
 | 36 | CUBIC congestion control | 📝 Design-only, LATER (fabric near-lossless, path is pump-bound) |
-| 37 | High-throughput cluster data plane (beat TCP per stream) | 🟢 Jumbo MTU 9700 + `buffer_size` cap→1 MiB landed; single-stream jumbo: copy 1913 MB/s @256K (103% of TCP), fast 3050 MB/s @512K (97.6% line). Interruptible fast REGISTER HW-validated. F2 measured (`.#urp-f2-matrix` + `.#urp-fast-f2-matrix`): copy path **membw-capped ~1900 MB/s, NOT additive** (flat N=1→4); **zero-copy path IS additive → 3066 MB/s = 98% line at N=8**. Option B **measured-justified** (2 KiB post-bound at 423k fps, ~0.56 core). **Multi-SGE chunked buffers (path Y) built + HW-validated** (PRs #67+#68): 1 MiB frame from 16×64 KiB chunks, reassembled 100%/reorder_drops 0, no order-8 alloc; single-chunk path unchanged (1943 MB/s). **In-order RX copy-elision bypass built + HW-validated (2026-08-26)**: `seq==next_expected` delivered straight from recv chunks via multi-kvec `sendmsg` (`urp_rx_send_uds_sg` + `urp_reorder_advance`), RX copies 5→1; **copy path 1 MiB 1079→3056 MB/s = 97.8% line** (blows past the ~1900 membw "ceiling", now tracks the fast path for a single in-order stream), all sizes 65 KiB–1 MiB 93–98% line, drops 0; reorder-matrix 9/9 verify=full PASS (qps 1/4/8); out-of-order path unchanged, app-transparent, no wire change |
+| 37 | High-throughput cluster data plane (beat TCP per stream) | ✅ **Thesis met: one `urp` stream beats one TCP stream on both paths.** Jumbo MTU 9700 + `buffer_size` cap→1 MiB landed; single-stream jumbo: fast 3050 MB/s @512K (97.6% line), copy path now **3056 MB/s @1 MiB (97.8% line)** after the copy-elision bypass (was 1913 @256K pre-bypass, 103% of TCP). Interruptible fast REGISTER HW-validated. F2 measured (`.#urp-f2-matrix` + `.#urp-fast-f2-matrix`): copy path **membw-capped ~1900 MB/s, NOT additive** (flat N=1→4); **zero-copy path IS additive → 3066 MB/s = 98% line at N=8**. Option B **measured-justified** (2 KiB post-bound at 423k fps, ~0.56 core). **Multi-SGE chunked buffers (path Y) built + HW-validated** (PRs #67+#68): 1 MiB frame from 16×64 KiB chunks, reassembled 100%/reorder_drops 0, no order-8 alloc; single-chunk path unchanged (1943 MB/s). **In-order RX copy-elision bypass built + HW-validated (2026-08-26)**: `seq==next_expected` delivered straight from recv chunks via multi-kvec `sendmsg` (`urp_rx_send_uds_sg` + `urp_reorder_advance`), RX copies 5→1; **copy path 1 MiB 1079→3056 MB/s = 97.8% line** (blows past the ~1900 membw "ceiling", now tracks the fast path for a single in-order stream), all sizes 65 KiB–1 MiB 93–98% line, drops 0; reorder-matrix 9/9 verify=full PASS (qps 1/4/8); out-of-order path unchanged, app-transparent, no wire change |
 
 ## Redpanda over UDS-over-RDMA
 
