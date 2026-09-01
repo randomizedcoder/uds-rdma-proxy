@@ -102,6 +102,16 @@
         # Multi-QP reorder validation (status.md gap #1): sweep num_qps, assert
         # reorder-insertions>0 + byte-exact delivery. `nix run .#urp-reorder-matrix`.
         urpReorderMatrix = import ./nix/urp-reorder-matrix.nix { inherit pkgs; };
+        # 3-node full-mesh concurrency (design 32 mesh extension): the new "2-way"
+        # regime — a node serving/driving two RDMA sessions on its two ports to two
+        # peers at once. per-edge / hub-rx / hub-tx / ring / all2all scenarios.
+        # `nix run .#urp-mesh-matrix -- hp1 hp2 hp3`.
+        urpMeshMatrix = import ./nix/urp-mesh-matrix.nix { inherit pkgs; };
+        # Long-duration (default 8h) soak of the mesh benchmark: loops a scenario,
+        # samples per-host kernel slab / MemAvailable / endpoint count / dmesg
+        # faults each iteration, and prints a leak + perf-drift verdict.
+        # `nix run .#urp-mesh-soak -- hp1 hp2 hp3`.
+        urpMeshSoak = import ./nix/urp-mesh-soak.nix { inherit pkgs; };
         # Zero-copy fast-path twins of the two matrices above (design 31 PR5b):
         # dedicated `--kind fast` endpoint pair, `urp-bench --mode uring-cmd`.
         #   .#urp-fast-bw-matrix (goodput), .#urp-fast-hw-matrix (RTT).
@@ -249,6 +259,12 @@
           # Multi-QP reorder validation over RoCEv2 (status gap #1; needs boxes):
           #   nix run .#urp-reorder-matrix -- <acceptor> <initiator> <acceptor-ip>
           urp-reorder-matrix = urpReorderMatrix;
+          # 3-node full-mesh concurrency / 2-way regime (design 32 mesh; needs boxes):
+          #   nix run .#urp-mesh-matrix -- [h1 h2 h3]   (default hp1 hp2 hp3)
+          urp-mesh-matrix = urpMeshMatrix;
+          # Long-duration soak of the mesh benchmark (leak + perf-drift; needs boxes):
+          #   SOAK_SECONDS=28800 nix run .#urp-mesh-soak -- [h1 h2 h3]
+          urp-mesh-soak = urpMeshSoak;
           # Zero-copy fast-path twins (design 31 PR5b; needs the boxes):
           #   nix run .#urp-fast-bw-matrix -- <acceptor> <initiator> <acceptor-ip>
           #   nix run .#urp-fast-hw-matrix -- <acceptor> <initiator> <acceptor-ip>

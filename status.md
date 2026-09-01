@@ -40,6 +40,15 @@ Highlights:
   (97.8% line)**, all sizes 65 KiB–1 MiB 93–98% line, drops 0 — now tracking the
   zero-copy path for one in-order stream. `.#urp-f2-matrix` shows the zero-copy
   path is additive to **98% line at N=8**.
+- **3-node full mesh (design 38)** — testbed grew hp1↔hp3 pair → **hp1/hp2/hp3
+  full mesh** (each node cabled to both others; node-pair /29 IPs, all 7.2.0 +
+  jumbo). New `.#urp-mesh-matrix` drives the **2-way regime** (a node serving two
+  RDMA sessions on its two ports at once). All edges 9/9 reorder-green
+  (`verify=full`); concurrent load reveals a **per-node ~3.7–3.9 GB/s copy-path
+  ceiling** shared across a node's flows (mesh aggregate ~5.5 GB/s, node-bound
+  not fabric-bound) and an **intermittent startup fairness latch** (one flow
+  starves ~5 MB/s ~1/3 of all2all runs, drops=0, clears on rerun — open
+  follow-up). Full results in `docs/design/38-three-node-mesh-benchmarking.md`.
 - **Connection bring-up & recovery (design 33)** — bounded connect-retry with
   capped backoff, reconnect-on-drop, silent-drop probe→retry, and lazy
   connect-on-first-accept; all hardware-verified. A userland gRPC rendezvous
