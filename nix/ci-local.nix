@@ -3,7 +3,8 @@
 #
 # ci.yml has two jobs; this target reproduces both faithfully:
 #
-#   nix-checks   -- 12 pure `nix build` targets (shared-crate tests, urp-cli,
+#   nix-checks   -- the pure `nix build` targets (shared-crate tests, urp-cli,
+#                   the urp-exporter binary + its tests,
 #                   the two urp-bench cores, the urp-netlink lib tests, the
 #                   urp-control control-plane tests, the urp-fast validators,
 #                   and the 4-kernel module matrix). Here
@@ -22,7 +23,7 @@
 #
 # Must be run from the repo root: the reproducer replay reads
 # ./fuzz/regressions/<target>/ from the working tree, just as the CI job does.
-{ pkgs, checks, urpCli, fuzz }:
+{ pkgs, checks, urpCli, urpExporter, fuzz }:
 
 let
   # The twelve build targets of the ci.yml `nix-checks` job, in the same order.
@@ -34,6 +35,8 @@ let
     { name = "urp-bench-rs-tests"; drv = checks.urp-bench-rs-tests; }
     { name = "urp-netlink-tests"; drv = checks.urp-netlink-tests; }
     { name = "urp-control-tests"; drv = checks.urp-control-tests; }
+    { name = "urp-exporter"; drv = urpExporter; }
+    { name = "urp-exporter-tests"; drv = checks.urp-exporter-tests; }
     { name = "urp-fast-validate-units"; drv = checks.urp-fast-validate-units; }
     { name = "urp-reorder-units"; drv = checks.urp-reorder-units; }
     { name = "urp-conn-slot-units"; drv = checks.urp-conn-slot-units; }
@@ -49,6 +52,9 @@ let
   reportLines =
     pkgs.lib.concatMapStringsSep "\n"
       (t: "    echo '  ok  ${t.name}  ->  ${t.drv}'") buildTargets;
+
+  # Derived so the banner count never drifts from the list above.
+  nTargets = toString (builtins.length buildTargets);
 
   fuzzClassify = "${fuzz.fuzz-classify}/bin/fuzz-classify";
   fuzzRxSeq = "${fuzz.fuzz-rx-seq}/bin/fuzz-rx-seq";
@@ -73,10 +79,10 @@ pkgs.writeShellApplication {
       fi
     }
 
-    echo '======== job: nix-checks (12 build targets) ========'
+    echo '======== job: nix-checks (${nTargets} build targets) ========'
     echo 'All build targets below were realised as dependencies of this app:'
 ${reportLines}
-    echo 'nix-checks: 12/12 build targets realised (reaching here means they built).'
+    echo 'nix-checks: ${nTargets}/${nTargets} build targets realised (reaching here means they built).'
 
     echo
     echo '======== job: fuzz-smoke ========'
@@ -111,7 +117,7 @@ ${reportLines}
 
     echo
     echo '======== LOCAL CI SUMMARY ========'
-    echo "nix-checks: 12/12 build targets green"
+    echo "nix-checks: ${nTargets}/${nTargets} build targets green"
     printf 'fuzz-smoke: PASS=%d FAIL=%d\n' "$pass" "$fail"
     if [ "$fail" -ne 0 ]; then
       printf 'FAILED:%s\n' "$failed"

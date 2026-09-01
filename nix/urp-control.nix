@@ -27,6 +27,7 @@ let
         baseName == "urp-cli" ||
         baseName == "urp-control" ||
         baseName == "urp-netlink" ||
+        baseName == "urp-exporter" ||
         baseName == "src" ||
         baseName == "commands" ||
         baseName == "tests"

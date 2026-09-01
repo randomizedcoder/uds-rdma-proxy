@@ -1,0 +1,31 @@
+# urp-exporter -- a lightweight Prometheus exporter for the urp kernel module
+# (design 39). Scrapes the generic-netlink counter surface via urp-netlink and
+# serves /metrics from a single blocking thread. Deliberately dependency-light:
+# no async runtime, no HTTP framework, no serde in this crate's own deps -- the
+# HTTP responder and the Prometheus exposition text are both hand-rolled, and
+# the whole binary inherits the workspace's opt-level="z" release profile
+# (design 39 §39.3). The io-uring feature is declared here but inert until PR4.
+[package]
+name = "urp-exporter"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[[bin]]
+name = "urp-exporter"
+path = "src/main.rs"
+
+[lib]
+name = "urp_exporter"
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"
+urp-netlink = { path = "../urp-netlink" }
+io-uring = { version = "0.7", optional = true }
+
+[features]
+default = []
+# PR4: batch the N verbose GETs through a single io_uring submit/reap. Declared
+# now so the wiring exists; the code path lands (and is benchmark-gated) later.
+io-uring = ["dep:io-uring"]

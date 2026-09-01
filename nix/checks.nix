@@ -25,6 +25,7 @@ let
         baseName == "urp-cli" ||
         baseName == "urp-netlink" ||
         baseName == "urp-control" ||
+        baseName == "urp-exporter" ||
         baseName == "src" ||
         baseName == "commands" ||
         baseName == "tests"
@@ -194,6 +195,29 @@ in
 
     cargoBuildFlags = [ "-p" "urp-netlink" "-p" "urp-cli" ];
     cargoTestFlags  = [ "-p" "urp-netlink" "-p" "urp-cli" ];
+
+    installPhase = ''
+      runHook preInstall
+      mkdir -p $out
+      touch $out/passed
+      runHook postInstall
+    '';
+  };
+
+  # urp-exporter unit tests (design 39): the table-driven render / HTTP-route /
+  # cardinality-cap / cache-gate / arg-parse truth tables. The exporter is
+  # dependency-light (libc + urp-netlink), so this runs fully sandboxed with no
+  # module, socket, or hardware.
+  urp-exporter-tests = pkgs.rustPlatform.buildRustPackage {
+    pname = "urp-exporter-tests";
+    version = "0.1.0";
+    inherit src;
+
+    cargoLock.lockFile = ../Cargo.lock;
+    nativeBuildInputs = [ rustToolchain ];
+
+    cargoBuildFlags = [ "-p" "urp-exporter" ];
+    cargoTestFlags  = [ "-p" "urp-exporter" ];
 
     installPhase = ''
       runHook preInstall
