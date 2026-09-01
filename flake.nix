@@ -122,6 +122,7 @@
           inherit pkgs fuzz;
           checks = nixChecks;
           urpCli = urpCli;
+          urpExporter = urpExporter;
         };
         fuzzRust = import ./nix/fuzz-rust.nix {
           inherit pkgs;
@@ -134,6 +135,11 @@
         };
 
         urpControl = import ./nix/urp-control.nix {
+          inherit pkgs;
+          inherit (packages) rustToolchain;
+        };
+
+        urpExporter = import ./nix/urp-exporter.nix {
           inherit pkgs;
           inherit (packages) rustToolchain;
         };
@@ -225,7 +231,7 @@
         checks = {
           inherit (nixChecks)
             protocol-tests urp-bench-units urp-bench-rs-tests
-            urp-netlink-tests urp-control-tests
+            urp-netlink-tests urp-control-tests urp-exporter-tests
             urp-fast-validate-units urp-reorder-units urp-conn-slot-units urp-window-units
             kernel-module-build
             urp-ko-6_1 urp-ko-6_6 urp-ko-6_12;
@@ -238,6 +244,8 @@
           inherit (nixChecks) urp-ko-6_1 urp-ko-6_6 urp-ko-6_12;
           urp-cli = urpCli;
           urp-control = urpControl;
+          # Prometheus metrics exporter (design 39): `nix run .#urp-exporter`
+          urp-exporter = urpExporter;
           urp-protocol-ffi = urpProtocolFfi;
           # io_uring UDS benchmark (design 30): `nix run .#urp-bench-local`
           urp-bench-c = urpBenchC;

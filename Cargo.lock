@@ -1343,6 +1343,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "urp-exporter"
+version = "0.1.0"
+dependencies = [
+ "io-uring",
+ "libc",
+ "urp-netlink",
+]
+
+[[package]]
 name = "urp-netlink"
 version = "0.1.0"
 dependencies = [

@@ -6,6 +6,7 @@ members = [
     "crates/urp-bench",
     "crates/urp-cli",
     "crates/urp-control",
+    "crates/urp-exporter",
     "crates/urp-netlink",
 ]
 
