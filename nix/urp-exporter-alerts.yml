@@ -1,0 +1,116 @@
+# Prometheus alert rules for the urp exporter (design 39 §39.9).
+#
+# These map the kernel module's error counters -- exposed by urp-exporter -- to
+# alerts. The testbed's standing invariant is drops=0 everywhere (design 38),
+# so reorder drops are CRITICAL; pool/PSK problems are warnings; credit stalls
+# are informational backpressure signal.
+#
+# Load into Prometheus via `rule_files: [ "urp-exporter-alerts.yml" ]`. Assumes
+# the exporter is scraped under a job labelled `job="urp"` (adjust the
+# URPExporterDown selector if you name the scrape job differently).
+groups:
+  - name: urp-exporter
+    rules:
+      # --- Loss: the invariant the whole testbed gates on. ---
+      - alert: URPReorderDrops
+        expr: rate(urp_endpoint_reorder_drops_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "urp endpoint {{ $labels.endpoint }} is dropping reordered frames"
+          description: >-
+            reorder_drops is increasing on endpoint {{ $labels.endpoint }}
+            ({{ printf "%.2f" $value }}/s). The fabric is expected lossless and
+            the testbed gates on drops=0 everywhere -- investigate reorder-window
+            depth, credit stalls, or fabric loss.
+
+      # --- Pool exhaustion. ---
+      - alert: URPBufferAllocFails
+        expr: rate(urp_endpoint_buffer_alloc_fails_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "urp endpoint {{ $labels.endpoint }} failing buffer allocations"
+          description: >-
+            buffer_alloc_fails is increasing on {{ $labels.endpoint }}
+            ({{ printf "%.2f" $value }}/s) -- the recv buffer pool is exhausted.
+            Raise buffer_count or lower the offered window.
+
+      # --- Security / PSK. ---
+      - alert: URPAuthFailures
+        expr: rate(urp_endpoint_auth_failures_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "urp endpoint {{ $labels.endpoint }} rejecting authentication"
+          description: >-
+            auth_failures is increasing on {{ $labels.endpoint }}
+            ({{ printf "%.2f" $value }}/s) -- PSK mismatch or an unauthorized
+            peer is dialing.
+
+      # --- Flow-control backpressure (informational). ---
+      - alert: URPCreditStallsHigh
+        expr: rate(urp_endpoint_credit_stalls_total[1m]) > 100
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "urp endpoint {{ $labels.endpoint }} stalling on credits"
+          description: >-
+            credit_stalls is sustained high on {{ $labels.endpoint }}
+            ({{ printf "%.0f" $value }}/s) -- the sender is frequently blocked on
+            the byte window. Expected under saturation; alarming only if paired
+            with lost goodput.
+
+      # --- Liveness: endpoint fell out of the active state. ---
+      - alert: URPEndpointNotActive
+        expr: max_over_time(urp_endpoint_state{state="active"}[1m]) == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "urp endpoint {{ $labels.endpoint }} is not active"
+          description: >-
+            endpoint {{ $labels.endpoint }} has not reported state=active for
+            over a minute (creating/draining/stopped) -- the data path is down.
+
+      # --- Per-QP health. ---
+      - alert: URPQpUnhealthy
+        expr: urp_qp_state{state="active"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "urp QP {{ $labels.endpoint }}/{{ $labels.qp }} not active"
+          description: >-
+            QP {{ $labels.qp }} on endpoint {{ $labels.endpoint }} is not in the
+            active state -- a queue pair failed to qualify or was removed.
+
+      # --- Exporter / scrape liveness. ---
+      - alert: URPExporterDown
+        expr: up{job="urp"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "urp exporter is not being scraped"
+          description: >-
+            Prometheus cannot scrape the urp exporter on {{ $labels.instance }}.
+            Note urp_up=0 (exporter reachable but the module/genl socket is
+            absent) is distinct from up=0 (exporter process/host unreachable).
+
+      # --- Module present but socket gone: exporter up, scrape empty. ---
+      - alert: URPModuleAbsent
+        expr: urp_up == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "urp exporter reachable but the kernel module is absent"
+          description: >-
+            urp_up=0 on {{ $labels.instance }} -- the exporter is serving but the
+            urp generic-netlink family is missing (module unloaded or failed to
+            load). No endpoint metrics are being produced.

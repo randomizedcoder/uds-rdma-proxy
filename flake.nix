@@ -336,6 +336,7 @@
       # through `self`, so a host that pins this flake gets urp.ko built against
       # its own kernel plus declarative endpoints.
       nixosModules.urp = import ./nix/nixos-module.nix { inherit self; };
+      nixosModules.urp-exporter = import ./nix/nixos-exporter-module.nix { inherit self; };
       nixosModules.default = self.nixosModules.urp;
     };
 }
