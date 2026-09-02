@@ -18,6 +18,13 @@ path = "../crates/uds-rdma-protocol"
 [dependencies.urp-bench]
 path = "../crates/urp-bench"
 
+# design 39 §39.6: exporter HTTP parser + netlink-reply decoder fuzz targets.
+[dependencies.urp-exporter]
+path = "../crates/urp-exporter"
+
+[dependencies.urp-netlink]
+path = "../crates/urp-netlink"
+
 [build-dependencies]
 cc = "1"
 
@@ -54,6 +61,16 @@ doc = false
 [[bin]]
 name = "bench_differential"
 path = "fuzz_targets/bench_differential.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_http_request"
+path = "fuzz_targets/fuzz_http_request.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_netlink_reply"
+path = "fuzz_targets/fuzz_netlink_reply.rs"
 doc = false
 
 [workspace]

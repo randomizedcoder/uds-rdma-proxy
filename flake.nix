@@ -27,9 +27,18 @@
     # Note: this is a heavy input (fetches the redpanda repo); it is only built
     # by `.#test-redpanda-uds` and is kept out of `checks`/CI.
     redpanda.url = "github:randomizedcoder/redpanda/d4b44629a5a8d06c4559e941428fd0249a5be643";
+
+    # RustSec advisory database for cargo-audit (design 39 §39.6). flake=false
+    # so we get the raw tree; the audit derivation runs `cargo audit --no-fetch
+    # --db ${advisory-db}` hermetically (the sandbox has no network). Advisory-
+    # only, never fails the build, manual-run like the rest of the analysis tier.
+    advisory-db = {
+      url = "github:rustsec/advisory-db";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs, rust-overlay, flake-utils, microvm, redpanda }:
+  outputs = { self, nixpkgs, rust-overlay, flake-utils, microvm, redpanda, advisory-db }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
@@ -52,7 +61,7 @@
         # derivations, manual-run only -- deliberately NOT in checks/CI.
         # See nix/analysis/default.nix. Usage: nix build .#analysis-all -L
         analysis = import ./nix/analysis {
-          inherit pkgs lib;
+          inherit pkgs lib advisory-db;
           inherit (packages) rustToolchain;
           inherit (nixChecks) src;
         };
@@ -142,6 +151,18 @@
         urpExporter = import ./nix/urp-exporter.nix {
           inherit pkgs;
           inherit (packages) rustToolchain;
+        };
+
+        # `mock`-featured exporter build (serves a synthetic fleet, no netlink)
+        # + the stress/soak runner that drives it (design 39 PR3, no hardware).
+        #   nix run .#urp-exporter-stress
+        urpExporterMock = import ./nix/urp-exporter.nix {
+          inherit pkgs;
+          inherit (packages) rustToolchain;
+          features = [ "mock" ];
+        };
+        urpExporterStress = import ./nix/urp-exporter-stress.nix {
+          inherit pkgs urpExporterMock;
         };
 
         # Phase 3a: FFI staticlib for the optional Rust-backed reorder
@@ -246,6 +267,9 @@
           urp-control = urpControl;
           # Prometheus metrics exporter (design 39): `nix run .#urp-exporter`
           urp-exporter = urpExporter;
+          # Exporter stress/soak against a synthetic fleet (design 39 PR3; no
+          # hardware): `nix run .#urp-exporter-stress`.
+          urp-exporter-stress = urpExporterStress;
           urp-protocol-ffi = urpProtocolFfi;
           # io_uring UDS benchmark (design 30): `nix run .#urp-bench-local`
           urp-bench-c = urpBenchC;
@@ -294,7 +318,7 @@
           inherit (analysis)
             analysis-sparse analysis-smatch analysis-checkpatch
             analysis-w1 analysis-w2 analysis-coccicheck
-            analysis-clippy analysis-rustfmt
+            analysis-clippy analysis-rustfmt analysis-rust-audit
             analysis-clang-tidy analysis-cppcheck analysis-all;
           # Userspace C fuzzers (manual): nix run .#fuzz-classify
           # Live-kernel fuzzers (baked into the pair-test rootfs; exposed here
