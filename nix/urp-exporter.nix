@@ -10,7 +10,7 @@
 # for the Phase 5 cross-arch builds where `pkgs` is a pkgsCross.<arch> set --
 # the derivation falls back to `pkgs.rustPlatform`. urp-exporter is
 # edition-2021 with no nightly features, so stable builds it fine.
-{ pkgs, rustToolchain ? null }:
+{ pkgs, rustToolchain ? null, features ? [ ] }:
 
 let
   src = builtins.path {
@@ -61,8 +61,12 @@ pkgs.rustPlatform.buildRustPackage {
 
   cargoLock.lockFile = ../Cargo.lock;
 
-  cargoBuildFlags = [ "-p" "urp-exporter" ];
-  cargoTestFlags  = [ "-p" "urp-exporter" ];
+  # `features` (default none) selects cargo features -- the stress runner passes
+  # [ "mock" ] to get the synthetic-fleet build (design 39 PR3).
+  cargoBuildFlags = [ "-p" "urp-exporter" ]
+    ++ pkgs.lib.optionals (features != [ ]) [ "--features" (pkgs.lib.concatStringsSep "," features) ];
+  cargoTestFlags  = [ "-p" "urp-exporter" ]
+    ++ pkgs.lib.optionals (features != [ ]) [ "--features" (pkgs.lib.concatStringsSep "," features) ];
 
   # Cross builds run the tests under an emulator they may not have, so skip the
   # check phase when cross-compiling (rustToolchain == null).

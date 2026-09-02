@@ -107,11 +107,32 @@ pub fn select_within_cap(counts: &[usize], max: usize) -> (usize, u64) {
 /// number of sample lines the `--max-series` cap dropped this render, which the
 /// caller folds into `SelfStats::series_capped`.
 pub fn render_into(buf: &mut String, eps: &[Endpoint], cfg: &Config, s: &SelfStats) -> u64 {
+    // Convenience wrapper for tests/one-shot callers: allocates a throwaway
+    // scratch. The serve loop uses `render_into_scratch` with a reused scratch
+    // so a steady-state render allocates nothing (design 39 §39.8a).
+    let mut scratch = Vec::new();
+    render_into_scratch(buf, &mut scratch, eps, cfg, s)
+}
+
+/// Same as [`render_into`] but takes a caller-owned `counts` scratch `Vec` so a
+/// warm call (buffer + scratch already at capacity) performs **zero** heap
+/// allocations. This is the hot path the `Exporter` drives; the alloc bench
+/// asserts 0 allocs/render against it (design 39 §39.8a).
+pub fn render_into_scratch(
+    buf: &mut String,
+    counts: &mut Vec<usize>,
+    eps: &[Endpoint],
+    cfg: &Config,
+    s: &SelfStats,
+) -> u64 {
     buf.clear();
 
     // Cardinality cap: pick the prefix of endpoints that fits under max_series.
-    let counts: Vec<usize> = eps.iter().map(|e| endpoint_series_count(e, cfg)).collect();
-    let (included, capped_now) = select_within_cap(&counts, cfg.max_series);
+    // Reuse the caller's scratch (cleared, capacity retained) so this is
+    // alloc-free once warm.
+    counts.clear();
+    counts.extend(eps.iter().map(|e| endpoint_series_count(e, cfg)));
+    let (included, capped_now) = select_within_cap(counts, cfg.max_series);
     let eps = &eps[..included];
     if capped_now > 0 {
         let _ = writeln!(
@@ -766,5 +787,75 @@ mod tests {
             ),
             "{b}"
         );
+    }
+
+    // design 39 §39.8a: a WARM render (buffer + scratch already at capacity)
+    // must perform ZERO heap allocations -- the CPU-cost budget depends on the
+    // hot path not churning the allocator. Measured via the crate's test-only
+    // counting global allocator, bracketing exactly one render_into_scratch.
+    #[test]
+    fn render_is_zero_alloc_when_warm() {
+        // per_stream on so every metric family is exercised in the hot path.
+        let cfg = Config {
+            per_stream: true,
+            ..Config::default()
+        };
+        let fleet = crate::mock::synthetic_fleet(8, 8, 4);
+        let mut buf = String::with_capacity(64 * 1024);
+        let mut scratch: Vec<usize> = Vec::with_capacity(64);
+        let stats = SelfStats::default();
+
+        // Warm up: grow buf + scratch to steady-state capacity.
+        for _ in 0..4 {
+            render_into_scratch(&mut buf, &mut scratch, &fleet, &cfg, &stats);
+        }
+        let len_warm = buf.len();
+
+        // Measured region: exactly one render, bracketed by the alloc counter.
+        let before = crate::alloc_count();
+        let _ = render_into_scratch(&mut buf, &mut scratch, &fleet, &cfg, &stats);
+        let after = crate::alloc_count();
+
+        assert_eq!(
+            after - before,
+            0,
+            "warm render_into_scratch allocated {} time(s); hot path must be zero-alloc",
+            after - before
+        );
+        // Sanity: deterministic output, so the warm render reproduced the size.
+        assert_eq!(buf.len(), len_warm, "render is non-deterministic in size");
+    }
+
+    // ns/render should scale ~linearly with fleet size; assert the cheap,
+    // non-flaky proxy (output grows monotonically with N) and print timings for
+    // the human reader (`cargo test -- --nocapture`).
+    #[test]
+    fn render_scales_with_fleet() {
+        let cfg = Config {
+            per_stream: true,
+            ..Config::default()
+        };
+        let stats = SelfStats::default();
+        let mut buf = String::with_capacity(256 * 1024);
+        let mut scratch: Vec<usize> = Vec::with_capacity(256);
+        let mut last_len = 0usize;
+        for &n in &[1usize, 4, 16, 64] {
+            let fleet = crate::mock::synthetic_fleet(n, 8, 4);
+            // warm
+            render_into_scratch(&mut buf, &mut scratch, &fleet, &cfg, &stats);
+            let start = std::time::Instant::now();
+            let iters = 200;
+            for _ in 0..iters {
+                render_into_scratch(&mut buf, &mut scratch, &fleet, &cfg, &stats);
+            }
+            let ns = start.elapsed().as_nanos() / iters;
+            eprintln!("render N={n:>3} -> {} bytes, {ns} ns/render", buf.len());
+            assert!(
+                buf.len() > last_len,
+                "output did not grow from N<{n} ({} <= {last_len})",
+                buf.len()
+            );
+            last_len = buf.len();
+        }
     }
 }

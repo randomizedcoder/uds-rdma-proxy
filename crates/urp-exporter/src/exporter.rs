@@ -32,9 +32,17 @@ pub struct Exporter {
     sock: Option<UrpSocket>,
     /// The last rendered `/metrics` document, reused across scrapes.
     buf: String,
+    /// Reused cardinality-cap scratch so a warm render allocates nothing
+    /// (design 39 §39.8a); paired with `buf` in `render_into_scratch`.
+    counts: Vec<usize>,
     /// When the buffer was last (re)rendered.
     last_render: Option<Instant>,
     stats: SelfStats,
+    /// Test/stress double: when set (only reachable under the `mock` feature),
+    /// scrapes serve this synthetic fleet instead of touching netlink, so the
+    /// render + HTTP hot path is drivable with no kernel module (design 39 PR3).
+    #[cfg(feature = "mock")]
+    mock_fleet: Option<Vec<urp_netlink::Endpoint>>,
 }
 
 impl Exporter {
@@ -43,9 +51,22 @@ impl Exporter {
             cfg,
             sock: None,
             buf: String::with_capacity(64 * 1024),
+            counts: Vec::with_capacity(64),
             last_render: None,
             stats: SelfStats::default(),
+            #[cfg(feature = "mock")]
+            mock_fleet: None,
         }
+    }
+
+    /// Construct an exporter that serves a fixed synthetic fleet (no netlink).
+    /// Only available under the `mock` feature -- used by the stress runner and
+    /// dashboard demos (design 39 PR3).
+    #[cfg(feature = "mock")]
+    pub fn new_mock(cfg: Config, fleet: Vec<urp_netlink::Endpoint>) -> Exporter {
+        let mut e = Exporter::new(cfg);
+        e.mock_fleet = Some(fleet);
+        e
     }
 
     /// Bind and serve forever. One connection handled at a time (Prometheus
@@ -88,6 +109,26 @@ impl Exporter {
     /// A netlink failure renders a minimal `urp_up 0` document rather than
     /// erroring the connection.
     fn scrape_and_render(&mut self) {
+        // Mock source (feature `mock` only): render the synthetic fleet with no
+        // socket. Fields are borrowed disjointly, so no aliasing conflict.
+        #[cfg(feature = "mock")]
+        if let Some(fleet) = self.mock_fleet.as_ref() {
+            let start = Instant::now();
+            self.stats.up = true;
+            self.stats.netlink_requests = 0;
+            self.stats.endpoints = fleet.len();
+            let capped = render::render_into_scratch(
+                &mut self.buf,
+                &mut self.counts,
+                fleet,
+                &self.cfg,
+                &self.stats,
+            );
+            self.stats.series_capped += capped;
+            self.stats.scrape_duration_seconds = start.elapsed().as_secs_f64();
+            return;
+        }
+
         // Lazily (re)connect; drop a dead socket so the next scrape retries.
         if self.sock.is_none() {
             match UrpSocket::connect() {
@@ -112,8 +153,13 @@ impl Exporter {
                 self.stats.scrape_duration_seconds = start.elapsed().as_secs_f64();
                 self.stats.netlink_requests = r.netlink_requests;
                 self.stats.endpoints = r.endpoints.len();
-                let capped =
-                    render::render_into(&mut self.buf, &r.endpoints, &self.cfg, &self.stats);
+                let capped = render::render_into_scratch(
+                    &mut self.buf,
+                    &mut self.counts,
+                    &r.endpoints,
+                    &self.cfg,
+                    &self.stats,
+                );
                 self.stats.series_capped += capped;
             }
             Err(e) => {
@@ -131,7 +177,7 @@ impl Exporter {
     fn render_down(&mut self) {
         self.stats.up = false;
         self.stats.endpoints = 0;
-        render::render_into(&mut self.buf, &[], &self.cfg, &self.stats);
+        render::render_into_scratch(&mut self.buf, &mut self.counts, &[], &self.cfg, &self.stats);
     }
 }
 

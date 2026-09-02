@@ -7,9 +7,35 @@ use urp_exporter::exporter::Exporter;
 
 fn main() {
     let cfg = Config::from_args();
-    let mut exporter = Exporter::new(cfg);
+    let mut exporter = build_exporter(cfg);
     if let Err(e) = exporter.run() {
         eprintln!("urp-exporter: fatal: {e}");
         std::process::exit(1);
+    }
+}
+
+/// Production build: always the real netlink-scraping exporter.
+#[cfg(not(feature = "mock"))]
+fn build_exporter(cfg: Config) -> Exporter {
+    Exporter::new(cfg)
+}
+
+/// Mock build: if `URP_EXPORTER_MOCK=<endpoints>[,<qps>[,<streams>]]` is set,
+/// serve that synthetic fleet with no netlink (design 39 PR3 stress runner);
+/// otherwise behave exactly like production.
+#[cfg(feature = "mock")]
+fn build_exporter(cfg: Config) -> Exporter {
+    match std::env::var("URP_EXPORTER_MOCK") {
+        Ok(spec) => match urp_exporter::mock::parse_spec(&spec) {
+            Some((n, q, s)) => {
+                eprintln!("urp-exporter: MOCK fleet endpoints={n} qps={q} streams={s}");
+                Exporter::new_mock(cfg, urp_exporter::mock::synthetic_fleet(n, q, s))
+            }
+            None => {
+                eprintln!("urp-exporter: bad URP_EXPORTER_MOCK spec {spec:?}, scraping netlink");
+                Exporter::new(cfg)
+            }
+        },
+        Err(_) => Exporter::new(cfg),
     }
 }

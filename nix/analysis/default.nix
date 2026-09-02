@@ -15,7 +15,7 @@
 # linuxPackages_latest build the kernel-module-build CI gate compiles
 # (the nixpkgs kernel .dev output ships the full source tree, so
 # checkpatch.pl and the coccinelle scripts need no external checkout).
-{ pkgs, lib, src, rustToolchain
+{ pkgs, lib, src, rustToolchain, advisory-db
 , kernelPackages ? pkgs.linuxPackages_latest }:
 
 let
@@ -27,6 +27,7 @@ let
   checkpatch = import ./checkpatch.nix { inherit pkgs src kernelPackages; };
   cocci = import ./coccicheck.nix { inherit pkgs mkKbuildReport kernelPackages; };
   rustLints = import ./rust-lints.nix { inherit pkgs src rustToolchain; };
+  rustAudit = import ./rust-audit.nix { inherit pkgs src advisory-db; };
   userlandC = import ./userland-c.nix { inherit pkgs; };
 
   all = pkgs.runCommand "urp-analysis-all" { } ''
@@ -38,11 +39,12 @@ let
     ln -s ${cocci.report} $out/coccicheck
     ln -s ${rustLints.clippy} $out/clippy
     ln -s ${rustLints.rustfmt-check} $out/rustfmt
+    ln -s ${rustAudit} $out/rust-audit
     ln -s ${userlandC.clang-tidy} $out/clang-tidy
     ln -s ${userlandC.cppcheck} $out/cppcheck
     {
       echo "=== urp static analysis (kernel ${kernelPackages.kernel.version}) ==="
-      for t in sparse smatch checkpatch gcc-w1 coccicheck clippy rustfmt clang-tidy cppcheck; do
+      for t in sparse smatch checkpatch gcc-w1 coccicheck clippy rustfmt rust-audit clang-tidy cppcheck; do
         printf '%-12s %s findings\n' "$t:" "$(cat $out/$t/count.txt)"
       done
     } > $out/summary.txt
@@ -58,6 +60,7 @@ in
   analysis-coccicheck = cocci.report;
   analysis-clippy = rustLints.clippy;
   analysis-rustfmt = rustLints.rustfmt-check;
+  analysis-rust-audit = rustAudit;
   analysis-clang-tidy = userlandC.clang-tidy;
   analysis-cppcheck = userlandC.cppcheck;
   analysis-all = all;
