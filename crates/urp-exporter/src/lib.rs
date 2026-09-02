@@ -21,6 +21,11 @@ pub mod scrape;
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
 
+/// Scrape-fan-out microbenchmark (blocking vs io_uring). Only under the
+/// `io-uring` feature; runs on hardware via `URP_EXPORTER_BENCH` (design 39 §39.4).
+#[cfg(feature = "io-uring")]
+pub mod bench;
+
 pub use config::Config;
 pub use exporter::Exporter;
 

@@ -22,13 +22,14 @@ path = "src/lib.rs"
 [dependencies]
 libc = "0.2"
 urp-netlink = { path = "../urp-netlink" }
-io-uring = { version = "0.7", optional = true }
 
 [features]
 default = []
-# PR4: batch the N verbose GETs through a single io_uring submit/reap. Declared
-# now so the wiring exists; the code path lands (and is benchmark-gated) later.
-io-uring = ["dep:io-uring"]
+# PR4: batch the N verbose GETs through a single io_uring submit/reap. The
+# implementation lives in urp-netlink (which owns the socket/fd); this just
+# enables it + switches the scrape fan-out over. Off by default -- blocking
+# stays the shipped path; opt-in for large-fan-out aggregator scrapes.
+io-uring = ["urp-netlink/io-uring"]
 # PR3: serve a synthetic fleet (URP_EXPORTER_MOCK env) instead of scraping
 # netlink, so the render + HTTP hot path is drivable with no kernel module --
 # used by the stress runner (nix/urp-exporter-stress.nix). Off in production.

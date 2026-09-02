@@ -23,6 +23,34 @@ pub struct ScrapeResult {
 /// failing the entire scrape.
 pub fn scrape(sock: &mut UrpSocket) -> Result<ScrapeResult, UrpError> {
     let scalars = fetch_endpoints(sock, None)?; // 1 dump
+
+    // io_uring fan-out (design 39 §39.4): one submit/reap for all N verbose GETs
+    // instead of N serial round-trips. Falls back to the blocking loop on any
+    // ring/socket error, so it is never worse than the default path.
+    #[cfg(feature = "io-uring")]
+    {
+        let names: Vec<&str> = scalars.iter().map(|e| e.name.as_str()).collect();
+        let n_names = names.len();
+        match urp_netlink::get_endpoints_batch_uring(sock, &names) {
+            Ok(verbose) => {
+                drop(names); // release the borrow of `scalars` before consuming it
+                let mut endpoints = Vec::with_capacity(scalars.len());
+                for (scalar, full) in scalars.into_iter().zip(verbose) {
+                    // Raced away / GET errored -> keep the scalar-only record.
+                    endpoints.push(full.unwrap_or(scalar));
+                }
+                return Ok(ScrapeResult {
+                    endpoints,
+                    netlink_requests: 1 + n_names as u64,
+                });
+            }
+            Err(e) => {
+                eprintln!("urp-exporter: io_uring batch failed ({e}); using blocking GETs");
+                // fall through to the blocking path below
+            }
+        }
+    }
+
     let mut requests = 1u64;
     let mut endpoints = Vec::with_capacity(scalars.len());
     for ep in scalars {
