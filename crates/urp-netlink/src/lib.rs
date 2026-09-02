@@ -43,6 +43,34 @@ pub fn fetch_endpoints(
     })
 }
 
+/// Batch the verbose GET for many endpoints through one io_uring submit/reap
+/// (design 39 §39.4 PR4). Returns, in the same order as `names`, `Some(endpoint)`
+/// with its `stats`/`qps`/`streams` filled, or `None` if that GET failed / the
+/// endpoint raced away (so the caller can fall back to the dump's scalar record).
+/// Errors (ring/socket failure) propagate so the caller can fall back to the
+/// blocking `get_endpoint` loop.
+#[cfg(feature = "io-uring")]
+pub fn get_endpoints_batch_uring(
+    sock: &mut UrpSocket,
+    names: &[&str],
+) -> Result<Vec<Option<Endpoint>>, UrpError> {
+    let payloads: Vec<Vec<u8>> = names
+        .iter()
+        .map(|name| {
+            let mut top = AttrBuf::new();
+            top.nest(UrpAttr::Endpoint as u16, |ep| {
+                ep.put_string(UrpEndpointAttr::Name as u16, name);
+            });
+            top.into_bytes()
+        })
+        .collect();
+    let bodies = sock.send_batch_uring(UrpCmd::GetEndpoint as u8, &payloads)?;
+    Ok(bodies
+        .into_iter()
+        .map(|b| b.and_then(|body| Endpoint::parse_top(&body)))
+        .collect())
+}
+
 /// Fetch a single endpoint by name, or `None` if it does not exist. Thin wrapper
 /// over [`fetch_endpoints`] for the common "does this one endpoint exist and what
 /// is its state?" query the control plane's acceptor asks to answer `ready`.

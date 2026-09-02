@@ -1,6 +1,12 @@
 # 39. Metrics Exporter — a lightweight Prometheus surface for `urp`
 
-Status: **Design (2026-09-01). Not yet implemented.** The `urp` kernel module
+Status: **PR1–PR4 implemented + deployed (2026-09-01).** The exporter is built
+(`crates/urp-exporter`), hardened-module-packaged (`nixosModules.urp-exporter`),
+stress/fuzz/audit-verified, and running on hp1/hp2/hp3 feeding Prometheus +
+Grafana. io_uring GET fan-out (PR4) was implemented and **benchmarked: blocking
+wins at every measured N** (§39.4), so it stays opt-in and blocking is the
+default. Remaining: PR5 hardware footprint acceptance test + 8h soak. The `urp`
+kernel module
 already tracks a small, fixed set of per-endpoint / per-QP / per-stream counters
 and exposes them over generic netlink (read today by `urp show --json`). This
 doc specifies a **standalone, dependency-light Prometheus exporter** that scrapes
@@ -237,6 +243,31 @@ so scrape latency ≈ `N ×` round-trip. The `N` GETs are independent (distinct
 PRs).** Teaching `dumpit` to include the `stats` nest (behind a request flag)
 returns everything in *one* multipart dump and makes the `N` GETs — and thus most
 of the io_uring argument — disappear. Tracked in §39.11.
+
+**Measured (PR4, 2026-09-01, hp1, `URP_EXPORTER_BENCH`, 200 iters/N).** The
+`io-uring` feature was implemented (`urp-netlink::send_batch_uring`: two-phase —
+submit all `N` sends, confirm each queued its one reply, then drain `N` recvs
+mapped back by `nlmsg_seq`, with a timeout guard; per-batch ring, plain
+`Send`/`Recv`, bumped `SO_RCVBUF`) and benchmarked against the blocking serial
+GETs by hammering one endpoint `N` times:
+
+| N | blocking | io_uring | speedup |
+|---|---|---|---|
+| 1 | 5.8 µs | 32.3 µs | **0.18×** |
+| 4 | 21.7 µs | 45.0 µs | 0.48× |
+| 16 | 88.7 µs | 112.6 µs | 0.79× |
+| 64 | 359.9 µs | 387.1 µs | 0.93× |
+| 256 | 1445.9 µs | 1475.7 µs | 0.98× |
+
+**io_uring never wins.** At the realistic `N` (a node runs 1–low-tens of
+endpoints) it is 2–5× *slower* — the ring setup + two `io_uring_enter`s dominate;
+by `N = 256` it only reaches ~parity because the kernel's per-message genl-fill
+cost (which io_uring cannot reduce) dominates both paths, exactly as predicted.
+**Decision: blocking is the shipped default; the `io-uring` feature stays
+off-by-default and opt-in.** It is kept in-tree (feature + the
+`urp-exporter-iouring` package) so the benchmark is reproducible and the path can
+be re-evaluated if a warm/cached ring or the kernel-side `dumpit`-with-stats
+lands — but on today's numbers there is no `N` at which enabling it is justified.
 
 ---
 

@@ -6,6 +6,14 @@ use urp_exporter::config::Config;
 use urp_exporter::exporter::Exporter;
 
 fn main() {
+    // Bench mode (io-uring feature, hardware only): URP_EXPORTER_BENCH[=<name>]
+    // runs the blocking-vs-io_uring N-sweep and exits (design 39 §39.4).
+    #[cfg(feature = "io-uring")]
+    if let Ok(v) = std::env::var("URP_EXPORTER_BENCH") {
+        let target = if v.is_empty() { None } else { Some(v.as_str()) };
+        urp_exporter::bench::run_and_exit(target);
+    }
+
     let cfg = Config::from_args();
     let mut exporter = build_exporter(cfg);
     if let Err(e) = exporter.run() {

@@ -341,6 +341,195 @@ impl UrpSocket {
         }
     }
 
+    /// Build a full nlmsg (nlmsghdr + genlmsghdr + payload, 4-aligned) with the
+    /// given seq and flags for the urp family. Shared by the io_uring batch path.
+    #[cfg(feature = "io-uring")]
+    fn build_urp_nlmsg(&self, cmd: u8, seq: u32, flags: u16, payload: &[u8]) -> Vec<u8> {
+        let total = NLMSG_HDR_LEN + GENL_HDR_LEN + payload.len();
+        let mut buf = Vec::with_capacity(align4(total));
+        buf.extend_from_slice(&(total as u32).to_ne_bytes());
+        buf.extend_from_slice(&self.family_id.to_ne_bytes());
+        buf.extend_from_slice(&flags.to_ne_bytes());
+        buf.extend_from_slice(&seq.to_ne_bytes());
+        buf.extend_from_slice(&self.pid.to_ne_bytes());
+        buf.push(cmd);
+        buf.push(URP_GENL_VERSION);
+        buf.extend_from_slice(&0u16.to_ne_bytes());
+        buf.extend_from_slice(payload);
+        while buf.len() % 4 != 0 {
+            buf.push(0);
+        }
+        buf
+    }
+
+    /// Grow SO_RCVBUF so a batch of replies (all queued before we drain them --
+    /// a genl `doit` reply is generated synchronously in `send()`) does not
+    /// overflow and get dropped. Best-effort; ignored on failure.
+    #[cfg(feature = "io-uring")]
+    fn bump_rcvbuf(&self, bytes: c_int) {
+        unsafe {
+            libc::setsockopt(
+                self.fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &bytes as *const _ as *const c_void,
+                size_of::<c_int>() as u32,
+            );
+        }
+    }
+
+    /// Fan out `payloads.len()` single-reply genl requests (`cmd`, no ACK)
+    /// through ONE io_uring submit/reap instead of `N` serial round-trips
+    /// (design 39 §39.4). Returns, in input order, `Some(body)` (the reply's
+    /// attribute blob, post-genlhdr) or `None` if that request came back as an
+    /// `NLMSG_ERROR` (e.g. the endpoint raced away). Errors on ring/socket
+    /// failure so the caller can fall back to the blocking path.
+    ///
+    /// Two phases avoid any completion-model hang: (1) submit all `N` sends and
+    /// confirm they succeeded -- each success synchronously queues exactly one
+    /// reply datagram; (2) submit `N` recvs (+ a timeout guard) and drain the
+    /// `N` datagrams, mapping each back to its request by `nlmsg_seq`.
+    #[cfg(feature = "io-uring")]
+    pub fn send_batch_uring(
+        &mut self,
+        cmd: u8,
+        payloads: &[Vec<u8>],
+    ) -> Result<Vec<Option<Vec<u8>>>, UrpError> {
+        use io_uring::{opcode, types, IoUring};
+
+        let n = payloads.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Build requests; seqs are consecutive from `base`, so seq->index is a
+        // subtraction (no map allocation).
+        let base = self.seq;
+        let mut reqs: Vec<Vec<u8>> = Vec::with_capacity(n);
+        for payload in payloads {
+            let seq = self.next_seq();
+            reqs.push(self.build_urp_nlmsg(cmd, seq, NLM_F_REQUEST, payload));
+        }
+
+        // All N replies are queued before we drain them; make room.
+        self.bump_rcvbuf(16 << 20);
+
+        let entries = ((2 * n) as u32).next_power_of_two().max(8);
+        let mut ring = IoUring::new(entries).map_err(UrpError::Io)?;
+        let fd = types::Fd(self.fd);
+
+        // --- Phase 1: submit all sends, confirm each succeeded. ---
+        {
+            let mut sq = ring.submission();
+            for (i, req) in reqs.iter().enumerate() {
+                let e = opcode::Send::new(fd, req.as_ptr(), req.len() as u32)
+                    .build()
+                    .user_data(i as u64);
+                // SAFETY: req buffers live in `reqs` until the fn returns.
+                unsafe {
+                    sq.push(&e)
+                        .map_err(|_| UrpError::Netlink("uring sq full (send)".into()))?;
+                }
+            }
+        }
+        ring.submit_and_wait(n).map_err(UrpError::Io)?;
+        {
+            let mut cq = ring.completion();
+            cq.sync();
+            let mut got = 0;
+            for cqe in &mut cq {
+                got += 1;
+                if cqe.result() < 0 {
+                    return Err(UrpError::Netlink(format!(
+                        "uring send failed: {}",
+                        io::Error::from_raw_os_error(-cqe.result())
+                    )));
+                }
+            }
+            if got != n {
+                return Err(UrpError::Netlink("uring: short send completion".into()));
+            }
+        }
+
+        // --- Phase 2: submit N recvs + a timeout guard, drain N datagrams. ---
+        const RECV_SZ: usize = 32 * 1024;
+        let mut rbuf = vec![0u8; n * RECV_SZ];
+        let ts = types::Timespec::new().sec(5);
+        const TIMEOUT_UD: u64 = u64::MAX;
+        {
+            let mut sq = ring.submission();
+            for i in 0..n {
+                // SAFETY: distinct RECV_SZ slice per recv, all within `rbuf`.
+                let ptr = unsafe { rbuf.as_mut_ptr().add(i * RECV_SZ) };
+                let e = opcode::Recv::new(fd, ptr, RECV_SZ as u32)
+                    .build()
+                    .user_data(i as u64);
+                unsafe {
+                    sq.push(&e)
+                        .map_err(|_| UrpError::Netlink("uring sq full (recv)".into()))?;
+                }
+                let _ = i;
+            }
+            let t = opcode::Timeout::new(&ts).build().user_data(TIMEOUT_UD);
+            // SAFETY: `ts` lives until the fn returns (past the reap loop).
+            unsafe {
+                sq.push(&t)
+                    .map_err(|_| UrpError::Netlink("uring sq full (timeout)".into()))?;
+            }
+        }
+
+        let mut recv_len: Vec<Option<usize>> = vec![None; n];
+        let mut done = 0usize;
+        let mut timed_out = false;
+        ring.submit()?;
+        while done < n && !timed_out {
+            ring.submit_and_wait(1).map_err(UrpError::Io)?;
+            let mut cq = ring.completion();
+            cq.sync();
+            for cqe in &mut cq {
+                if cqe.user_data() == TIMEOUT_UD {
+                    timed_out = true;
+                    continue;
+                }
+                let idx = cqe.user_data() as usize;
+                if cqe.result() > 0 && idx < n {
+                    recv_len[idx] = Some(cqe.result() as usize);
+                }
+                done += 1;
+            }
+        }
+        if done < n {
+            return Err(UrpError::Netlink("uring recv timeout".into()));
+        }
+
+        // Decode each datagram, mapping seq -> input index.
+        let mut out: Vec<Option<Vec<u8>>> = vec![None; n];
+        for (ri, len) in recv_len.iter().enumerate() {
+            let Some(len) = *len else { continue };
+            let msg = &rbuf[ri * RECV_SZ..ri * RECV_SZ + len];
+            if msg.len() < NLMSG_HDR_LEN {
+                continue;
+            }
+            let nlmsg_len = u32::from_ne_bytes(msg[0..4].try_into().unwrap()) as usize;
+            let nlmsg_type = u16::from_ne_bytes(msg[4..6].try_into().unwrap());
+            let mseq = u32::from_ne_bytes(msg[8..12].try_into().unwrap());
+            let idx = mseq.wrapping_sub(base) as usize;
+            if idx >= n {
+                continue; // stale/foreign datagram
+            }
+            if nlmsg_type == NLMSG_ERROR {
+                out[idx] = None; // request errored (endpoint raced away)
+                continue;
+            }
+            let body_start = NLMSG_HDR_LEN + GENL_HDR_LEN;
+            let body_end = nlmsg_len.min(msg.len());
+            if body_end > body_start {
+                out[idx] = Some(msg[body_start..body_end].to_vec());
+            }
+        }
+        Ok(out)
+    }
+
     pub fn subscribe_events(&mut self) -> Result<(), UrpError> {
         if self.events_mcgrp_id == 0 {
             return Err(UrpError::Netlink(

@@ -165,6 +165,15 @@
           inherit pkgs urpExporterMock;
         };
 
+        # io_uring-featured exporter build: batches the N verbose GETs through
+        # one submit/reap (design 39 §39.4 PR4). Opt-in (blocking stays default);
+        # also carries the `URP_EXPORTER_BENCH` blocking-vs-uring N-sweep.
+        urpExporterIouring = import ./nix/urp-exporter.nix {
+          inherit pkgs;
+          inherit (packages) rustToolchain;
+          features = [ "io-uring" ];
+        };
+
         # Phase 3a: FFI staticlib for the optional Rust-backed reorder
         # buffer. Only consumed by the kernel build when
         # CONFIG_URP_REORDER_RUST=y; the default urp-ko build (C rbtree
@@ -270,6 +279,10 @@
           # Exporter stress/soak against a synthetic fleet (design 39 PR3; no
           # hardware): `nix run .#urp-exporter-stress`.
           urp-exporter-stress = urpExporterStress;
+          # io_uring-featured exporter (design 39 §39.4 PR4; opt-in). Carries the
+          # blocking-vs-uring bench: `URP_EXPORTER_BENCH= urp-exporter` on a node
+          # with the module loaded.
+          urp-exporter-iouring = urpExporterIouring;
           urp-protocol-ffi = urpProtocolFfi;
           # io_uring UDS benchmark (design 30): `nix run .#urp-bench-local`
           urp-bench-c = urpBenchC;
