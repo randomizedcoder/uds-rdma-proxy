@@ -1099,6 +1099,97 @@ static void test_hist_bucket(struct kunit *test)
 }
 
 /*
+ * design 40 §40.2: OWD latency histogram bucketing. Same `le` classifier as
+ * urp_hist_bucket but the latency-tuned edge set (1 us .. 10 ms). Pins the exact
+ * pure function the userspace twin (tools/urp-hist-units.c) also drives.
+ */
+static void test_owd_bucket(struct kunit *test)
+{
+	u32 i;
+
+	/* corner: zero / <= first edge (1 us) -> bucket 0. */
+	KUNIT_EXPECT_EQ(test, urp_owd_bucket(0), 0u);
+	KUNIT_EXPECT_EQ(test, urp_owd_bucket(1), 0u);
+	KUNIT_EXPECT_EQ(test, urp_owd_bucket(1000), 0u);
+	/* boundary: one past an edge crosses into the next bucket. */
+	KUNIT_EXPECT_EQ(test, urp_owd_bucket(1001), 1u);
+	KUNIT_EXPECT_EQ(test, urp_owd_bucket(2000), 1u);
+	KUNIT_EXPECT_EQ(test, urp_owd_bucket(2001), 2u);
+	/* positive: exact edges map to their own bucket. */
+	KUNIT_EXPECT_EQ(test, urp_owd_bucket(10000), 3u);
+	KUNIT_EXPECT_EQ(test, urp_owd_bucket(100000), 6u);
+	KUNIT_EXPECT_EQ(test, urp_owd_bucket(1000000), 9u);
+	/* boundary: last finite edge (10 ms) and just past it -> +Inf. */
+	KUNIT_EXPECT_EQ(test, urp_owd_bucket(10000000), URP_OWD_NEDGES - 1u);
+	KUNIT_EXPECT_EQ(test, urp_owd_bucket(10000001), URP_OWD_NBUCKETS - 1u);
+	/* corner: huge -> +Inf catch-all. */
+	KUNIT_EXPECT_EQ(test, urp_owd_bucket((u64)~0ULL), URP_OWD_NBUCKETS - 1u);
+
+	/* edge table strictly increasing; +Inf sentinel is U64_MAX; OWD fits in
+	 * the shared urp_hist15 storage (its bucket count <= the interarrival one).
+	 */
+	for (i = 1; i < URP_OWD_NEDGES; i++)
+		KUNIT_EXPECT_GT(test, urp_owd_edge_ns(i), urp_owd_edge_ns(i - 1));
+	KUNIT_EXPECT_EQ(test, urp_owd_edge_ns(URP_OWD_NEDGES), (u64)~0ULL);
+	KUNIT_EXPECT_LE(test, (u32)URP_OWD_NBUCKETS, (u32)URP_HIST_NBUCKETS);
+}
+
+/*
+ * design 40 §40.2: OWD timestamp trailer codec. The 8-byte little-endian
+ * t_send_real must round-trip and be byte-exact (KUnit + the userspace twin both
+ * pin it; the module's TX/RX datapath in PR-B2 relies on this being the identity).
+ */
+static void test_tstamp_trailer(struct kunit *test)
+{
+	u8 buf[URP_TSTAMP_TRAILER_LEN];
+
+	urp_frame_tstamp_encode(buf, 0x1122334455667788ULL);
+	/* Little-endian byte layout. */
+	KUNIT_EXPECT_EQ(test, buf[0], (u8)0x88);
+	KUNIT_EXPECT_EQ(test, buf[7], (u8)0x11);
+	KUNIT_EXPECT_EQ(test, urp_frame_tstamp_decode(buf), 0x1122334455667788ULL);
+	/* corner: 0 and U64_MAX round-trip. */
+	urp_frame_tstamp_encode(buf, 0ULL);
+	KUNIT_EXPECT_EQ(test, urp_frame_tstamp_decode(buf), 0ULL);
+	urp_frame_tstamp_encode(buf, (u64)~0ULL);
+	KUNIT_EXPECT_EQ(test, urp_frame_tstamp_decode(buf), (u64)~0ULL);
+}
+
+/*
+ * design 40 §40.2: the TSTAMP capability rides the same 5-byte caps trailer as
+ * byte-windowing (design 35 §35.3). Verify it advertises independently and
+ * composes with WINDOW_BYTES in the caps byte, so a peer can negotiate either or
+ * both. Mirrors test_conn_priv_cap_trailer's use of urp_conn_priv_peer_caps.
+ */
+static void test_conn_priv_cap_tstamp(struct kunit *test)
+{
+	u8 buf[URP_CONN_PRIV_CAP_TRAILER_LEN];
+	u8 caps = 0;
+
+	/* TSTAMP alone. */
+	KUNIT_EXPECT_EQ(test,
+			urp_conn_priv_build_full(buf, 0, URP_EP_KIND_UDS, 0,
+						 URP_CONN_CAP_TSTAMP), 5);
+	KUNIT_EXPECT_TRUE(test, urp_conn_priv_peer_caps(buf, 5, 0, &caps));
+	KUNIT_EXPECT_EQ(test, caps, (u8)URP_CONN_CAP_TSTAMP);
+
+	/* TSTAMP composes with WINDOW_BYTES (distinct bits). */
+	KUNIT_EXPECT_EQ(test,
+			urp_conn_priv_build_full(buf, 0, URP_EP_KIND_UDS, 0,
+						 URP_CONN_CAP_WINDOW_BYTES |
+						 URP_CONN_CAP_TSTAMP), 5);
+	KUNIT_EXPECT_TRUE(test, urp_conn_priv_peer_caps(buf, 5, 0, &caps));
+	KUNIT_EXPECT_EQ(test, caps & URP_CONN_CAP_TSTAMP,
+			(u8)URP_CONN_CAP_TSTAMP);
+	KUNIT_EXPECT_EQ(test, caps & URP_CONN_CAP_WINDOW_BYTES,
+			(u8)URP_CONN_CAP_WINDOW_BYTES);
+	/* distinct bits -- the two caps never alias. */
+	KUNIT_EXPECT_EQ(test,
+			(u32)(URP_CONN_CAP_TSTAMP & URP_CONN_CAP_WINDOW_BYTES),
+			0u);
+}
+
+/*
  * gap #6 Phase 2: CREDIT-BYTES CONTROL payload codec. The u64 cumulative byte
  * grant must round-trip little-endian, and the decoder must reject a short
  * payload (the apply path then ignores a malformed grant). Kept numerically in
@@ -1961,6 +2052,9 @@ static struct kunit_case urp_test_cases[] = {
 	KUNIT_CASE(test_reorder_depth_for_window),
 	/* design 40 §40.1: RX inter-arrival histogram bucketing. */
 	KUNIT_CASE(test_hist_bucket),
+	KUNIT_CASE(test_owd_bucket),
+	KUNIT_CASE(test_tstamp_trailer),
+	KUNIT_CASE(test_conn_priv_cap_tstamp),
 	/* design 32: acceptor connection plan (eager-connect gate) */
 	KUNIT_CASE(test_acceptor_eager_connect),
 	/* design 32: credit-grant routing (per-stream vs per-QP pool) */

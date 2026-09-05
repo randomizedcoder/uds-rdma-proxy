@@ -40,6 +40,12 @@ unsigned int urp_window_bytes		 = URP_WINDOW_BYTES_DEFAULT;
 /* design 40 §40.1: RX inter-arrival histogram sampling (default on). */
 unsigned int urp_interarrival_hist	 = URP_INTERARRIVAL_HIST_DEFAULT;
 
+/* design 40 §40.2: OWD sample period (default 64, 0 = off) + advisory PTP
+ * servo offset (0 = unknown, set by a userspace PTP monitor).
+ */
+unsigned int urp_latency_sample_period	 = URP_LATENCY_SAMPLE_PERIOD_DEFAULT;
+unsigned int urp_owd_clock_offset_ns;
+
 /* proc_douintvec_minmax bounds (extra1/extra2 are void*, so non-const). */
 static unsigned int urp_uint_zero;			/* 0 */
 static unsigned int urp_uint_one = 1;
@@ -111,6 +117,30 @@ static struct ctl_table urp_sysctls[] = {
 		.proc_handler	= proc_douintvec_minmax,
 		.extra1		= &urp_uint_zero,
 		.extra2		= &urp_uint_one,
+	},
+	{
+		/* design 40 §40.2: OWD TX sampling period. 0 = off (no stamp, no
+		 * cap advertise, no nest); N = stamp every Nth frame (default 64).
+		 */
+		.procname	= "latency_sample_period",
+		.data		= &urp_latency_sample_period,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec_minmax,
+		.extra1		= &urp_uint_zero,
+		.extra2		= &urp_uint_max,
+	},
+	{
+		/* design 40 §40.2: advisory PTP servo offset (ns), set by a
+		 * userspace PTP monitor, surfaced verbatim over netlink. 0 = unknown.
+		 */
+		.procname	= "owd_clock_offset_ns",
+		.data		= &urp_owd_clock_offset_ns,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec_minmax,
+		.extra1		= &urp_uint_zero,
+		.extra2		= &urp_uint_max,
 	},
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
 	{ }	/* sentinel: required before 6.11, forbidden after */

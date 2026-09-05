@@ -34,6 +34,16 @@
 #define URP_DATA_FLAG_SYN	(1 << 0)
 #define URP_DATA_FLAG_FIN	(1 << 1)
 #define URP_DATA_FLAG_RST	(1 << 2)
+/*
+ * design 40 PR-B: a DATA frame carrying an 8-byte one-way-delay timestamp
+ * trailer (sender CLOCK_REALTIME ns at post) appended AFTER payload_length
+ * bytes. (Design 40 §40.2 mis-stated this as BIT(1); bits 0..2 are already
+ * SYN/FIN/RST, so TSTAMP takes the next free data-flag bit, BIT(3).) Sent only
+ * on sampled frames and only when both peers advertised URP_CONN_CAP_TSTAMP;
+ * an old peer never sets it, so the wire is byte-identical to legacy.
+ */
+#define URP_DATA_FLAG_TSTAMP	(1 << 3)
+#define URP_TSTAMP_TRAILER_LEN	8	/* u64 t_send_real (ns), little-endian */
 
 /* Control flags (frame_type == URP_FRAME_TYPE_CONTROL) */
 #define URP_CTRL_FLAG_CREDIT	(1 << 0)	/* credits_granted carries grant */
@@ -201,6 +211,14 @@ enum urp_endpoint_attr {
 	 */
 	URP_ENDPOINT_A_INTERARRIVAL	= 17,
 
+	/* NLA_NESTED -- design 40 §40.2 one-way delivery-latency (OWD)
+	 * histogram: a single urp_hist_attr sub-nest (stride 0) plus the
+	 * clock-offset gauge and skew-anomaly counter (enum urp_owd_attr).
+	 * Read-only, verbose GET only, and only when urp.latency_sample_period
+	 * is non-zero. Append-only: an older decoder ignores it.
+	 */
+	URP_ENDPOINT_A_OWD		= 18,
+
 	__URP_ENDPOINT_A_MAX,
 };
 
@@ -262,14 +280,32 @@ enum urp_stats_attr {
  */
 enum urp_hist_attr {
 	URP_HIST_A_UNSPEC	= 0,
-	URP_HIST_A_STRIDE	= 1,	/* NLA_U32 -- sampling stride (1/10/100) */
-	URP_HIST_A_BUCKETS	= 2,	/* NLA_BINARY -- URP_HIST_NBUCKETS x u64 counts */
+	URP_HIST_A_STRIDE	= 1,	/* NLA_U32 -- stride 1/10/100 (interarrival) or 0 (owd) */
+	URP_HIST_A_BUCKETS	= 2,	/* NLA_BINARY -- N x u64 counts (N per family:
+					 * URP_HIST_NBUCKETS interarrival, URP_OWD_NBUCKETS owd) */
 	URP_HIST_A_SUM_NS	= 3,	/* NLA_U64 -- sum of observed deltas (ns) */
 	URP_HIST_A_COUNT	= 4,	/* NLA_U64 -- total observations */
 	__URP_HIST_A_MAX,
 };
 
 #define URP_HIST_A_MAX (__URP_HIST_A_MAX - 1)
+
+/*
+ * OWD nest attributes (design 40 §40.2), nested inside URP_ENDPOINT_A_OWD: the
+ * histogram itself as a urp_hist_attr sub-nest, plus two sibling scalars -- the
+ * PTP servo offset (advisory, 0 = unknown/unsynced; a dashboard greys OWD out
+ * when it is high) and the count of skew-rejected (negative-delta) samples that
+ * were NOT bucketed.
+ */
+enum urp_owd_attr {
+	URP_OWD_A_UNSPEC	= 0,
+	URP_OWD_A_HIST		= 1,	/* NLA_NESTED -- one urp_hist_attr set */
+	URP_OWD_A_CLOCK_OFFSET_NS = 2,	/* NLA_U64 -- PTP servo offset, 0 = unknown */
+	URP_OWD_A_ANOMALIES	= 3,	/* NLA_U64 -- skew-rejected sample count */
+	__URP_OWD_A_MAX,
+};
+
+#define URP_OWD_A_MAX (__URP_OWD_A_MAX - 1)
 
 /*
  * Endpoint operating mode (per-endpoint, immutable, set at `urp add`).

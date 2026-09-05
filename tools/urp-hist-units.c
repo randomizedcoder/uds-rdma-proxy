@@ -87,11 +87,52 @@ static void run_strides(void)
 	CHECK_EQ(URP_IA_NSTRIDES, 3, "three strides");
 }
 
+/*
+ * design 40 §40.2: OWD latency classifier -- same `le` semantics as the
+ * inter-arrival one, latency-tuned edges (1 us .. 10 ms, 14 buckets).
+ */
+static void run_owd_bucket(void)
+{
+	u32 i;
+
+	/* corner: zero / <= first edge (1 us) -> bucket 0. */
+	CHECK_EQ(urp_owd_bucket(0), 0, "owd zero -> bucket 0");
+	CHECK_EQ(urp_owd_bucket(1000), 0, "owd on first edge 1us -> bucket 0");
+	/* boundary: one past an edge crosses into the next bucket. */
+	CHECK_EQ(urp_owd_bucket(1001), 1, "owd 1us+1 -> bucket 1");
+	CHECK_EQ(urp_owd_bucket(2000), 1, "owd on edge 2us -> bucket 1");
+	CHECK_EQ(urp_owd_bucket(2001), 2, "owd 2us+1 -> bucket 2");
+	/* positive: exact edges map to their own bucket. */
+	CHECK_EQ(urp_owd_bucket(10000), 3, "owd 10us -> bucket 3");
+	CHECK_EQ(urp_owd_bucket(100000), 6, "owd 100us -> bucket 6");
+	CHECK_EQ(urp_owd_bucket(1000000), 9, "owd 1ms -> bucket 9");
+	/* boundary: last finite edge (10 ms) and just past it -> +Inf. */
+	CHECK_EQ(urp_owd_bucket(10000000), URP_OWD_NEDGES - 1,
+		 "owd 10ms -> last finite bucket");
+	CHECK_EQ(urp_owd_bucket(10000001), URP_OWD_NBUCKETS - 1,
+		 "owd 10ms+1 -> +Inf bucket");
+	/* corner: anything huge -> the +Inf catch-all. */
+	CHECK_EQ(urp_owd_bucket((u64)~0ULL), URP_OWD_NBUCKETS - 1,
+		 "owd U64_MAX -> +Inf bucket");
+
+	/* edges strictly increasing; +Inf sentinel is U64_MAX; OWD buckets fit
+	 * the shared urp_hist15 storage (<= the interarrival bucket count).
+	 */
+	for (i = 1; i < URP_OWD_NEDGES; i++)
+		CHECK_EQ(urp_owd_edge_ns(i) > urp_owd_edge_ns(i - 1), true,
+			 "owd edge[%u] > edge[%u]", i, i - 1);
+	CHECK_EQ(urp_owd_edge_ns(URP_OWD_NEDGES), (u64)~0ULL,
+		 "owd edge[+Inf] == U64_MAX");
+	CHECK_EQ(URP_OWD_NBUCKETS <= URP_HIST_NBUCKETS, true,
+		 "owd buckets fit urp_hist15");
+}
+
 int main(void)
 {
 	run_bucket();
 	run_edges_monotonic();
 	run_strides();
+	run_owd_bucket();
 
 	printf("urp-hist-units: %d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;

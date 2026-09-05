@@ -88,4 +88,40 @@ static inline u32 urp_ia_stride(u32 i)
 	return i < URP_IA_NSTRIDES ? strides[i] : 1u;
 }
 
+/*
+ * design 40 PR-B: one-way delivery latency (OWD) histogram. Same classic-`le`
+ * bucketing as the inter-arrival histogram above, but a latency-tuned edge set
+ * (~1 us to ~10 ms, design 40 §40.2) rather than the rate-tuned inter-arrival
+ * one. 14 buckets = 13 finite ns edges + a trailing +Inf. Keep in lock-step
+ * with the Rust owd `le` table (crates/urp-netlink) and the KUnit/units cases.
+ */
+#define URP_OWD_NBUCKETS	14u
+#define URP_OWD_NEDGES		(URP_OWD_NBUCKETS - 1u)
+
+static inline u64 urp_owd_edge_ns(u32 i)
+{
+	static const u64 edges[URP_OWD_NEDGES] = {
+		1000u,		2000u,		5000u,		10000u,
+		20000u,		50000u,		100000u,	200000u,
+		500000u,	1000000u,	2000000u,	5000000u,
+		10000000u,
+	};
+
+	return i < URP_OWD_NEDGES ? edges[i] : (u64)~0ULL;
+}
+
+/*
+ * Classify an OWD delta (ns) into [0, URP_OWD_NBUCKETS), same `le` semantics as
+ * urp_hist_bucket. Pure; the sole thing KUnit + urp-hist-units pin for OWD.
+ */
+static inline u32 urp_owd_bucket(u64 ns)
+{
+	u32 i;
+
+	for (i = 0; i < URP_OWD_NEDGES; i++)
+		if (ns <= urp_owd_edge_ns(i))
+			return i;
+	return URP_OWD_NBUCKETS - 1u;
+}
+
 #endif /* _URP_HIST_H */
