@@ -1,7 +1,9 @@
 # 40. Datapath Latency & Rate Histograms
 
-Status: **PR-A (inter-arrival histogram) implemented (2026-09-04); PR-B (one-way
-delivery latency) + PR-C (hardware validation) designed, not yet built.** Follow-up
+Status: **PR-A (inter-arrival histogram) implemented + live-validated on the mesh
+(2026-09-05); PR-B1 (OWD plumbing/codec, hardware-free) implemented (2026-09-05);
+PR-B2 (OWD datapath + surface) + PR-C (hardware validation) designed, not yet
+built.** Follow-up
 to [39. Metrics Exporter](39-metrics-exporter.md) §39.11 ("Latency/credit gaps —
 the module exposes only `rtt_ewma_ns`; no latency histograms"). Specifies two new
 kernel-measured distributions, surfaced through the same generic-netlink → exporter
@@ -128,10 +130,18 @@ carries an **8-byte timestamp trailer** appended *after* the payload, flagged in
 existing `flags` byte `[13]`:
 
 ```
-URP_FRAME_FLAG_TSTAMP  = BIT(1)     /* new flag; BIT(0) is unused today */
+URP_DATA_FLAG_TSTAMP   = BIT(3)     /* bits 0..2 are already SYN/FIN/RST */
 trailer (8 bytes, little-endian, present iff flag set):
     [0..8)  t_send_real  u64        /* sender CLOCK_REALTIME (ns) at post */
 ```
+
+> **Correction (PR-B1).** The original spec named this flag `BIT(1)` and claimed
+> "BIT(0) is unused." That is wrong: the data-flags byte `[13]` already carries
+> `URP_DATA_FLAG_SYN`=BIT(0), `_FIN`=BIT(1), `_RST`=BIT(2)
+> (`include/uapi/linux/urp.h`), so TSTAMP takes the next free bit, **BIT(3)**.
+> The caps bit is `URP_CONN_CAP_TSTAMP = (1 << 1)` (byte-windowing holds
+> `(1 << 0)`). The 8-byte trailer codec is `urp_frame_tstamp_{encode,decode}` in
+> `urp_frame.h`, pinned by KUnit (`test_tstamp_trailer`) and the userspace twin.
 
 The trailer sits past `payload_length` bytes, so a receiver that does not understand
 the flag (or a mis-set flag) simply never reads it — but we do not rely on that:
@@ -323,13 +333,29 @@ against mainline; `urp-netlink`/`urp-exporter` test suites + the three nix check
 green. **Still to do:** live validation on the mesh (PR-C-lite: confirm the family
 populates and the exporter footprint stays within the design 39 §39.9 budget).
 
-**PR-B — one-way delivery latency (protocol change).** `URP_FRAME_FLAG_TSTAMP` +
-8-byte trailer codec in `urp_frame.h` (pure, fuzz+KUnit); `URP_CONN_CAP_TSTAMP` caps
-bit + negotiation gate; `urp.latency_sample_period` sysctl (default 64); TX stamp on
-sampled frames + buffer-size trailer reserve; RX delta + skew clamp + bucket;
-`URP_ENDPOINT_A_OWD` nest; `urp-netlink` decode; exporter render + clock-offset/anomaly
-metrics; dashboard percentile panels + alerts. **Needs the testbed's PTP** to
-validate; unit/fuzz/mock layers are hardware-free.
+**PR-B1 — OWD plumbing + codec (hardware-free, zero behaviour change). IMPLEMENTED
+2026-09-05.** `URP_DATA_FLAG_TSTAMP` (BIT(3)) + the 8-byte `urp_frame_tstamp_*`
+trailer codec in `urp_frame.h`; `URP_CONN_CAP_TSTAMP` (1<<1) caps bit;
+`urp_owd_bucket()` + `URP_OWD_NBUCKETS` (14, latency-tuned edges) in the shared
+`urp_hist.h`; `struct urp_owd` on `urp_endpoint` (reuses `urp_hist15` storage);
+`URP_ENDPOINT_A_OWD` (=18) UAPI attr + `enum urp_owd_attr`; `urp.latency_sample_period`
+(default 64) + `urp.owd_clock_offset_ns` (advisory) sysctls. Tests: KUnit
+`test_owd_bucket` / `test_tstamp_trailer` / `test_conn_priv_cap_tstamp`; userspace
+twin extended (`urp-hist-units`, 57 checks). Nothing stamps or reads yet, so the
+wire is byte-identical to legacy and the OWD nest is never emitted. Kernel module
+builds mainline 7.2; `urp-hist-units` green. **No new fuzz harness:** the codec is a
+straight-line LE64 round-trip (unit-covered); the hostile TSTAMP-parse surface lands
+in PR-B2 and is already exercised by `wire_fuzz` (random-flag + truncated-frame
+generation covers a set TSTAMP flag with a missing/short trailer).
+
+**PR-B2 — OWD datapath + surface (protocol change; needs PTP to validate).** Wire
+the negotiation (advertise `URP_CONN_CAP_TSTAMP` when `latency_sample_period != 0`,
+mirroring `window_bytes_advertise` in `urp_endpoint.c`); TX stamp on sampled frames
+(`seq % period == 0`, cap negotiated) + buffer-size trailer reserve; RX delta vs
+`ktime_get_real_ns()` + skew clamp → `anomalies` + bucket + trailer strip before UDS
+delivery; `URP_ENDPOINT_A_OWD` netlink encoder; `urp-netlink` decode
+(`URP_OWD_EDGES_NS` parity); exporter `urp_endpoint_owd_seconds_*` +
+clock-offset/anomaly + `--owd` flag; dashboard percentile panels + alerts.
 
 **PR-C — hardware validation.** On the PTP-synced hp1/hp2/hp3 mesh: confirm
 single-flow OWD p50 ≈ the ~36 µs floor and that the p99 tail grows with concurrency
@@ -343,10 +369,13 @@ histograms on. Append numbers here and flip Status.
 ## 40.8 How to reproduce (once implemented)
 
 ```
-# unit/fuzz (no hardware)
+# unit (no hardware)
+nix build -L .#checks.x86_64-linux.urp-hist-units       # owd + interarrival classifier
 nix build -L .#checks.x86_64-linux.urp-exporter-tests   # render + decode tables
-nix run .#fuzz-c -- fuzz_frame 300                       # TSTAMP trailer codec
 nix run .#ci-local
+# the hostile TSTAMP-parse surface (PR-B2) rides the existing wire fuzzer, which
+# already sets random flags incl. BIT(3) and truncated trailers:
+#   (in the microVM tier) wire_fuzz <acceptor-ip> <port> 300
 
 # live (module loaded, one node): inter-arrival needs no PTP
 nix run .#urp-exporter -- --listen 127.0.0.1:9975

@@ -258,6 +258,20 @@ struct urp_interarrival {
 	struct urp_hist15	h[URP_IA_NSTRIDES];	   /* stride 1 / 10 / 100 */
 };
 
+/*
+ * struct urp_owd - per-endpoint one-way delivery-latency state (design 40 §40.2).
+ * Reuses urp_hist15 storage (URP_OWD_NBUCKETS <= URP_HIST_NBUCKETS -- only the
+ * first URP_OWD_NBUCKETS buckets are populated and serialized). @h buckets are
+ * atomic because the netlink reader races the RX writer; @anomalies counts
+ * skew-rejected (negative-delta) samples deliberately NOT bucketed, so clock
+ * skew never corrupts the distribution. The advisory PTP servo offset is a
+ * module-global (urp_owd_clock_offset_ns sysctl), not per-endpoint.
+ */
+struct urp_owd {
+	struct urp_hist15	h;		/* uses buckets [0, URP_OWD_NBUCKETS) */
+	atomic64_t		anomalies;
+};
+
 struct urp_endpoint;	/* forward decl for struct urp_qp */
 
 /*
@@ -418,6 +432,25 @@ extern unsigned int urp_window_bytes;
  */
 #define URP_INTERARRIVAL_HIST_DEFAULT	1
 extern unsigned int urp_interarrival_hist;
+
+/*
+ * design 40 §40.2: one-way delivery-latency (OWD) sampling. A TX-side sender
+ * stamps its CLOCK_REALTIME into a frame's TSTAMP trailer when seq % period == 0
+ * (and only when the peer negotiated URP_CONN_CAP_TSTAMP); the receiver buckets
+ * t_recv_real - t_send_real. Default 64 = ~1-in-64 frames, thousands of samples/s
+ * at line rate. 0 disables sampling, the cap advertisement, and the netlink nest.
+ * Writable via /proc/sys/urp/latency_sample_period.
+ */
+#define URP_LATENCY_SAMPLE_PERIOD_DEFAULT	64
+extern unsigned int urp_latency_sample_period;
+
+/*
+ * design 40 §40.2: advisory PTP servo offset (ns), set by a userspace PTP
+ * monitor via /proc/sys/urp/owd_clock_offset_ns and surfaced verbatim over
+ * netlink so a dashboard can grey OWD out when sync is poor. 0 = unknown. The
+ * module does not read the servo itself (MVP); this is purely a pass-through.
+ */
+extern unsigned int urp_owd_clock_offset_ns;
 
 /* urp_sysctl.c -- /proc/sys/urp/ runtime tunables (design 33 Phase 1). */
 int  urp_sysctl_register(void);
@@ -679,6 +712,13 @@ struct urp_endpoint {
 	 * nest. Zero-initialized with the endpoint (kzalloc).
 	 */
 	struct urp_interarrival	interarrival;
+	/*
+	 * design 40 §40.2: one-way delivery-latency histogram. Buckets are
+	 * written from the recv-completion context on sampled frames carrying a
+	 * TSTAMP trailer; emitted over netlink in the URP_ENDPOINT_A_OWD nest.
+	 * Zero-initialized with the endpoint (kzalloc).
+	 */
+	struct urp_owd		owd;
 	struct completion	cm_done;
 	int			cm_status;
 	bool			connected;

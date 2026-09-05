@@ -173,6 +173,26 @@ static inline u8 urp_frame_decode_flags(const void *buf)
 }
 
 /*
+ * design 40 PR-B: one-way-delay timestamp trailer. On a frame flagged
+ * URP_DATA_FLAG_TSTAMP, an 8-byte little-endian u64 (the sender's
+ * CLOCK_REALTIME in ns at post time) is appended AFTER the payload. @tail
+ * points at the first byte past payload_length bytes of payload -- the caller
+ * must have reserved URP_TSTAMP_TRAILER_LEN there (buffer sizing reserves it
+ * once the cap is negotiated, same discipline as the 20-byte header reserve).
+ * Pure codec (no clock read here -- the caller passes t_send_real), so KUnit
+ * and the userspace units round-trip it without ktime.
+ */
+static inline void urp_frame_tstamp_encode(void *tail, u64 t_send_real)
+{
+	put_unaligned_le64(t_send_real, (u8 *)tail);
+}
+
+static inline u64 urp_frame_tstamp_decode(const void *tail)
+{
+	return get_unaligned_le64((const u8 *)tail);
+}
+
+/*
  * Chunked-frame payload layout (design 37 path Y). A logical frame is gathered
  * from @nchunks physically-separate chunks of @chunk_size bytes each; the
  * 20-byte header occupies the start of chunk 0, so the payload begins at
