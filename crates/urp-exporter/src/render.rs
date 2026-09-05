@@ -10,7 +10,8 @@
 
 use std::fmt::Write;
 
-use urp_netlink::format::{Endpoint, Qp, Stats, Stream};
+use urp_netlink::format::{Endpoint, Qp, Stats, Stream, URP_HIST_EDGES_NS};
+use urp_netlink::uapi::URP_HIST_NBUCKETS;
 
 use crate::config::Config;
 
@@ -82,6 +83,10 @@ pub fn endpoint_series_count(ep: &Endpoint, cfg: &Config) -> usize {
         let per_stream = 2 + 3 + STREAM_STATES.len() + 1;
         n += ep.streams.len() * per_stream;
     }
+    if cfg.interarrival {
+        // per stride: NBUCKETS _bucket lines + _sum + _count (design 40 §40.1).
+        n += ep.interarrival.len() * (URP_HIST_NBUCKETS + 2);
+    }
     n
 }
 
@@ -148,6 +153,7 @@ pub fn render_into_scratch(
     if cfg.per_stream {
         render_streams(buf, eps);
     }
+    render_interarrival(buf, eps, cfg);
     capped_now
 }
 
@@ -438,6 +444,61 @@ fn render_streams(buf: &mut String, eps: &[Endpoint]) {
     }
 }
 
+/// RX inter-arrival histogram family (design 40 §40.1). The module stores
+/// per-bucket counts; we accumulate them into the Prometheus cumulative
+/// `_bucket` contract as we emit, so the hot path allocates nothing. Emitted
+/// only when enabled AND at least one endpoint carries the nest (an old module
+/// reports none, so the family silently vanishes).
+fn render_interarrival(buf: &mut String, eps: &[Endpoint], cfg: &Config) {
+    if !cfg.interarrival || eps.iter().all(|e| e.interarrival.is_empty()) {
+        return;
+    }
+    help(
+        buf,
+        "urp_endpoint_interarrival_seconds",
+        "histogram",
+        "RX inter-arrival time between delivered DATA frames, per sampling stride (1/10/100).",
+    );
+    for ep in eps {
+        for h in &ep.interarrival {
+            let mut running = 0u64;
+            for (i, &c) in h.buckets.iter().enumerate() {
+                running += c;
+                let _ = write!(buf, "urp_endpoint_interarrival_seconds_bucket");
+                ia_labels_le(buf, ep, h.stride, i);
+                let _ = writeln!(buf, " {running}");
+            }
+            let _ = write!(buf, "urp_endpoint_interarrival_seconds_sum");
+            ia_labels(buf, ep, h.stride);
+            let _ = writeln!(buf, " {}", h.sum_ns as f64 / 1e9);
+            let _ = write!(buf, "urp_endpoint_interarrival_seconds_count");
+            ia_labels(buf, ep, h.stride);
+            let _ = writeln!(buf, " {}", h.count);
+        }
+    }
+}
+
+/// `{endpoint,device,stride}` -- the inter-arrival label set for `_sum`/`_count`.
+fn ia_labels(buf: &mut String, ep: &Endpoint, stride: u32) {
+    ep_labels_open(buf, ep);
+    let _ = write!(buf, ",stride=\"{stride}\"}}");
+}
+
+/// Same, plus the `le` bucket bound. Bucket `i < NBUCKETS-1` uses the finite
+/// edge (ns -> seconds); the last bucket is `+Inf`. Edges come from the const
+/// table shared with the kernel header (design 40 §40.1).
+fn ia_labels_le(buf: &mut String, ep: &Endpoint, stride: u32, bucket: usize) {
+    ep_labels_open(buf, ep);
+    let _ = write!(buf, ",stride=\"{stride}\",le=\"");
+    if bucket + 1 < URP_HIST_NBUCKETS {
+        let secs = URP_HIST_EDGES_NS[bucket] as f64 / 1e9;
+        let _ = write!(buf, "{secs:e}");
+    } else {
+        let _ = write!(buf, "+Inf");
+    }
+    buf.push_str("\"}");
+}
+
 /* ---- label + header helpers ------------------------------------------- */
 
 fn help(buf: &mut String, name: &str, kind: &str, text: &str) {
@@ -572,6 +633,7 @@ mod tests {
                 buffer_alloc_fails: 0,
                 auth_failures: 0,
             }),
+            interarrival: vec![],
         }
     }
 
@@ -786,6 +848,105 @@ mod tests {
                 "urp_endpoint_tx_bytes_total{endpoint=\"pair_acceptor\",device=\"mlx5_0\"} 5"
             ),
             "{b}"
+        );
+    }
+
+    // design 40 §40.1: the inter-arrival histogram renders as a valid
+    // Prometheus histogram -- cumulative _bucket, bucket[+Inf] == _count, HELP/
+    // TYPE once, stride label present, and the family vanishes when no endpoint
+    // carries the nest (old module) or the flag is off.
+    #[test]
+    fn interarrival_histogram_truth_table() {
+        use urp_netlink::format::Histogram;
+        let cfg = Config {
+            per_qp: false,
+            ..Config::default()
+        };
+        // A histogram with known per-bucket counts summing to 45 (0+1+..+9 over
+        // the first 10 buckets, then zeros), so cumulative[+Inf] must equal 45.
+        let mut ep = ep_fixture();
+        let buckets: Vec<u64> = (0..URP_HIST_NBUCKETS as u64)
+            .map(|b| if b < 10 { b } else { 0 })
+            .collect();
+        let total: u64 = buckets.iter().sum();
+        ep.interarrival = vec![Histogram {
+            stride: 10,
+            buckets,
+            sum_ns: 12_000,
+            count: total,
+        }];
+        let mut buf = String::new();
+        render_into(
+            &mut buf,
+            std::slice::from_ref(&ep),
+            &cfg,
+            &SelfStats::default(),
+        );
+
+        // HELP/TYPE histogram exactly once.
+        assert_eq!(
+            buf.matches("# TYPE urp_endpoint_interarrival_seconds histogram")
+                .count(),
+            1,
+            "type once\n{buf}"
+        );
+        // stride label carried, first finite le is the 250ns == 2.5e-7 s edge.
+        assert!(
+            buf.contains("urp_endpoint_interarrival_seconds_bucket{endpoint=\"pair_acceptor\",device=\"mlx5_0\",stride=\"10\",le=\"2.5e-7\"}"),
+            "first bucket le label missing:\n{buf}"
+        );
+        // cumulative +Inf bucket == count == 45.
+        assert!(
+            buf.contains(&format!("stride=\"10\",le=\"+Inf\"}} {total}")),
+            "+Inf cumulative should equal count {total}:\n{buf}"
+        );
+        assert!(
+            buf.contains(&format!(
+                "urp_endpoint_interarrival_seconds_count{{endpoint=\"pair_acceptor\",device=\"mlx5_0\",stride=\"10\"}} {total}"
+            )),
+            "_count missing:\n{buf}"
+        );
+        // _bucket lines are monotonic non-decreasing across le for this stride.
+        let mut last = 0u64;
+        for line in buf.lines().filter(|l| {
+            l.starts_with("urp_endpoint_interarrival_seconds_bucket") && l.contains("stride=\"10\"")
+        }) {
+            let v: u64 = line.rsplit(' ').next().unwrap().parse().unwrap();
+            assert!(v >= last, "cumulative went backwards: {line}");
+            last = v;
+        }
+        assert_eq!(last, total, "final cumulative == count");
+
+        // negative: no nest (old module) -> family absent even with flag on.
+        let mut bare = ep_fixture();
+        bare.interarrival.clear();
+        let mut b2 = String::new();
+        render_into(
+            &mut b2,
+            std::slice::from_ref(&bare),
+            &cfg,
+            &SelfStats::default(),
+        );
+        assert!(
+            !b2.contains("urp_endpoint_interarrival_seconds"),
+            "family must vanish without the nest:\n{b2}"
+        );
+
+        // negative: flag off -> family absent even with data present.
+        let cfg_off = Config {
+            interarrival: false,
+            ..cfg.clone()
+        };
+        let mut b3 = String::new();
+        render_into(
+            &mut b3,
+            std::slice::from_ref(&ep),
+            &cfg_off,
+            &SelfStats::default(),
+        );
+        assert!(
+            !b3.contains("urp_endpoint_interarrival_seconds"),
+            "family must vanish when --no-interarrival:\n{b3}"
         );
     }
 

@@ -9,7 +9,30 @@
 //! Only compiled under `#[cfg(test)]` or the `mock` feature, so it never lands
 //! in the production binary.
 
-use urp_netlink::format::{Endpoint, Qp, Stats, Stream};
+use urp_netlink::format::{Endpoint, Histogram, Qp, Stats, Stream};
+use urp_netlink::uapi::URP_HIST_NBUCKETS;
+
+/// Build a deterministic per-stride inter-arrival histogram (design 40 §40.1)
+/// for the mock fleet, so the render hot path (and its zero-alloc/CPU budget)
+/// exercises the histogram family. Counts vary by `(base, stride)` so buckets
+/// are non-trivial and `sum`/`count` are consistent with a mean in-band.
+fn mock_interarrival(base: u64) -> Vec<Histogram> {
+    [1u32, 10, 100]
+        .into_iter()
+        .map(|stride| {
+            let buckets: Vec<u64> = (0..URP_HIST_NBUCKETS as u64)
+                .map(|b| (base / 1000 + b + stride as u64) % 97)
+                .collect();
+            let count: u64 = buckets.iter().sum();
+            Histogram {
+                stride,
+                sum_ns: count * (2_000 + stride as u64 * 100),
+                count,
+                buckets,
+            }
+        })
+        .collect()
+}
 
 /// Build a deterministic fleet of `endpoints` endpoints, each with `qps` QPs and
 /// `streams` streams. Counters vary by index so the rendered exposition looks
@@ -64,6 +87,7 @@ pub fn synthetic_fleet(endpoints: usize, qps: usize, streams: usize) -> Vec<Endp
                     buffer_alloc_fails: 0,
                     auth_failures: 0,
                 }),
+                interarrival: mock_interarrival(base),
             }
         })
         .collect()

@@ -194,6 +194,13 @@ enum urp_endpoint_attr {
 	 */
 	URP_ENDPOINT_A_KIND		= 16,
 
+	/* NLA_NESTED -- design 40 §40.1 RX inter-arrival histograms, one
+	 * urp_hist_attr sub-nest per sampling stride (1 / 10 / 100). Read-only,
+	 * returned by the verbose GET only, and only when urp.interarrival_hist
+	 * is enabled. Append-only: an older decoder ignores it.
+	 */
+	URP_ENDPOINT_A_INTERARRIVAL	= 17,
+
 	__URP_ENDPOINT_A_MAX,
 };
 
@@ -246,6 +253,23 @@ enum urp_stats_attr {
 };
 
 #define URP_STATS_A_MAX (__URP_STATS_A_MAX - 1)
+
+/*
+ * Histogram attributes (design 40 §40.1). Nested once per sampling stride inside
+ * URP_ENDPOINT_A_INTERARRIVAL (and, in design 40 PR-B, inside the one-way-delay
+ * nest). Only counts cross the wire; the URP_HIST_NBUCKETS le upper-bound edges
+ * are compile-time constants shared with the exporter (kernel/urp_hist.h).
+ */
+enum urp_hist_attr {
+	URP_HIST_A_UNSPEC	= 0,
+	URP_HIST_A_STRIDE	= 1,	/* NLA_U32 -- sampling stride (1/10/100) */
+	URP_HIST_A_BUCKETS	= 2,	/* NLA_BINARY -- URP_HIST_NBUCKETS x u64 counts */
+	URP_HIST_A_SUM_NS	= 3,	/* NLA_U64 -- sum of observed deltas (ns) */
+	URP_HIST_A_COUNT	= 4,	/* NLA_U64 -- total observations */
+	__URP_HIST_A_MAX,
+};
+
+#define URP_HIST_A_MAX (__URP_HIST_A_MAX - 1)
 
 /*
  * Endpoint operating mode (per-endpoint, immutable, set at `urp add`).

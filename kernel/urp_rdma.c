@@ -619,6 +619,40 @@ void urp_send_done(struct ib_cq *cq, struct ib_wc *wc)
  * connection). Runs in the serialized recv-CQ workqueue context, so
  * kernel_sendmsg may sleep. Returns 0 or the sendmsg error.
  */
+/*
+ * Record one RX inter-arrival sample for a delivered DATA frame (design 40
+ * §40.1). Called once per received DATA frame from the recv-completion context,
+ * which is serialized on the single recv CQ, so @ia's writer-private bookkeeping
+ * (last_ns / nframes) needs no lock; only the buckets are atomic (read
+ * concurrently by netlink). For each stride s in {1,10,100} we bucket the gap
+ * since the last stride-s sample -- stride 1 is per-frame jitter, 10/100 are
+ * short/sustained rate. The first sample per stride primes last_ns and is not
+ * bucketed (no prior timestamp to diff against).
+ */
+static void urp_interarrival_sample(struct urp_endpoint *ep)
+{
+	struct urp_interarrival *ia = &ep->interarrival;
+	u64 now = ktime_get_ns();
+	u32 s;
+
+	ia->nframes++;
+	for (s = 0; s < URP_IA_NSTRIDES; s++) {
+		u32 stride = urp_ia_stride(s);
+
+		if (ia->nframes % stride)
+			continue;
+		if (ia->last_ns[s]) {
+			u64 delta = now - ia->last_ns[s];
+			u32 b = urp_hist_bucket(delta);
+
+			atomic64_inc(&ia->h[s].bucket[b]);
+			atomic64_add(delta, &ia->h[s].sum_ns);
+			atomic64_inc(&ia->h[s].count);
+		}
+		ia->last_ns[s] = now;
+	}
+}
+
 static int urp_rx_send_uds(struct urp_endpoint *ep, struct urp_stream *s,
 			   struct socket *uds, const void *data, u32 len)
 {
@@ -921,6 +955,14 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 		atomic64_inc(&ep->stats.buffer_alloc_fails);
 		goto repost;
 	}
+
+	/*
+	 * design 40 §40.1: record the RX inter-arrival sample for this DATA frame
+	 * (one wire frame == one arrival, before any reorder-drain fan-out). Gated
+	 * by urp.interarrival_hist so operators can disable the per-frame timestamp.
+	 */
+	if (urp_interarrival_hist)
+		urp_interarrival_sample(ep);
 
 	/*
 	 * Deliver the payload to the UDS socket.

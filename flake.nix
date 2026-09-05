@@ -121,6 +121,11 @@
         # faults each iteration, and prints a leak + perf-drift verdict.
         # `nix run .#urp-mesh-soak -- hp1 hp2 hp3`.
         urpMeshSoak = import ./nix/urp-mesh-soak.nix { inherit pkgs; };
+        # design 39 PR5 hardware validation: exporter footprint acceptance test
+        # (<1% goodput delta while scraping during all2all) + an 8h co-run soak
+        # sampling exporter RSS/fd. Need the exporter deployed on the hp nodes.
+        urpExporterAccept = import ./nix/urp-exporter-accept.nix { inherit pkgs; };
+        urpExporterSoak = import ./nix/urp-exporter-soak.nix { inherit pkgs; };
         # Zero-copy fast-path twins of the two matrices above (design 31 PR5b):
         # dedicated `--kind fast` endpoint pair, `urp-bench --mode uring-cmd`.
         #   .#urp-fast-bw-matrix (goodput), .#urp-fast-hw-matrix (RTT).
@@ -263,6 +268,7 @@
             protocol-tests urp-bench-units urp-bench-rs-tests
             urp-netlink-tests urp-control-tests urp-exporter-tests
             urp-fast-validate-units urp-reorder-units urp-conn-slot-units urp-window-units
+            urp-hist-units
             kernel-module-build
             urp-ko-6_1 urp-ko-6_6 urp-ko-6_12;
         };
@@ -310,6 +316,11 @@
           # Long-duration soak of the mesh benchmark (leak + perf-drift; needs boxes):
           #   SOAK_SECONDS=28800 nix run .#urp-mesh-soak -- [h1 h2 h3]
           urp-mesh-soak = urpMeshSoak;
+          # Exporter footprint acceptance test + co-run soak (design 39 PR5):
+          #   nix run .#urp-exporter-accept -- [h1 h2 h3]
+          #   SOAK_SECONDS=28800 nix run .#urp-exporter-soak -- [h1 h2 h3]
+          urp-exporter-accept = urpExporterAccept;
+          urp-exporter-soak = urpExporterSoak;
           # Zero-copy fast-path twins (design 31 PR5b; needs the boxes):
           #   nix run .#urp-fast-bw-matrix -- <acceptor> <initiator> <acceptor-ip>
           #   nix run .#urp-fast-hw-matrix -- <acceptor> <initiator> <acceptor-ip>
