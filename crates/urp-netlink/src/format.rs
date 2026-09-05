@@ -7,9 +7,30 @@ use serde_json::{json, Value};
 
 use crate::attr::{payload_str, payload_u16, payload_u32, payload_u64, payload_u8, AttrIter};
 use crate::uapi::{
-    UrpEndpointAttr, UrpEndpointState, UrpQpAttr, UrpQpState, UrpStatsAttr, UrpStreamAttr,
-    UrpStreamState,
+    UrpEndpointAttr, UrpEndpointState, UrpHistAttr, UrpQpAttr, UrpQpState, UrpStatsAttr,
+    UrpStreamAttr, UrpStreamState, URP_HIST_NBUCKETS,
 };
+
+/// le upper-bound edges (nanoseconds) of the histogram buckets, mirroring
+/// `urp_hist_edge_ns()` in `kernel/urp_hist.h`. The trailing +Inf bucket has no
+/// finite edge, so this has `URP_HIST_NBUCKETS - 1` entries. The exporter turns
+/// each into an `le="<seconds>"` label; a parity test pins it to the kernel
+/// header. **Keep in lock-step with the kernel edge table.**
+pub const URP_HIST_EDGES_NS: [u64; URP_HIST_NBUCKETS - 1] = [
+    250, 500, 1_000, 2_000, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000,
+    5_000_000, 25_000_000,
+];
+
+/// One classic histogram (design 40 §40.1) decoded from a `URP_HIST_A_*` sub-nest.
+/// `buckets` holds the `URP_HIST_NBUCKETS` **per-bucket** (non-cumulative) counts;
+/// the exporter accumulates them into the Prometheus cumulative `_bucket` contract.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct Histogram {
+    pub stride: u32,
+    pub buckets: Vec<u64>,
+    pub sum_ns: u64,
+    pub count: u64,
+}
 
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct Qp {
@@ -62,6 +83,10 @@ pub struct Endpoint {
     pub qps: Vec<Qp>,
     pub streams: Vec<Stream>,
     pub stats: Option<Stats>,
+    /// design 40 §40.1: RX inter-arrival histograms, one per sampling stride
+    /// (1/10/100). Empty when the module predates the feature or the sysctl is
+    /// off (the exporter then emits no inter-arrival family).
+    pub interarrival: Vec<Histogram>,
 }
 
 /// Decode a 28-byte sockaddr_in6 blob to a Rust SocketAddr (collapsing
@@ -152,6 +177,9 @@ impl Endpoint {
                 }
                 x if x == UrpEndpointAttr::Stats as u16 => {
                     ep.stats = Some(parse_stats(p));
+                }
+                x if x == UrpEndpointAttr::Interarrival as u16 => {
+                    ep.interarrival = parse_histograms(p);
                 }
                 _ => {}
             }
@@ -254,6 +282,20 @@ impl Endpoint {
             ));
             out.push_str(&format!("    auth-failures:     {}\n", st.auth_failures));
         }
+        if !self.interarrival.is_empty() {
+            out.push_str("  interarrival (RX):\n");
+            for h in &self.interarrival {
+                let mean_us = if h.count > 0 {
+                    h.sum_ns as f64 / h.count as f64 / 1000.0
+                } else {
+                    0.0
+                };
+                out.push_str(&format!(
+                    "    stride={:<3} count={} mean={:.1}us\n",
+                    h.stride, h.count, mean_us
+                ));
+            }
+        }
         out
     }
 
@@ -272,6 +314,7 @@ impl Endpoint {
             "qps": self.qps,
             "streams": self.streams,
             "stats": self.stats,
+            "interarrival": self.interarrival,
         })
     }
 }
@@ -374,6 +417,41 @@ fn parse_stats(buf: &[u8]) -> Stats {
     s
 }
 
+/// Decode the URP_ENDPOINT_A_INTERARRIVAL nest: an array of per-stride
+/// sub-nests, each a `urp_hist_attr` set (design 40 §40.1). A bucket blob whose
+/// length is not exactly `URP_HIST_NBUCKETS` u64s is treated as absent (the
+/// histogram is dropped) rather than partially decoded.
+fn parse_histograms(buf: &[u8]) -> Vec<Histogram> {
+    let mut out = Vec::new();
+    for (_idx, p) in AttrIter::new(buf) {
+        let mut h = Histogram::default();
+        let mut buckets_ok = false;
+        for (t, val) in AttrIter::new(p) {
+            match t {
+                x if x == UrpHistAttr::Stride as u16 => h.stride = payload_u32(val).unwrap_or(0),
+                x if x == UrpHistAttr::Buckets as u16 => {
+                    if val.len() == URP_HIST_NBUCKETS * 8 {
+                        h.buckets = (0..URP_HIST_NBUCKETS)
+                            .map(|i| {
+                                let o = i * 8;
+                                u64::from_ne_bytes(val[o..o + 8].try_into().unwrap())
+                            })
+                            .collect();
+                        buckets_ok = true;
+                    }
+                }
+                x if x == UrpHistAttr::SumNs as u16 => h.sum_ns = payload_u64(val).unwrap_or(0),
+                x if x == UrpHistAttr::Count as u16 => h.count = payload_u64(val).unwrap_or(0),
+                _ => {}
+            }
+        }
+        if buckets_ok {
+            out.push(h);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,6 +486,7 @@ mod tests {
                 rx_frames: 40,
                 ..Stats::default()
             }),
+            interarrival: vec![],
         }
     }
 
@@ -460,8 +539,75 @@ mod tests {
             "qps",
             "streams",
             "stats",
+            "interarrival",
         ] {
             assert!(parsed.get(k).is_some(), "missing key {k} in json");
         }
+    }
+
+    // design 40 §40.1: the URP_HIST_EDGES_NS le table must stay in lock-step
+    // with the kernel header (urp_hist_edge_ns in kernel/urp_hist.h). Re-parse
+    // the header's edge list and assert equality; skipped when the header is
+    // absent (published tarball) so the test still runs there.
+    #[test]
+    fn hist_edges_match_kernel_header() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernel/urp_hist.h");
+        let src = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => return, // header not shipped; nothing to check
+        };
+        // Grab the numbers inside the `edges[] = { ... };` initializer.
+        let start = src.find("edges[URP_HIST_NEDGES] = {").expect("edges table");
+        let end = src[start..].find("};").expect("edges end") + start;
+        let body = &src[start..end];
+        let nums: Vec<u64> = body
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|t| !t.is_empty())
+            .filter_map(|t| t.parse::<u64>().ok())
+            .collect();
+        assert_eq!(
+            nums, URP_HIST_EDGES_NS,
+            "Rust le table drifted from kernel/urp_hist.h edges"
+        );
+    }
+
+    // design 40 §40.1: decode a synthetic interarrival nest and confirm the
+    // per-stride histograms round-trip (buckets len, sum, count, stride).
+    #[test]
+    fn parse_interarrival_round_trip() {
+        use crate::attr::AttrBuf;
+        let mut nest = AttrBuf::new();
+        for stride in [1u32, 10, 100] {
+            nest.nest(stride as u16, |h| {
+                h.put_u32(UrpHistAttr::Stride as u16, stride);
+                let mut blob = Vec::new();
+                for b in 0..URP_HIST_NBUCKETS as u64 {
+                    blob.extend_from_slice(&(b + stride as u64).to_ne_bytes());
+                }
+                h.put_bytes(UrpHistAttr::Buckets as u16, &blob);
+                h.put_u64(UrpHistAttr::SumNs as u16, 123 * stride as u64);
+                h.put_u64(UrpHistAttr::Count as u16, 7 * stride as u64);
+            });
+        }
+        let hs = parse_histograms(nest.as_bytes());
+        assert_eq!(hs.len(), 3, "three strides");
+        for (i, stride) in [1u32, 10, 100].into_iter().enumerate() {
+            assert_eq!(hs[i].stride, stride);
+            assert_eq!(hs[i].buckets.len(), URP_HIST_NBUCKETS);
+            assert_eq!(hs[i].buckets[0], stride as u64); // b==0 -> 0+stride
+            assert_eq!(hs[i].sum_ns, 123 * stride as u64);
+            assert_eq!(hs[i].count, 7 * stride as u64);
+        }
+        // negative: a sub-nest with a wrong-length bucket blob is dropped.
+        let mut bad = AttrBuf::new();
+        bad.nest(1, |h| {
+            h.put_u32(UrpHistAttr::Stride as u16, 1);
+            h.put_bytes(UrpHistAttr::Buckets as u16, &[0u8; 8]); // too short
+            h.put_u64(UrpHistAttr::Count as u16, 1);
+        });
+        assert!(
+            parse_histograms(bad.as_bytes()).is_empty(),
+            "short blob dropped"
+        );
     }
 }

@@ -1,14 +1,20 @@
 {
-  "__comment": "Grafana dashboard for the urp exporter (design 39 §39.9). Import and select a Prometheus datasource. Panels: per-endpoint goodput/frame-rate, per-QP throughput split (the view that visualises the mesh startup fairness latch, design 38 §38.5), per-QP RTT, per-stream reorder depth, live credits, error counters, and exporter self-cost.",
+  "__comment": "Grafana dashboard for the urp exporter (design 39 \u00a739.9). Import and select a Prometheus datasource. Panels: per-endpoint goodput/frame-rate, per-QP throughput split (the view that visualises the mesh startup fairness latch, design 38 \u00a738.5), per-QP RTT, per-stream reorder depth, live credits, error counters, and exporter self-cost.",
   "title": "urp -- UDS-over-RoCEv2",
   "uid": "urp-exporter",
   "schemaVersion": 39,
   "version": 1,
   "editable": true,
   "timezone": "browser",
-  "time": { "from": "now-15m", "to": "now" },
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
   "refresh": "5s",
-  "tags": ["urp", "rdma"],
+  "tags": [
+    "urp",
+    "rdma"
+  ],
   "templating": {
     "list": [
       {
@@ -20,23 +26,41 @@
       {
         "name": "endpoint",
         "type": "query",
-        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
         "query": "label_values(urp_endpoint_num_qps, endpoint)",
         "refresh": 2,
         "includeAll": true,
         "multi": true,
-        "current": { "text": "All", "value": "$__all" }
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
       }
     ]
   },
   "panels": [
     {
       "id": 1,
-      "title": "Per-endpoint goodput (rx)",
+      "title": "Per-endpoint goodput (rx + tx)",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
-      "fieldConfig": { "defaults": { "unit": "Bps" } },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps"
+        }
+      },
       "targets": [
         {
           "expr": "rate(urp_endpoint_rx_bytes_total{endpoint=~\"$endpoint\"}[$__rate_interval])",
@@ -54,9 +78,21 @@
       "id": 2,
       "title": "Per-endpoint frame rate",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
-      "fieldConfig": { "defaults": { "unit": "fps" } },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "fps"
+        }
+      },
       "targets": [
         {
           "expr": "rate(urp_endpoint_rx_frames_total{endpoint=~\"$endpoint\"}[$__rate_interval])",
@@ -72,16 +108,33 @@
     },
     {
       "id": 3,
-      "title": "Per-QP throughput split (rx) -- fairness latch view (§38.5)",
+      "title": "Per-QP throughput split (rx + tx) -- fairness latch view (\u00a738.5)",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
-      "fieldConfig": { "defaults": { "unit": "Bps" } },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps"
+        }
+      },
       "targets": [
         {
           "expr": "rate(urp_qp_rx_bytes_total{endpoint=~\"$endpoint\"}[$__rate_interval])",
-          "legendFormat": "{{endpoint}} qp{{qp}}",
+          "legendFormat": "{{endpoint}} qp{{qp}} rx",
           "refId": "A"
+        },
+        {
+          "expr": "rate(urp_qp_tx_bytes_total{endpoint=~\"$endpoint\"}[$__rate_interval])",
+          "legendFormat": "{{endpoint}} qp{{qp}} tx",
+          "refId": "B"
         }
       ]
     },
@@ -89,9 +142,21 @@
       "id": 4,
       "title": "Per-QP RTT",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
-      "fieldConfig": { "defaults": { "unit": "ns" } },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ns"
+        }
+      },
       "targets": [
         {
           "expr": "urp_qp_rtt_ns{endpoint=~\"$endpoint\"}",
@@ -104,9 +169,21 @@
       "id": 5,
       "title": "Reorder-queue depth (per stream)",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
-      "fieldConfig": { "defaults": { "unit": "short" } },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
       "targets": [
         {
           "expr": "urp_stream_reorder_depth{endpoint=~\"$endpoint\"}",
@@ -119,9 +196,21 @@
       "id": 6,
       "title": "Live credits (per stream)",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
-      "fieldConfig": { "defaults": { "unit": "short" } },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
       "targets": [
         {
           "expr": "urp_stream_credits_local{endpoint=~\"$endpoint\"}",
@@ -139,8 +228,16 @@
       "id": 7,
       "title": "Endpoint state",
       "type": "state-timeline",
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 16
+      },
       "targets": [
         {
           "expr": "urp_endpoint_state{endpoint=~\"$endpoint\"} == 1",
@@ -153,9 +250,21 @@
       "id": 8,
       "title": "Error counters (rate) -- reorder drops / alloc fails / auth",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
-      "fieldConfig": { "defaults": { "unit": "cps" } },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps"
+        }
+      },
       "targets": [
         {
           "expr": "rate(urp_endpoint_reorder_drops_total{endpoint=~\"$endpoint\"}[$__rate_interval])",
@@ -183,9 +292,21 @@
       "id": 9,
       "title": "Exporter cost (scrape duration + up)",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
-      "fieldConfig": { "defaults": { "unit": "s" } },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
       "targets": [
         {
           "expr": "urp_exporter_scrape_duration_seconds",
@@ -201,6 +322,83 @@
           "expr": "urp_up",
           "legendFormat": "{{instance}} up",
           "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "RX inter-arrival p50/p99 by stride (design 40)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "description": "Distribution of the gap between delivered DATA frames, per sampling stride (1=per-frame jitter, 10/100=short/sustained rate). Not one-way latency -- that is design 40 PR-B (urp_endpoint_owd_seconds).",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "showPoints": "never"
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (endpoint,stride,le) (rate(urp_endpoint_interarrival_seconds_bucket{endpoint=~\"$endpoint\"}[$__rate_interval])))",
+          "legendFormat": "{{endpoint}} s{{stride}} p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (endpoint,stride,le) (rate(urp_endpoint_interarrival_seconds_bucket{endpoint=~\"$endpoint\"}[$__rate_interval])))",
+          "legendFormat": "{{endpoint}} s{{stride}} p99",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "RX inter-arrival distribution -- stride=1 (design 40)",
+      "type": "heatmap",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "description": "Per-frame RX inter-arrival distribution: the burst structure a mean rate cannot show. Widens under credit-stall / fairness sawtooth load.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "options": {
+        "calculate": false,
+        "cellGap": 1,
+        "color": {
+          "scheme": "Spectral",
+          "mode": "scheme"
+        },
+        "yAxis": {
+          "unit": "s"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (le) (rate(urp_endpoint_interarrival_seconds_bucket{endpoint=~\"$endpoint\",stride=\"1\"}[$__rate_interval]))",
+          "legendFormat": "{{le}}",
+          "format": "heatmap",
+          "refId": "A"
         }
       ]
     }

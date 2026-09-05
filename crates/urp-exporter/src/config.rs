@@ -26,6 +26,10 @@ pub struct Config {
     pub max_series: usize,
     /// Per-scrape netlink deadline; also the HTTP header read timeout.
     pub scrape_timeout: Duration,
+    /// Emit the RX inter-arrival histogram family (`urp_endpoint_interarrival_
+    /// seconds_*`). On by default -- surfaces only when the module reports the
+    /// nest (design 40 §40.1), so an old module simply emits nothing.
+    pub interarrival: bool,
 }
 
 impl Default for Config {
@@ -37,6 +41,7 @@ impl Default for Config {
             per_stream: false,
             max_series: 100_000,
             scrape_timeout: Duration::from_millis(2000),
+            interarrival: true,
         }
     }
 }
@@ -51,6 +56,7 @@ pub fn usage() -> ! {
          \x20 --max-series N         (default 100000)\n\
          \x20 --per-qp / --no-per-qp (default on)\n\
          \x20 --per-stream           (default off)\n\
+         \x20 --no-interarrival      (default on; RX inter-arrival histogram)\n\
          serves Prometheus /metrics scraped from the urp kernel module."
     );
     std::process::exit(2);
@@ -92,6 +98,8 @@ impl Config {
                 "--per-qp" => cfg.per_qp = true,
                 "--no-per-qp" => cfg.per_qp = false,
                 "--per-stream" => cfg.per_stream = true,
+                "--interarrival" => cfg.interarrival = true,
+                "--no-interarrival" => cfg.interarrival = false,
                 "--help" | "-h" => usage(),
                 _ => usage(),
             }
@@ -110,7 +118,7 @@ mod tests {
     fn parse_flags_truth_table() {
         let s = |v: &str| v.to_string();
         // Each case: (argv tokens, predicate on the resulting Config).
-        let cases: [(Vec<String>, fn(&Config) -> bool); 6] = [
+        let cases: [(Vec<String>, fn(&Config) -> bool); 7] = [
             // positive: an explicit listen addr round-trips
             (vec![s("--listen"), s("0.0.0.0:9100")], |c| {
                 c.listen.port() == 9100 && c.listen.ip().is_unspecified()
@@ -135,6 +143,8 @@ mod tests {
             (vec![s("--scrape-timeout-ms"), s("1234")], |c| {
                 c.scrape_timeout.as_millis() == 1234 && c.cache_ttl.as_millis() == 250
             }),
+            // design 40: interarrival is on by default, --no-interarrival flips it
+            (vec![s("--no-interarrival")], |c| !c.interarrival),
         ];
         for (i, (argv, pred)) in cases.into_iter().enumerate() {
             let cfg = Config::parse(&argv);

@@ -37,6 +37,8 @@ unsigned int urp_connect_backoff_ceil_ms = URP_CONNECT_BACKOFF_CEIL_MS_DEFAULT;
 unsigned int urp_window_bytes_advertise	 = URP_WINDOW_BYTES_ADVERTISE_DEFAULT;
 /* gap #6 Phase 2 (PR3): per-stream byte window; clamped at stream create. */
 unsigned int urp_window_bytes		 = URP_WINDOW_BYTES_DEFAULT;
+/* design 40 §40.1: RX inter-arrival histogram sampling (default on). */
+unsigned int urp_interarrival_hist	 = URP_INTERARRIVAL_HIST_DEFAULT;
 
 /* proc_douintvec_minmax bounds (extra1/extra2 are void*, so non-const). */
 static unsigned int urp_uint_zero;			/* 0 */
@@ -97,6 +99,18 @@ static struct ctl_table urp_sysctls[] = {
 		.proc_handler	= proc_douintvec_minmax,
 		.extra1		= &urp_window_bytes_min,
 		.extra2		= &urp_window_bytes_max,
+	},
+	{
+		/* design 40 §40.1: 0 = disable RX inter-arrival histogram
+		 * sampling (and its netlink nest), non-zero = enable (default).
+		 */
+		.procname	= "interarrival_hist",
+		.data		= &urp_interarrival_hist,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec_minmax,
+		.extra1		= &urp_uint_zero,
+		.extra2		= &urp_uint_one,
 	},
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
 	{ }	/* sentinel: required before 6.11, forbidden after */

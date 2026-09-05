@@ -77,7 +77,23 @@ pub enum UrpEndpointAttr {
     Stats = 14,
     Mode = 15,
     Kind = 16,
+    Interarrival = 17,
 }
+
+// --- enum urp_hist_attr (design 40 §40.1) ---
+#[repr(u16)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum UrpHistAttr {
+    Unspec = 0,
+    Stride = 1,
+    Buckets = 2,
+    SumNs = 3,
+    Count = 4,
+}
+
+/// Number of histogram buckets (14 finite le edges + +Inf), mirroring
+/// `URP_HIST_NBUCKETS` in `kernel/urp_hist.h`.
+pub const URP_HIST_NBUCKETS: usize = 15;
 
 /// enum urp_ep_mode -- endpoint operating mode (URP_ENDPOINT_A_MODE payload).
 pub const URP_EP_MODE_MULTISTREAM: u8 = 0;

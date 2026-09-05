@@ -41,6 +41,7 @@ let
     { name = "urp-reorder-units"; drv = checks.urp-reorder-units; }
     { name = "urp-conn-slot-units"; drv = checks.urp-conn-slot-units; }
     { name = "urp-window-units"; drv = checks.urp-window-units; }
+    { name = "urp-hist-units"; drv = checks.urp-hist-units; }
     { name = "kernel-module-build"; drv = checks.kernel-module-build; }
     { name = "urp-ko-6_1"; drv = checks.urp-ko-6_1; }
     { name = "urp-ko-6_6"; drv = checks.urp-ko-6_6; }

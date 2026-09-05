@@ -422,6 +422,33 @@ in
     '';
   };
 
+  # design 40 §40.1: pure histogram bucketing (kernel/urp_hist.h). Same
+  # sandboxed-userspace-twin pattern as urp-window-units; must agree with the
+  # KUnit cases in kernel/urp_test.c.
+  urp-hist-units = pkgs.stdenv.mkDerivation {
+    name = "urp-hist-units";
+    src = pkgs.lib.fileset.toSource {
+      root = ../.;
+      fileset = pkgs.lib.fileset.unions [
+        ../kernel/urp_hist.h
+        ../tools/urp-hist-units.c
+      ];
+    };
+    buildPhase = ''
+      $CC -Wall -Wextra -Werror -O2 -I kernel \
+        -o urp-hist-units \
+        tools/urp-hist-units.c
+    '';
+    doCheck = true;
+    checkPhase = ''
+      ./urp-hist-units
+    '';
+    installPhase = ''
+      mkdir -p $out
+      touch $out/passed
+    '';
+  };
+
   # NOTE: miri requires network access to build its sysroot (fetches cfg-if for std).
   # This is incompatible with Nix's sandbox. Run miri via devshell instead:
   #   nix develop --command cargo miri test -p uds-rdma-protocol

@@ -1059,6 +1059,46 @@ static void test_reorder_depth_for_window(struct kunit *test)
 }
 
 /*
+ * design 40 §40.1: RX inter-arrival histogram bucketing. Pins the exact same
+ * pure classifier the userspace twin (tools/urp-hist-units.c, nix check
+ * urp-hist-units) drives -- one set of decisions, two drivers.
+ */
+static void test_hist_bucket(struct kunit *test)
+{
+	u32 i;
+
+	/* corner: zero / <= first edge (250 ns) -> bucket 0. */
+	KUNIT_EXPECT_EQ(test, urp_hist_bucket(0), 0u);
+	KUNIT_EXPECT_EQ(test, urp_hist_bucket(1), 0u);
+	KUNIT_EXPECT_EQ(test, urp_hist_bucket(250), 0u);
+	/* boundary: one past an edge crosses into the next bucket (le semantics). */
+	KUNIT_EXPECT_EQ(test, urp_hist_bucket(251), 1u);
+	KUNIT_EXPECT_EQ(test, urp_hist_bucket(500), 1u);
+	KUNIT_EXPECT_EQ(test, urp_hist_bucket(501), 2u);
+	/* positive: exact edges map to their own bucket. */
+	KUNIT_EXPECT_EQ(test, urp_hist_bucket(1000), 2u);
+	KUNIT_EXPECT_EQ(test, urp_hist_bucket(10000), 5u);
+	KUNIT_EXPECT_EQ(test, urp_hist_bucket(100000), 8u);
+	KUNIT_EXPECT_EQ(test, urp_hist_bucket(1000000), 11u);
+	/* boundary: last finite edge (25 ms) and just past it -> +Inf. */
+	KUNIT_EXPECT_EQ(test, urp_hist_bucket(25000000), URP_HIST_NEDGES - 1u);
+	KUNIT_EXPECT_EQ(test, urp_hist_bucket(25000001), URP_HIST_NBUCKETS - 1u);
+	/* corner: huge -> +Inf catch-all. */
+	KUNIT_EXPECT_EQ(test, urp_hist_bucket(1000000000ULL), URP_HIST_NBUCKETS - 1u);
+	KUNIT_EXPECT_EQ(test, urp_hist_bucket((u64)~0ULL), URP_HIST_NBUCKETS - 1u);
+
+	/* edge table is strictly increasing; +Inf sentinel is U64_MAX. */
+	for (i = 1; i < URP_HIST_NEDGES; i++)
+		KUNIT_EXPECT_GT(test, urp_hist_edge_ns(i), urp_hist_edge_ns(i - 1));
+	KUNIT_EXPECT_EQ(test, urp_hist_edge_ns(URP_HIST_NEDGES), (u64)~0ULL);
+
+	/* sampling strides {1,10,100}. */
+	KUNIT_EXPECT_EQ(test, urp_ia_stride(0), 1u);
+	KUNIT_EXPECT_EQ(test, urp_ia_stride(1), 10u);
+	KUNIT_EXPECT_EQ(test, urp_ia_stride(2), 100u);
+}
+
+/*
  * gap #6 Phase 2: CREDIT-BYTES CONTROL payload codec. The u64 cumulative byte
  * grant must round-trip little-endian, and the decoder must reject a short
  * payload (the apply path then ignores a malformed grant). Kept numerically in
@@ -1919,6 +1959,8 @@ static struct kunit_case urp_test_cases[] = {
 	KUNIT_CASE(test_window_for_stream),
 	KUNIT_CASE(test_link_speed_mbps),
 	KUNIT_CASE(test_reorder_depth_for_window),
+	/* design 40 §40.1: RX inter-arrival histogram bucketing. */
+	KUNIT_CASE(test_hist_bucket),
 	/* design 32: acceptor connection plan (eager-connect gate) */
 	KUNIT_CASE(test_acceptor_eager_connect),
 	/* design 32: credit-grant routing (per-stream vs per-QP pool) */

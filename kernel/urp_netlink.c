@@ -296,6 +296,45 @@ static int urp_fill_endpoint(struct sk_buff *skb, struct urp_endpoint *ep,
 				      atomic64_read(&ep->stats.auth_failures), 0))
 			goto cancel;
 		nla_nest_end(skb, stats_nest);
+
+		/*
+		 * design 40 §40.1: RX inter-arrival histograms -- one sub-nest
+		 * per sampling stride (1/10/100). Only counts cross the wire; the
+		 * le edges are compile-time constants shared with the exporter
+		 * (kernel/urp_hist.h). Gated by the same sysctl as the sampling,
+		 * so a disabled histogram adds no bytes and surfaces no metric.
+		 */
+		if (urp_interarrival_hist) {
+			struct nlattr *ia_nest =
+				nla_nest_start(skb, URP_ENDPOINT_A_INTERARRIVAL);
+			u32 s;
+
+			if (!ia_nest)
+				goto cancel;
+			for (s = 0; s < URP_IA_NSTRIDES; s++) {
+				struct urp_hist15 *h = &ep->interarrival.h[s];
+				struct nlattr *h_entry =
+					nla_nest_start(skb, s + 1);
+				u64 buckets[URP_HIST_NBUCKETS];
+				u32 b;
+
+				if (!h_entry)
+					goto cancel;
+				for (b = 0; b < URP_HIST_NBUCKETS; b++)
+					buckets[b] = atomic64_read(&h->bucket[b]);
+				if (nla_put_u32(skb, URP_HIST_A_STRIDE,
+						urp_ia_stride(s)) ||
+				    nla_put(skb, URP_HIST_A_BUCKETS,
+					    sizeof(buckets), buckets) ||
+				    nla_put_u64_64bit(skb, URP_HIST_A_SUM_NS,
+						      atomic64_read(&h->sum_ns), 0) ||
+				    nla_put_u64_64bit(skb, URP_HIST_A_COUNT,
+						      atomic64_read(&h->count), 0))
+					goto cancel;
+				nla_nest_end(skb, h_entry);
+			}
+			nla_nest_end(skb, ia_nest);
+		}
 	}
 
 	nla_nest_end(skb, nest);

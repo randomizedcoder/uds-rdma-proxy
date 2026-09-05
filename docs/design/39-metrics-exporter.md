@@ -459,7 +459,11 @@ Graphs the same data unlocks: per-endpoint goodput
 - **Latency/credit gaps.** The module exposes only `rtt_ewma_ns` — no latency
   histograms, no credit-*grant* counters (design 35/36 wishlist in
   [11-metrics.md](11-metrics.md)). Those need new kernel counters before the
-  exporter can surface them; out of scope here.
+  exporter can surface them; out of scope here. **The latency-histogram half is
+  now specified in
+  [40. Datapath Latency & Rate Histograms](40-datapath-latency-histograms.md)**
+  (an inter-arrival rate/jitter histogram with no protocol change, plus a
+  PTP-based one-way delivery-latency histogram).
 
 ## 39.12 How to reproduce (once implemented)
 

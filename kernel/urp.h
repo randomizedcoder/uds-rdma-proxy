@@ -37,6 +37,7 @@
 #include "include/uapi/linux/urp.h"
 #include "urp_credit.h"
 #include "urp_window.h"
+#include "urp_hist.h"
 #include "urp_reorder.h"
 
 /*
@@ -232,6 +233,31 @@ struct urp_stats {
 	atomic64_t	auth_failures;
 };
 
+/*
+ * struct urp_hist15 - a fixed classic histogram (design 40 §40.1).
+ * Buckets carry per-bucket (non-cumulative) counts; the exporter accumulates
+ * them into the Prometheus cumulative _bucket contract at render. atomic64 so
+ * the netlink reader sees torn-free counts (same contract as urp_stats).
+ */
+struct urp_hist15 {
+	atomic64_t	bucket[URP_HIST_NBUCKETS];
+	atomic64_t	sum_ns;
+	atomic64_t	count;
+};
+
+/*
+ * struct urp_interarrival - per-endpoint RX inter-arrival state (design 40).
+ * @last_ns / @nframes are written only from the recv-completion context, which
+ * is serialized on the single recv CQ (see the recv_scratch comment in struct
+ * urp_endpoint), so they need no lock or atomic. @h[] buckets ARE atomic because
+ * the netlink reader samples them concurrently.
+ */
+struct urp_interarrival {
+	u64			last_ns[URP_IA_NSTRIDES];  /* writer-private */
+	u64			nframes;		   /* writer-private */
+	struct urp_hist15	h[URP_IA_NSTRIDES];	   /* stride 1 / 10 / 100 */
+};
+
 struct urp_endpoint;	/* forward decl for struct urp_qp */
 
 /*
@@ -383,6 +409,15 @@ extern unsigned int urp_window_bytes_advertise;
  * newly created streams.
  */
 extern unsigned int urp_window_bytes;
+
+/*
+ * design 40 §40.1: enable RX inter-arrival histogram sampling (default on -- the
+ * per-frame cost is one ktime_get_ns + a branchless bucket + up to three
+ * atomic64_inc). 0 disables both the sampling and the netlink nest. Writable via
+ * /proc/sys/urp/interarrival_hist.
+ */
+#define URP_INTERARRIVAL_HIST_DEFAULT	1
+extern unsigned int urp_interarrival_hist;
 
 /* urp_sysctl.c -- /proc/sys/urp/ runtime tunables (design 33 Phase 1). */
 int  urp_sysctl_register(void);
@@ -636,6 +671,14 @@ struct urp_endpoint {
 
 	/* Runtime state */
 	struct urp_stats	stats;
+	/*
+	 * design 40 §40.1: RX inter-arrival histograms. Colocated with stats
+	 * but kept separate because it mixes writer-private bookkeeping with
+	 * atomic buckets. Sampled from the (serialized) recv-completion context
+	 * via urp_interarrival_sample(); emitted over netlink beside the stats
+	 * nest. Zero-initialized with the endpoint (kzalloc).
+	 */
+	struct urp_interarrival	interarrival;
 	struct completion	cm_done;
 	int			cm_status;
 	bool			connected;
