@@ -34,6 +34,36 @@ pub const URP_BUFFER_SIZE_MAX: u32 = 1048576;
 
 pub const URP_DEFAULT_PORT: u16 = 4791;
 
+// --- wire frame constants (kernel/include/uapi/linux/urp.h) -----------------
+// Mirrored here and pinned by the table-driven `wire_defines_match_kernel_header`
+// parity test so a symbol used on the wire cannot silently drift from -- or go
+// missing in -- the kernel header (design 40: the class of bug where
+// URP_CONN_CAP_TSTAMP was referenced in C but never `#define`d).
+
+pub const URP_FRAME_HEADER_SIZE: u32 = 20;
+pub const URP_PONG_PAYLOAD_SIZE: u32 = 48;
+
+/// DATA-frame flag byte [13] bits. SYN/FIN/RST occupy bits 0..2; the OWD
+/// timestamp trailer takes the next free bit (design 40 §40.2 -- NOT BIT(1),
+/// which the original spec mis-stated).
+pub const URP_DATA_FLAG_SYN: u8 = 1 << 0;
+pub const URP_DATA_FLAG_FIN: u8 = 1 << 1;
+pub const URP_DATA_FLAG_RST: u8 = 1 << 2;
+pub const URP_DATA_FLAG_TSTAMP: u8 = 1 << 3;
+/// Length of the little-endian u64 `t_send_real` (ns) OWD trailer.
+pub const URP_TSTAMP_TRAILER_LEN: u32 = 8;
+
+/// CONTROL-frame flag bits. CREDIT_BYTES is bit 5 (bits 1..4 reserved by the
+/// Rust protocol twin; see the kernel header comment).
+pub const URP_CTRL_FLAG_CREDIT: u8 = 1 << 0;
+pub const URP_CTRL_FLAG_CREDIT_BYTES: u8 = 1 << 5;
+pub const URP_CREDIT_BYTES_PAYLOAD_SIZE: u32 = 8;
+
+/// Connection capability bits, advertised in the CM private_data trailer and
+/// negotiated by BOTH peers before the feature activates (design 35 §35.3).
+pub const URP_CONN_CAP_WINDOW_BYTES: u8 = 1 << 0;
+pub const URP_CONN_CAP_TSTAMP: u8 = 1 << 1;
+
 /// Generic netlink control family id (well-known).
 pub const GENL_ID_CTRL: u16 = 16;
 
@@ -356,5 +386,282 @@ mod tests {
         // Spot-check that the family name string is right.
         assert!(txt.contains("\"urp\""));
         assert!(txt.contains("\"events\""));
+    }
+
+    /// Evaluate a scalar `#define NAME VALUE` from kernel C header text, or
+    /// `None` if `name` is not `#define`d. Supports the value forms the header
+    /// actually uses: a decimal or `0x` hex literal (optional `U`/`u` suffix),
+    /// and a single `(1 << N)` bit-shift. A trailing `/* ... */` or `// ...`
+    /// comment is ignored. Deliberately fail-closed: an absent symbol, or a
+    /// value form it cannot evaluate, returns `None` (never a silent 0) so the
+    /// parity test below cannot pass by accident.
+    fn eval_define(src: &str, name: &str) -> Option<i64> {
+        let needle = format!("#define {}", name);
+        // Match the whole token: "#define NAME" must be followed by whitespace,
+        // so `URP_CONN_CAP` does not match `URP_CONN_CAP_WINDOW_BYTES`.
+        let line = src.lines().find(|l| {
+            let t = l.trim_start();
+            t.starts_with(&needle)
+                && t[needle.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_whitespace())
+        })?;
+        // Value = text after the name, minus any trailing comment.
+        let after = line.trim_start()[needle.len()..].trim();
+        let val = after
+            .split("/*")
+            .next()
+            .unwrap_or("")
+            .split("//")
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches(|c| c == '(' || c == ')')
+            .trim();
+        let parse_int = |s: &str| -> Option<i64> {
+            // Order matters: strip a `U`/`u` integer suffix first, then any stray
+            // parens (e.g. the `3)` left of an `(1 << 3)U` rhs), then re-trim.
+            let s = s
+                .trim()
+                .trim_matches(|c| c == '(' || c == ')')
+                .trim_end_matches(['U', 'u'])
+                .trim_matches(|c| c == '(' || c == ')')
+                .trim();
+            if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                i64::from_str_radix(hex, 16).ok()
+            } else {
+                s.parse::<i64>().ok()
+            }
+        };
+        if let Some((lhs, rhs)) = val.split_once("<<") {
+            Some(parse_int(lhs)? << parse_int(rhs)?)
+        } else {
+            parse_int(val)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Outcome {
+        /// The symbol must be `#define`d and evaluate to `value`.
+        Present,
+        /// The symbol must NOT be `#define`d (proves the checker fails closed).
+        Absent,
+    }
+
+    /// A wire-constant parity row: the kernel `#define` symbol, the value the
+    /// Rust mirror expects, a human description, and whether the symbol is
+    /// expected present or absent.
+    struct Case {
+        name: &'static str,
+        value: i64,
+        desc: &'static str,
+        outcome: Outcome,
+    }
+
+    // design 40: guard the wire/negotiation `#define` family against the exact
+    // class of bug where `URP_CONN_CAP_TSTAMP` was referenced in C but never
+    // `#define`d in the header (undetected because its only user, urp_test.c,
+    // isn't compiled by `.#urp-ko`). This table re-parses the header for every
+    // symbol the Rust mirror carries and asserts value AND presence -- so a
+    // missing or drifted define fails here, in a tier that always compiles.
+    #[test]
+    fn wire_defines_match_kernel_header() {
+        let candidates = [
+            "../../kernel/include/uapi/linux/urp.h",
+            "../../../kernel/include/uapi/linux/urp.h",
+            "kernel/include/uapi/linux/urp.h",
+        ];
+        let path = candidates.iter().find(|c| Path::new(c).exists());
+        let path = match path {
+            Some(p) => *p,
+            None => {
+                eprintln!("skipping wire_defines_match_kernel_header: header not found");
+                return;
+            }
+        };
+        let txt = std::fs::read_to_string(path).expect("read header");
+
+        let cases: &[Case] = &[
+            // --- positive: each wire constant the Rust mirror carries is
+            //     #define'd with the matching value. ---
+            Case {
+                name: "URP_FRAME_HEADER_SIZE",
+                value: URP_FRAME_HEADER_SIZE as i64,
+                desc: "20-byte LE frame header",
+                outcome: Outcome::Present,
+            },
+            Case {
+                name: "URP_PONG_PAYLOAD_SIZE",
+                value: URP_PONG_PAYLOAD_SIZE as i64,
+                desc: "PONG probe payload (drives URP_BUFFER_SIZE_MIN)",
+                outcome: Outcome::Present,
+            },
+            Case {
+                name: "URP_DATA_FLAG_SYN",
+                value: URP_DATA_FLAG_SYN as i64,
+                desc: "DATA flag bit 0",
+                outcome: Outcome::Present,
+            },
+            Case {
+                name: "URP_DATA_FLAG_FIN",
+                value: URP_DATA_FLAG_FIN as i64,
+                desc: "DATA flag bit 1",
+                outcome: Outcome::Present,
+            },
+            Case {
+                name: "URP_DATA_FLAG_RST",
+                value: URP_DATA_FLAG_RST as i64,
+                desc: "DATA flag bit 2",
+                outcome: Outcome::Present,
+            },
+            Case {
+                name: "URP_CTRL_FLAG_CREDIT",
+                value: URP_CTRL_FLAG_CREDIT as i64,
+                desc: "CONTROL frame-credit grant flag",
+                outcome: Outcome::Present,
+            },
+            Case {
+                name: "URP_CTRL_FLAG_CREDIT_BYTES",
+                value: URP_CTRL_FLAG_CREDIT_BYTES as i64,
+                desc: "CONTROL byte-credit grant flag (bit 5)",
+                outcome: Outcome::Present,
+            },
+            Case {
+                name: "URP_CREDIT_BYTES_PAYLOAD_SIZE",
+                value: URP_CREDIT_BYTES_PAYLOAD_SIZE as i64,
+                desc: "u64 cumulative byte-credit payload",
+                outcome: Outcome::Present,
+            },
+            Case {
+                name: "URP_CONN_CAP_WINDOW_BYTES",
+                value: URP_CONN_CAP_WINDOW_BYTES as i64,
+                desc: "byte-windowing capability bit",
+                outcome: Outcome::Present,
+            },
+            // --- positive: the design-40 additions that regressed. This row is
+            //     the direct regression guard for the latent PR-B1 bug. ---
+            Case {
+                name: "URP_CONN_CAP_TSTAMP",
+                value: URP_CONN_CAP_TSTAMP as i64,
+                desc: "OWD timestamp capability bit (design 40 PR-B)",
+                outcome: Outcome::Present,
+            },
+            Case {
+                name: "URP_TSTAMP_TRAILER_LEN",
+                value: URP_TSTAMP_TRAILER_LEN as i64,
+                desc: "8-byte LE t_send_real OWD trailer",
+                outcome: Outcome::Present,
+            },
+            // --- boundary: the OWD flag must be exactly BIT(3). Bits 0..2 are
+            //     SYN/FIN/RST; the original spec mis-stated it as BIT(1). If the
+            //     header ever moves it back onto an occupied bit, this fails. ---
+            Case {
+                name: "URP_DATA_FLAG_TSTAMP",
+                value: 1 << 3,
+                desc: "OWD flag = next free DATA bit (BIT(3), not BIT(1))",
+                outcome: Outcome::Present,
+            },
+            // --- negative: a symbol that is NOT in the header must evaluate to
+            //     None. This proves eval_define fails closed -- the property the
+            //     ORIGINAL parity test lacked, which let the missing
+            //     URP_CONN_CAP_TSTAMP define ship. If this row ever "passes" by
+            //     finding a value, the checker is broken and every Present row
+            //     above is worthless. ---
+            Case {
+                name: "URP_CONN_CAP_NONEXISTENT_XYZZY",
+                value: 0,
+                desc: "bogus symbol -- checker must report Absent",
+                outcome: Outcome::Absent,
+            },
+            // --- corner: a prefix of a real symbol must not match the longer
+            //     one. `URP_CONN_CAP` is not itself defined; the whole-token
+            //     match must return None rather than latching onto
+            //     URP_CONN_CAP_WINDOW_BYTES. ---
+            Case {
+                name: "URP_CONN_CAP",
+                value: 0,
+                desc: "prefix of a real define -- must not partial-match",
+                outcome: Outcome::Absent,
+            },
+        ];
+
+        for (i, c) in cases.iter().enumerate() {
+            let got = eval_define(&txt, c.name);
+            match c.outcome {
+                Outcome::Present => assert_eq!(
+                    got,
+                    Some(c.value),
+                    "case {i} ({}): {} -- expected #define = {}, header gave {:?}",
+                    c.name,
+                    c.desc,
+                    c.value,
+                    got
+                ),
+                Outcome::Absent => assert_eq!(
+                    got, None,
+                    "case {i} ({}): {} -- expected symbol absent, header gave {:?}",
+                    c.name, c.desc, got
+                ),
+            }
+        }
+
+        // --- corner: the flag/cap bits must be pairwise distinct. A value-only
+        //     table would still pass if, say, TSTAMP were redefined onto RST's
+        //     bit (each still equals "its own" define); this pins the structural
+        //     no-collision invariant the bit layout depends on. The mirror
+        //     constants are themselves header-pinned by the Present rows above,
+        //     so this is transitively a header invariant. ---
+        let data_flags = [
+            URP_DATA_FLAG_SYN,
+            URP_DATA_FLAG_FIN,
+            URP_DATA_FLAG_RST,
+            URP_DATA_FLAG_TSTAMP,
+        ];
+        for (a, fa) in data_flags.iter().enumerate() {
+            for fb in &data_flags[a + 1..] {
+                assert_eq!(fa & fb, 0, "DATA flag bits collide: {fa:#x} & {fb:#x}");
+            }
+        }
+        assert_eq!(
+            URP_CONN_CAP_WINDOW_BYTES & URP_CONN_CAP_TSTAMP,
+            0,
+            "CONN cap bits collide"
+        );
+    }
+
+    // Unit-cover the eval_define helper's expression forms directly, so a
+    // failure in the parity test above can be localized to data vs. parser.
+    #[test]
+    fn eval_define_truth_table() {
+        let src = "\
+#define A_DEC        42
+#define A_HEX        0x2a
+#define A_SHIFT      (1 << 5)
+#define A_SHIFT_U    (1 << 3)U
+#define A_SUFFIX     16U
+#define A_PREFIX     7
+#define A_PREFIX_X   9
+";
+        // Each case: (symbol, expected, description).
+        let cases: &[(&str, Option<i64>, &str)] = &[
+            // positive: plain decimal
+            ("A_DEC", Some(42), "decimal literal"),
+            // positive: hex literal
+            ("A_HEX", Some(0x2a), "hex literal equals its decimal"),
+            // positive: parenthesized bit-shift
+            ("A_SHIFT", Some(32), "(1 << 5) evaluates"),
+            // boundary: shift with a U suffix on the rhs
+            ("A_SHIFT_U", Some(8), "(1 << 3)U suffix tolerated"),
+            // boundary: integer with U suffix
+            ("A_SUFFIX", Some(16), "trailing U stripped"),
+            // negative: absent symbol -> None (fail-closed)
+            ("A_MISSING", None, "absent symbol is None, never 0"),
+            // corner: a prefix must not match the longer symbol name
+            ("A_PREFIX", Some(7), "exact token, not the A_PREFIX_X line"),
+        ];
+        for (i, (name, want, desc)) in cases.iter().enumerate() {
+            assert_eq!(eval_define(src, name), *want, "case {i} ({name}): {desc}");
+        }
     }
 }
