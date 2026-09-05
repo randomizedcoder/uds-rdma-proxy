@@ -2,15 +2,15 @@
 
 Status: **PR-A (inter-arrival histogram) implemented + live-validated on the mesh
 (2026-09-05); PR-B1 (OWD plumbing/codec, hardware-free) implemented (2026-09-05);
-PR-B2 (OWD datapath + surface) + PR-C (hardware validation) designed, not yet
-built.** Follow-up
+PR-B2 (OWD datapath + full exporter/Grafana surface) implemented (2026-09-05);
+PR-C (live PTP-mesh validation) pending.** Follow-up
 to [39. Metrics Exporter](39-metrics-exporter.md) §39.11 ("Latency/credit gaps —
 the module exposes only `rtt_ewma_ns`; no latency histograms"). Specifies two new
 kernel-measured distributions, surfaced through the same generic-netlink → exporter
-→ Grafana path design 39 already built. PR-A ships the RX inter-arrival histogram
-end to end (kernel sampler + netlink nest + `urp-netlink` decode + exporter family +
-Grafana panels + KUnit/userspace/render tests, all hardware-free); PR-B/PR-C below
-remain design.
+→ Grafana path design 39 already built. PR-A + PR-B ship both histograms end to end
+(kernel sampler + netlink nest + `urp-netlink` decode + exporter family + Grafana
+panels + KUnit/userspace/render tests, all hardware-free); PR-C below validates OWD
+against the PTP-synced mesh.
 
 ## 40.0 Why — the gap this closes
 
@@ -249,12 +249,19 @@ urp_endpoint_interarrival_seconds_count{stride="1"}              <n>
    # …repeated for stride="10", stride="100"
 
 # Histogram B — labels {endpoint, device}
-urp_endpoint_owd_seconds_bucket{le="1e-05"}  <cumsum>
-urp_endpoint_owd_seconds_sum                 <Σ owd seconds>
-urp_endpoint_owd_seconds_count               <n>
-urp_endpoint_owd_clock_offset_ns             <gauge; 0 = unknown/no-PTP>
-urp_endpoint_owd_clock_anomalies_total       <counter; skew-rejected samples>
+urp_endpoint_owd_seconds_bucket{le="1e-05"}   <cumsum>
+urp_endpoint_owd_seconds_sum                  <Σ owd seconds>
+urp_endpoint_owd_seconds_count                <n>
+urp_endpoint_owd_clock_offset_seconds         <gauge; 0 = unknown/no-PTP>
+urp_endpoint_owd_anomalies_total              <counter; skew-rejected samples>
 ```
+
+> **Naming (PR-B2).** The offset gauge and anomaly counter ship as
+> `urp_endpoint_owd_clock_offset_seconds` and `urp_endpoint_owd_anomalies_total`
+> (this section's earlier sketch wrote `_clock_offset_ns` / `_clock_anomalies_total`).
+> Prometheus convention is base units — **seconds**, not nanoseconds — matching the
+> `_seconds` histogram families above; the kernel carries the offset in ns
+> (`URP_OWD_A_CLOCK_OFFSET_NS`) and the renderer divides by 1e9.
 
 The kernel stores **per-bucket** (non-cumulative) counts; the renderer accumulates
 into `le`-ordered cumulative sums (Prometheus histogram contract) as it emits — a
@@ -275,9 +282,12 @@ so a node without PTP/OWD simply omits family B.
 **Grafana** (design 39 dashboard JSON, consumed from the upstream repo on `l` —
 edits need merge-first, memory `design39-exporter`):
 
-- **OWD percentiles** — `histogram_quantile(0.5|0.99|0.999, sum by (le)
-  (rate(urp_endpoint_owd_seconds_bucket[1m])))`. Three lines; the p999 line is the
-  low-latency SLO. Greyed when `urp_endpoint_owd_clock_offset_ns` is high/unknown.
+- **OWD percentiles (PR-B2, shipped)** — `histogram_quantile(0.5|0.99|0.999, sum by
+  (endpoint,le) (rate(urp_endpoint_owd_seconds_bucket[$__rate_interval])))`, three
+  lines; the p999 line is the low-latency SLO. Paired panels added to the design 39
+  dashboard: a full-distribution OWD heatmap (a bimodal split is the fairness latch)
+  and a `urp_endpoint_owd_clock_offset_seconds` + `rate(owd_anomalies_total)` panel to
+  read PTP health before trusting the percentiles.
 - **Inter-arrival (PR-A, shipped)** — two panels added to the design 39 dashboard:
   (1) a percentiles-by-stride timeseries — `histogram_quantile(0.5|0.99, sum by
   (endpoint,stride,le) (rate(urp_endpoint_interarrival_seconds_bucket[$__rate_interval])))`
@@ -291,11 +301,12 @@ edits need merge-first, memory `design39-exporter`):
 
 **Alerts** (`nix/urp-exporter-alerts.yml`, design 39 §39.9):
 
-- `URPLatencyP99High` — `histogram_quantile(0.99, …owd…) > <slo>` for 2m (page).
-- `URPClockUnsynced` — `urp_endpoint_owd_clock_offset_ns > 5000` (advisory; OWD
-  numbers untrustworthy).
-- `URPClockAnomalies` — `rate(urp_endpoint_owd_clock_anomalies_total) > 0` sustained
-  (skew or cross-boundary reordering).
+- `URPOwdTailHigh` (shipped, info) — `histogram_quantile(0.99, sum by (endpoint,le)
+  (rate(urp_endpoint_owd_seconds_bucket[5m]))) > 0.005`. Threshold is fabric-specific
+  (single-flow floor is tens of µs; the tail grows under contention / the fairness
+  latch), so it ships info-level and tuneable rather than paging.
+- `URPOwdClockSkew` (shipped, warning) — `rate(urp_endpoint_owd_anomalies_total[5m]) > 0`
+  sustained: negative OWD ⇒ the PTP mesh drifted and the percentiles are untrustworthy.
 
 ---
 
@@ -348,14 +359,21 @@ straight-line LE64 round-trip (unit-covered); the hostile TSTAMP-parse surface l
 in PR-B2 and is already exercised by `wire_fuzz` (random-flag + truncated-frame
 generation covers a set TSTAMP flag with a missing/short trailer).
 
-**PR-B2 — OWD datapath + surface (protocol change; needs PTP to validate).** Wire
-the negotiation (advertise `URP_CONN_CAP_TSTAMP` when `latency_sample_period != 0`,
-mirroring `window_bytes_advertise` in `urp_endpoint.c`); TX stamp on sampled frames
-(`seq % period == 0`, cap negotiated) + buffer-size trailer reserve; RX delta vs
-`ktime_get_real_ns()` + skew clamp → `anomalies` + bucket + trailer strip before UDS
-delivery; `URP_ENDPOINT_A_OWD` netlink encoder; `urp-netlink` decode
-(`URP_OWD_EDGES_NS` parity); exporter `urp_endpoint_owd_seconds_*` +
-clock-offset/anomaly + `--owd` flag; dashboard percentile panels + alerts.
+**PR-B2 — OWD datapath + surface (protocol change; needs PTP to validate).
+IMPLEMENTED 2026-09-05.** Wires the negotiation (`urp_local_caps` advertises
+`URP_CONN_CAP_TSTAMP` when `latency_sample_period != 0`, mirroring
+`window_bytes_advertise`; `urp_tstamp_negotiate` latches `ep->tstamp_negotiated` at
+all-QPs-ESTABLISHED); TX stamp on sampled frames in **both** pump paths
+(`urp_tx_maybe_stamp`: `seq % period == 0`, `num_chunks == 1`, cap negotiated) with
+an unconditional 8-byte trailer reserve (`urp_ep_tx_max_payload`); RX delta vs
+`ktime_get_real_ns()` (`urp_owd_sample`: negative → `anomalies`, else bucket; length-
+guarded against a hostile flag-without-trailer); `URP_ENDPOINT_A_OWD` netlink encoder;
+`urp-netlink` decode (`Owd` struct, `URP_OWD_EDGES_NS` parity test); exporter
+`urp_endpoint_owd_seconds_*` + `urp_endpoint_owd_clock_offset_seconds` gauge +
+`urp_endpoint_owd_anomalies_total` counter behind the default-on `--owd`/`--no-owd`
+flag (self-suppresses when the module reports no nest); Grafana OWD percentile +
+distribution + PTP-health panels; `URPOwdTailHigh` + `URPOwdClockSkew` alerts.
+Kernel builds mainline 7.2; `urp-netlink` + `urp-exporter` render/decode tables green.
 
 **PR-C — hardware validation.** On the PTP-synced hp1/hp2/hp3 mesh: confirm
 single-flow OWD p50 ≈ the ~36 µs floor and that the p99 tail grows with concurrency

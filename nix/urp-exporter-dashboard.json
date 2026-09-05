@@ -401,6 +401,138 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "id": 12,
+      "title": "RX one-way delivery latency p50/p99/p999 (design 40 PR-B)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 40
+      },
+      "description": "TRUE one-way sender->receiver delivery latency of sampled DATA frames (needs PTP-synced clocks). This is the low-latency thesis the round-trip urp_qp_rtt_ns probe cannot isolate. p50 tracks the single-flow floor (~tens of us); p99/p999 grow with node contention / the fairness fan-out (design 38 §38.5).",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "showPoints": "never"
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (endpoint,le) (rate(urp_endpoint_owd_seconds_bucket{endpoint=~\"$endpoint\"}[$__rate_interval])))",
+          "legendFormat": "{{endpoint}} p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (endpoint,le) (rate(urp_endpoint_owd_seconds_bucket{endpoint=~\"$endpoint\"}[$__rate_interval])))",
+          "legendFormat": "{{endpoint}} p99",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.999, sum by (endpoint,le) (rate(urp_endpoint_owd_seconds_bucket{endpoint=~\"$endpoint\"}[$__rate_interval])))",
+          "legendFormat": "{{endpoint}} p999",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "title": "RX one-way delivery-latency distribution (design 40 PR-B)",
+      "type": "heatmap",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 40
+      },
+      "description": "Full one-way delivery-latency distribution: the tail shape a p99 line flattens. A bimodal split is the fairness latch (one starved flow) showing up as a second mode.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "options": {
+        "calculate": false,
+        "cellGap": 1,
+        "color": {
+          "scheme": "Spectral",
+          "mode": "scheme"
+        },
+        "yAxis": {
+          "unit": "s"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (le) (rate(urp_endpoint_owd_seconds_bucket{endpoint=~\"$endpoint\"}[$__rate_interval]))",
+          "legendFormat": "{{le}}",
+          "format": "heatmap",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "title": "OWD clock offset + skew anomalies (design 40 PR-B)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 48
+      },
+      "description": "PTP servo clock offset (left) and the rate of samples rejected as clock-skewed (negative OWD). A rising anomaly rate or a large/growing offset means the PTP mesh has drifted and the OWD numbers above are untrustworthy -- read this panel before trusting the latency percentiles.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "showPoints": "never"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*offset.*"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "urp_endpoint_owd_clock_offset_seconds{endpoint=~\"$endpoint\"}",
+          "legendFormat": "{{endpoint}} offset",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(urp_endpoint_owd_anomalies_total{endpoint=~\"$endpoint\"}[$__rate_interval])",
+          "legendFormat": "{{endpoint}} anomalies/s",
+          "refId": "B"
+        }
+      ]
     }
   ]
 }

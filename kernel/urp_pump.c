@@ -192,6 +192,31 @@ static u32 urp_frame_fill_kvecs(struct urp_endpoint *ep, struct urp_buffer *buf,
 }
 
 /*
+ * design 40 §40.2: on a sampled DATA frame whose connection negotiated TSTAMP,
+ * set URP_DATA_FLAG_TSTAMP and append the 8-byte sender-CLOCK_REALTIME trailer
+ * after @len payload bytes. Returns the extra bytes to post (0 or 8) so the
+ * caller extends the send length. @seq is the frame's sequence number (sampling
+ * gate seq % period == 0). Only single-chunk buffers are stamped: placing the
+ * trailer past a payload that scatters across path-Y chunks would need
+ * boundary-straddle logic, and the TX pump reserves 8 tail bytes
+ * (urp_ep_tx_max_payload) so HEADER + len + 8 always fits a single-chunk buffer.
+ * Jumbo (multi-chunk) flows are throughput-oriented and simply report no OWD.
+ */
+static u32 urp_tx_maybe_stamp(struct urp_endpoint *ep, struct urp_buffer *buf,
+			      u64 seq, u32 len)
+{
+	u32 period = READ_ONCE(urp_latency_sample_period);
+
+	if (!ep->tstamp_negotiated || buf->num_chunks != 1 || !period ||
+	    (seq % period))
+		return 0;
+	((u8 *)buf->data)[13] |= URP_DATA_FLAG_TSTAMP;
+	urp_frame_tstamp_encode((u8 *)buf->data + URP_FRAME_HEADER_SIZE + len,
+				ktime_get_real_ns());
+	return URP_TSTAMP_TRAILER_LEN;
+}
+
+/*
  * TX pump kthread.
  *
  * Reads data from the UDS socket, wraps it in a frame header, and posts
@@ -210,10 +235,13 @@ static int urp_tx_thread_fn(void *data)
 		u32 nkv;
 		int ret;
 		u32 len;
+		u64 seq;
+		u32 tstamp;	/* OWD trailer bytes to post: 0 or 8 */
 		/* Per-endpoint frame cap: header + max_payload == buf_size,
 		 * scattered across the buffer's chunks (design 37 path Y).
+		 * design 40 §40.2: reserve the 8-byte OWD trailer at the tail.
 		 */
-		u32 max_payload = urp_ep_max_payload(ep->buf_size);
+		u32 max_payload = urp_ep_tx_max_payload(ep->buf_size);
 
 		buf = urp_buf_alloc_send(ep);
 		if (!buf) {
@@ -254,13 +282,16 @@ static int urp_tx_thread_fn(void *data)
 		len = ret;
 
 		/* Encode frame header */
+		seq = conn->seq++;
 		urp_frame_encode(buf->data,
 				 0,		/* stream_id: k0 uses 0 */
-				 conn->seq++,	/* sequence number */
+				 seq,		/* sequence number */
 				 URP_FRAME_TYPE_DATA,
 				 0,		/* flags: no SYN/FIN/RST for k0 */
 				 0,		/* credits: not used in k0 */
 				 len);
+		/* design 40 §40.2: OWD trailer on sampled frames (0 or 8 bytes). */
+		tstamp = urp_tx_maybe_stamp(ep, buf, seq, len);
 
 		/* Round-robin across all connected QPs (with num_qps=1
 		 * this always picks qps[0]).
@@ -284,7 +315,7 @@ static int urp_tx_thread_fn(void *data)
 			atomic64_inc(&ep->stats.credit_stalls);
 
 		ret = urp_post_frame(ep, qp->qp, buf,
-				     URP_FRAME_HEADER_SIZE + len);
+				     URP_FRAME_HEADER_SIZE + len + tstamp);
 		if (ret) {
 			pr_err_ratelimited("ib_post_send failed: %d\n", ret);
 			conn->active = false;
@@ -364,7 +395,10 @@ static int urp_stream_tx_fn(void *data)
 		u8 flags = 0;
 		int ret;
 		u32 len;
-		u32 max_payload = urp_ep_max_payload(ep->buf_size);
+		u64 seq;
+		u32 tstamp;	/* OWD trailer bytes to post: 0 or 8 */
+		/* design 40 §40.2: reserve the 8-byte OWD trailer at the tail. */
+		u32 max_payload = urp_ep_tx_max_payload(ep->buf_size);
 
 		if (!stream->uds_sock)
 			break;
@@ -422,8 +456,11 @@ static int urp_stream_tx_fn(void *data)
 			send_syn = false;
 		}
 
-		urp_frame_encode(buf->data, stream->id, stream->tx_seq++,
+		seq = stream->tx_seq++;
+		urp_frame_encode(buf->data, stream->id, seq,
 				 URP_FRAME_TYPE_DATA, flags, 0, len);
+		/* design 40 §40.2: OWD trailer on sampled frames (0 or 8 bytes). */
+		tstamp = urp_tx_maybe_stamp(ep, buf, seq, len);
 
 		qp = urp_qp_select_round_robin(ep);
 		if (!qp) {
@@ -505,7 +542,7 @@ static int urp_stream_tx_fn(void *data)
 		}
 
 		ret = urp_post_frame(ep, qp->qp, buf,
-				     URP_FRAME_HEADER_SIZE + len);
+				     URP_FRAME_HEADER_SIZE + len + tstamp);
 		if (ret) {
 			pr_err_ratelimited("stream %u ib_post_send failed: %d\n",
 					   stream->id, ret);

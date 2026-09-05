@@ -30,6 +30,13 @@ pub struct Config {
     /// seconds_*`). On by default -- surfaces only when the module reports the
     /// nest (design 40 §40.1), so an old module simply emits nothing.
     pub interarrival: bool,
+    /// Emit the RX one-way delivery-latency family (`urp_endpoint_owd_seconds_*`,
+    /// plus the clock-offset gauge and anomalies counter). On by default --
+    /// surfaces only when the module reports the nest (design 40 §40.2), which
+    /// needs the `urp.latency_sample_period` sysctl set AND both peers to
+    /// negotiate the `URP_CONN_CAP_TSTAMP` cap AND a PTP-synced clock, so it
+    /// self-suppresses.
+    pub owd: bool,
 }
 
 impl Default for Config {
@@ -42,6 +49,7 @@ impl Default for Config {
             max_series: 100_000,
             scrape_timeout: Duration::from_millis(2000),
             interarrival: true,
+            owd: true,
         }
     }
 }
@@ -57,6 +65,7 @@ pub fn usage() -> ! {
          \x20 --per-qp / --no-per-qp (default on)\n\
          \x20 --per-stream           (default off)\n\
          \x20 --no-interarrival      (default on; RX inter-arrival histogram)\n\
+         \x20 --no-owd               (default on; RX one-way delivery latency)\n\
          serves Prometheus /metrics scraped from the urp kernel module."
     );
     std::process::exit(2);
@@ -100,6 +109,8 @@ impl Config {
                 "--per-stream" => cfg.per_stream = true,
                 "--interarrival" => cfg.interarrival = true,
                 "--no-interarrival" => cfg.interarrival = false,
+                "--owd" => cfg.owd = true,
+                "--no-owd" => cfg.owd = false,
                 "--help" | "-h" => usage(),
                 _ => usage(),
             }
@@ -118,7 +129,7 @@ mod tests {
     fn parse_flags_truth_table() {
         let s = |v: &str| v.to_string();
         // Each case: (argv tokens, predicate on the resulting Config).
-        let cases: [(Vec<String>, fn(&Config) -> bool); 7] = [
+        let cases: [(Vec<String>, fn(&Config) -> bool); 8] = [
             // positive: an explicit listen addr round-trips
             (vec![s("--listen"), s("0.0.0.0:9100")], |c| {
                 c.listen.port() == 9100 && c.listen.ip().is_unspecified()
@@ -145,6 +156,9 @@ mod tests {
             }),
             // design 40: interarrival is on by default, --no-interarrival flips it
             (vec![s("--no-interarrival")], |c| !c.interarrival),
+            // design 40 §40.2: owd is on by default, --no-owd flips it (and leaves
+            // interarrival untouched)
+            (vec![s("--no-owd")], |c| !c.owd && c.interarrival),
         ];
         for (i, (argv, pred)) in cases.into_iter().enumerate() {
             let cfg = Config::parse(&argv);

@@ -9,8 +9,8 @@
 //! Only compiled under `#[cfg(test)]` or the `mock` feature, so it never lands
 //! in the production binary.
 
-use urp_netlink::format::{Endpoint, Histogram, Qp, Stats, Stream};
-use urp_netlink::uapi::URP_HIST_NBUCKETS;
+use urp_netlink::format::{Endpoint, Histogram, Owd, Qp, Stats, Stream};
+use urp_netlink::uapi::{URP_HIST_NBUCKETS, URP_OWD_NBUCKETS};
 
 /// Build a deterministic per-stride inter-arrival histogram (design 40 §40.1)
 /// for the mock fleet, so the render hot path (and its zero-alloc/CPU budget)
@@ -32,6 +32,27 @@ fn mock_interarrival(base: u64) -> Vec<Histogram> {
             }
         })
         .collect()
+}
+
+/// Build a deterministic OWD histogram (design 40 §40.2) for the mock fleet, so
+/// the render hot path exercises the OWD family too. Counts vary by `base` and a
+/// non-zero anomaly/offset so all three OWD sub-families (hist, clock offset,
+/// anomalies) render.
+fn mock_owd(base: u64) -> Owd {
+    let buckets: Vec<u64> = (0..URP_OWD_NBUCKETS as u64)
+        .map(|b| (base / 1000 + b) % 89)
+        .collect();
+    let count: u64 = buckets.iter().sum();
+    Owd {
+        hist: Histogram {
+            stride: 0,
+            sum_ns: count * 40_000,
+            count,
+            buckets,
+        },
+        clock_offset_ns: 36 + base % 64,
+        anomalies: base % 3,
+    }
 }
 
 /// Build a deterministic fleet of `endpoints` endpoints, each with `qps` QPs and
@@ -88,6 +109,7 @@ pub fn synthetic_fleet(endpoints: usize, qps: usize, streams: usize) -> Vec<Endp
                     auth_failures: 0,
                 }),
                 interarrival: mock_interarrival(base),
+                owd: Some(mock_owd(base)),
             }
         })
         .collect()

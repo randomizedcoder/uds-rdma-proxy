@@ -133,4 +133,18 @@ urp_window_negotiate(bool local_advertise, bool peer_advertise)
 	return local_advertise && peer_advertise;
 }
 
+/*
+ * design 40 §40.2 (PR-B2): is OWD timestamping negotiated on this connection?
+ * Enabled only when THIS endpoint samples (@local_sample, urp.latency_sample_period
+ * != 0) AND the peer advertised URP_CONN_CAP_TSTAMP (@peer_advertise). Same
+ * both-sides-agree gate as the window: a sender must never append a trailer a
+ * receiver will not expect (it would land in the receiver's payload). Latches
+ * ep->tstamp_negotiated, which gates the TX stamp.
+ */
+static inline bool
+urp_tstamp_negotiate(bool local_sample, bool peer_advertise)
+{
+	return local_sample && peer_advertise;
+}
+
 #endif /* _URP_CONN_PLAN_H */

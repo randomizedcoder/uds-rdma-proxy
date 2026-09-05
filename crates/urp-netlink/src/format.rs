@@ -7,8 +7,8 @@ use serde_json::{json, Value};
 
 use crate::attr::{payload_str, payload_u16, payload_u32, payload_u64, payload_u8, AttrIter};
 use crate::uapi::{
-    UrpEndpointAttr, UrpEndpointState, UrpHistAttr, UrpQpAttr, UrpQpState, UrpStatsAttr,
-    UrpStreamAttr, UrpStreamState, URP_HIST_NBUCKETS,
+    UrpEndpointAttr, UrpEndpointState, UrpHistAttr, UrpOwdAttr, UrpQpAttr, UrpQpState,
+    UrpStatsAttr, UrpStreamAttr, UrpStreamState, URP_HIST_NBUCKETS, URP_OWD_NBUCKETS,
 };
 
 /// le upper-bound edges (nanoseconds) of the histogram buckets, mirroring
@@ -21,6 +21,15 @@ pub const URP_HIST_EDGES_NS: [u64; URP_HIST_NBUCKETS - 1] = [
     5_000_000, 25_000_000,
 ];
 
+/// le upper-bound edges (nanoseconds) of the OWD histogram buckets, mirroring
+/// `urp_owd_edge_ns()` in `kernel/urp_hist.h`. The trailing +Inf bucket has no
+/// finite edge, so this has `URP_OWD_NBUCKETS - 1` entries. A parity test pins it
+/// to the kernel header. **Keep in lock-step with the kernel OWD edge table.**
+pub const URP_OWD_EDGES_NS: [u64; URP_OWD_NBUCKETS - 1] = [
+    1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 200_000, 500_000, 1_000_000, 2_000_000,
+    5_000_000, 10_000_000,
+];
+
 /// One classic histogram (design 40 §40.1) decoded from a `URP_HIST_A_*` sub-nest.
 /// `buckets` holds the `URP_HIST_NBUCKETS` **per-bucket** (non-cumulative) counts;
 /// the exporter accumulates them into the Prometheus cumulative `_bucket` contract.
@@ -30,6 +39,18 @@ pub struct Histogram {
     pub buckets: Vec<u64>,
     pub sum_ns: u64,
     pub count: u64,
+}
+
+/// design 40 §40.2: RX one-way delivery-latency histogram plus its PTP context.
+/// `hist.buckets` holds `URP_OWD_NBUCKETS` per-bucket counts (edges =
+/// `URP_OWD_EDGES_NS`); `stride` is unused for OWD (single histogram, always 0).
+/// `clock_offset_ns` is the last PTP servo offset (0 = unknown) and `anomalies`
+/// counts samples rejected as clock-skewed (negative OWD), never bucketed.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct Owd {
+    pub hist: Histogram,
+    pub clock_offset_ns: u64,
+    pub anomalies: u64,
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -87,6 +108,10 @@ pub struct Endpoint {
     /// (1/10/100). Empty when the module predates the feature or the sysctl is
     /// off (the exporter then emits no inter-arrival family).
     pub interarrival: Vec<Histogram>,
+    /// design 40 §40.2: RX one-way delivery-latency histogram + PTP context.
+    /// `None` when the module predates the feature or the sysctl is off (the
+    /// exporter then emits no OWD family).
+    pub owd: Option<Owd>,
 }
 
 /// Decode a 28-byte sockaddr_in6 blob to a Rust SocketAddr (collapsing
@@ -180,6 +205,9 @@ impl Endpoint {
                 }
                 x if x == UrpEndpointAttr::Interarrival as u16 => {
                     ep.interarrival = parse_histograms(p);
+                }
+                x if x == UrpEndpointAttr::Owd as u16 => {
+                    ep.owd = parse_owd(p);
                 }
                 _ => {}
             }
@@ -296,6 +324,17 @@ impl Endpoint {
                 ));
             }
         }
+        if let Some(o) = &self.owd {
+            let mean_us = if o.hist.count > 0 {
+                o.hist.sum_ns as f64 / o.hist.count as f64 / 1000.0
+            } else {
+                0.0
+            };
+            out.push_str(&format!(
+                "  owd (RX): count={} mean={:.1}us offset={}ns anomalies={}\n",
+                o.hist.count, mean_us, o.clock_offset_ns, o.anomalies
+            ));
+        }
         out
     }
 
@@ -315,6 +354,7 @@ impl Endpoint {
             "streams": self.streams,
             "stats": self.stats,
             "interarrival": self.interarrival,
+            "owd": self.owd,
         })
     }
 }
@@ -424,32 +464,65 @@ fn parse_stats(buf: &[u8]) -> Stats {
 fn parse_histograms(buf: &[u8]) -> Vec<Histogram> {
     let mut out = Vec::new();
     for (_idx, p) in AttrIter::new(buf) {
-        let mut h = Histogram::default();
-        let mut buckets_ok = false;
-        for (t, val) in AttrIter::new(p) {
-            match t {
-                x if x == UrpHistAttr::Stride as u16 => h.stride = payload_u32(val).unwrap_or(0),
-                x if x == UrpHistAttr::Buckets as u16 => {
-                    if val.len() == URP_HIST_NBUCKETS * 8 {
-                        h.buckets = (0..URP_HIST_NBUCKETS)
-                            .map(|i| {
-                                let o = i * 8;
-                                u64::from_ne_bytes(val[o..o + 8].try_into().unwrap())
-                            })
-                            .collect();
-                        buckets_ok = true;
-                    }
-                }
-                x if x == UrpHistAttr::SumNs as u16 => h.sum_ns = payload_u64(val).unwrap_or(0),
-                x if x == UrpHistAttr::Count as u16 => h.count = payload_u64(val).unwrap_or(0),
-                _ => {}
-            }
-        }
-        if buckets_ok {
+        if let Some(h) = parse_one_hist(p, URP_HIST_NBUCKETS) {
             out.push(h);
         }
     }
     out
+}
+
+/// Decode one `urp_hist_attr` set. A bucket blob whose length is not exactly
+/// `nbuckets` u64s is treated as absent (returns `None`) rather than partially
+/// decoded -- the interarrival nest carries `URP_HIST_NBUCKETS`, the OWD nest
+/// `URP_OWD_NBUCKETS`.
+fn parse_one_hist(buf: &[u8], nbuckets: usize) -> Option<Histogram> {
+    let mut h = Histogram::default();
+    let mut buckets_ok = false;
+    for (t, val) in AttrIter::new(buf) {
+        match t {
+            x if x == UrpHistAttr::Stride as u16 => h.stride = payload_u32(val).unwrap_or(0),
+            x if x == UrpHistAttr::Buckets as u16 => {
+                if val.len() == nbuckets * 8 {
+                    h.buckets = (0..nbuckets)
+                        .map(|i| {
+                            let o = i * 8;
+                            u64::from_ne_bytes(val[o..o + 8].try_into().unwrap())
+                        })
+                        .collect();
+                    buckets_ok = true;
+                }
+            }
+            x if x == UrpHistAttr::SumNs as u16 => h.sum_ns = payload_u64(val).unwrap_or(0),
+            x if x == UrpHistAttr::Count as u16 => h.count = payload_u64(val).unwrap_or(0),
+            _ => {}
+        }
+    }
+    buckets_ok.then_some(h)
+}
+
+/// Decode the URP_ENDPOINT_A_OWD nest (design 40 §40.2): one `URP_OWD_A_HIST`
+/// sub-nest (a `urp_hist_attr` set with `URP_OWD_NBUCKETS` buckets) plus the
+/// scalar PTP context. Returns `None` if the histogram sub-nest is missing or
+/// malformed (a well-formed but empty histogram still decodes to `Some`).
+fn parse_owd(buf: &[u8]) -> Option<Owd> {
+    let mut owd = Owd::default();
+    let mut hist_ok = false;
+    for (t, val) in AttrIter::new(buf) {
+        match t {
+            x if x == UrpOwdAttr::Hist as u16 => {
+                if let Some(h) = parse_one_hist(val, URP_OWD_NBUCKETS) {
+                    owd.hist = h;
+                    hist_ok = true;
+                }
+            }
+            x if x == UrpOwdAttr::ClockOffsetNs as u16 => {
+                owd.clock_offset_ns = payload_u64(val).unwrap_or(0)
+            }
+            x if x == UrpOwdAttr::Anomalies as u16 => owd.anomalies = payload_u64(val).unwrap_or(0),
+            _ => {}
+        }
+    }
+    hist_ok.then_some(owd)
 }
 
 #[cfg(test)]
@@ -487,6 +560,7 @@ mod tests {
                 ..Stats::default()
             }),
             interarrival: vec![],
+            owd: None,
         }
     }
 
@@ -540,6 +614,7 @@ mod tests {
             "streams",
             "stats",
             "interarrival",
+            "owd",
         ] {
             assert!(parsed.get(k).is_some(), "missing key {k} in json");
         }
@@ -609,5 +684,71 @@ mod tests {
             parse_histograms(bad.as_bytes()).is_empty(),
             "short blob dropped"
         );
+    }
+
+    // design 40 §40.2: the URP_OWD_EDGES_NS le table must stay in lock-step with
+    // the kernel header (urp_owd_edge_ns in kernel/urp_hist.h). Same re-parse as
+    // the interarrival edges; skipped when the header is absent.
+    #[test]
+    fn owd_edges_match_kernel_header() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernel/urp_hist.h");
+        let src = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => return, // header not shipped; nothing to check
+        };
+        let start = src
+            .find("edges[URP_OWD_NEDGES] = {")
+            .expect("owd edges table");
+        let end = src[start..].find("};").expect("owd edges end") + start;
+        let body = &src[start..end];
+        let nums: Vec<u64> = body
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|t| !t.is_empty())
+            .filter_map(|t| t.parse::<u64>().ok())
+            .collect();
+        assert_eq!(
+            nums, URP_OWD_EDGES_NS,
+            "Rust owd le table drifted from kernel/urp_hist.h edges"
+        );
+    }
+
+    // design 40 §40.2: decode a synthetic OWD nest (hist sub-nest + PTP context)
+    // and confirm it round-trips; a missing/short hist blob yields None.
+    #[test]
+    fn parse_owd_round_trip() {
+        use crate::attr::AttrBuf;
+        let mut nest = AttrBuf::new();
+        nest.nest(UrpOwdAttr::Hist as u16, |h| {
+            h.put_u32(UrpHistAttr::Stride as u16, 0);
+            let mut blob = Vec::new();
+            for b in 0..URP_OWD_NBUCKETS as u64 {
+                blob.extend_from_slice(&(b + 1).to_ne_bytes());
+            }
+            h.put_bytes(UrpHistAttr::Buckets as u16, &blob);
+            h.put_u64(UrpHistAttr::SumNs as u16, 987);
+            h.put_u64(UrpHistAttr::Count as u16, 42);
+        });
+        nest.put_u64(UrpOwdAttr::ClockOffsetNs as u16, 36);
+        nest.put_u64(UrpOwdAttr::Anomalies as u16, 3);
+
+        let owd = parse_owd(nest.as_bytes()).expect("owd decodes");
+        assert_eq!(owd.hist.buckets.len(), URP_OWD_NBUCKETS);
+        assert_eq!(owd.hist.buckets[0], 1);
+        assert_eq!(owd.hist.sum_ns, 987);
+        assert_eq!(owd.hist.count, 42);
+        assert_eq!(owd.clock_offset_ns, 36);
+        assert_eq!(owd.anomalies, 3);
+
+        // negative: OWD nest with no hist sub-nest -> None (only scalars present).
+        let mut noh = AttrBuf::new();
+        noh.put_u64(UrpOwdAttr::ClockOffsetNs as u16, 1);
+        assert!(parse_owd(noh.as_bytes()).is_none(), "no hist -> None");
+
+        // negative: hist sub-nest with a wrong-length bucket blob -> None.
+        let mut short = AttrBuf::new();
+        short.nest(UrpOwdAttr::Hist as u16, |h| {
+            h.put_bytes(UrpHistAttr::Buckets as u16, &[0u8; 8]); // too short
+        });
+        assert!(parse_owd(short.as_bytes()).is_none(), "short blob -> None");
     }
 }

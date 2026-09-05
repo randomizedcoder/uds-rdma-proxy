@@ -335,6 +335,46 @@ static int urp_fill_endpoint(struct sk_buff *skb, struct urp_endpoint *ep,
 			}
 			nla_nest_end(skb, ia_nest);
 		}
+
+		/*
+		 * design 40 §40.2: OWD one-way delivery-latency nest, gated by the
+		 * sample-period sysctl (0 = off => no nest, no metric). One hist
+		 * sub-nest (stride 0, URP_OWD_NBUCKETS buckets) plus the advisory
+		 * PTP clock offset and the skew-rejected sample counter.
+		 */
+		if (READ_ONCE(urp_latency_sample_period)) {
+			struct nlattr *owd_nest =
+				nla_nest_start(skb, URP_ENDPOINT_A_OWD);
+			struct urp_hist15 *h = &ep->owd.h;
+			struct nlattr *h_entry;
+			u64 buckets[URP_OWD_NBUCKETS];
+			u32 b;
+
+			if (!owd_nest)
+				goto cancel;
+			h_entry = nla_nest_start(skb, URP_OWD_A_HIST);
+			if (!h_entry)
+				goto cancel;
+			for (b = 0; b < URP_OWD_NBUCKETS; b++)
+				buckets[b] = atomic64_read(&h->bucket[b]);
+			if (nla_put_u32(skb, URP_HIST_A_STRIDE, 0) ||
+			    nla_put(skb, URP_HIST_A_BUCKETS,
+				    sizeof(buckets), buckets) ||
+			    nla_put_u64_64bit(skb, URP_HIST_A_SUM_NS,
+					      atomic64_read(&h->sum_ns), 0) ||
+			    nla_put_u64_64bit(skb, URP_HIST_A_COUNT,
+					      atomic64_read(&h->count), 0))
+				goto cancel;
+			nla_nest_end(skb, h_entry);
+			if (nla_put_u64_64bit(skb, URP_OWD_A_CLOCK_OFFSET_NS,
+					      READ_ONCE(urp_owd_clock_offset_ns),
+					      0) ||
+			    nla_put_u64_64bit(skb, URP_OWD_A_ANOMALIES,
+					      atomic64_read(&ep->owd.anomalies),
+					      0))
+				goto cancel;
+			nla_nest_end(skb, owd_nest);
+		}
 	}
 
 	nla_nest_end(skb, nest);

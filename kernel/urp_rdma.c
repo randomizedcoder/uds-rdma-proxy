@@ -385,6 +385,23 @@ void urp_buf_free_recv(struct urp_endpoint *ep, struct urp_buffer *buf)
 	spin_unlock_irqrestore(&ep->recv_lock, flags);
 }
 
+/*
+ * design 40 §40.2 + gap #6: the capability bits this endpoint advertises in its
+ * CM private_data caps trailer, read from the live sysctls. Both the connect and
+ * the accept/REP path emit the same set so negotiation is symmetric; the peer
+ * activates a capability only when BOTH sides advertised it.
+ */
+static u8 urp_local_caps(void)
+{
+	u8 caps = 0;
+
+	if (READ_ONCE(urp_window_bytes_advertise))
+		caps |= URP_CONN_CAP_WINDOW_BYTES;
+	if (READ_ONCE(urp_latency_sample_period))
+		caps |= URP_CONN_CAP_TSTAMP;
+	return caps;
+}
+
 /* ---- Deferred rdma_connect ---- */
 
 /*
@@ -425,9 +442,7 @@ void urp_connect_work_fn(struct work_struct *w)
 	param.private_data = qp_priv;
 	param.private_data_len =
 		urp_conn_priv_build_full(qp_priv, ep->auth_len, ep->kind,
-					 (u8)qp->index,
-					 READ_ONCE(urp_window_bytes_advertise) ?
-						URP_CONN_CAP_WINDOW_BYTES : 0);
+					 (u8)qp->index, urp_local_caps());
 
 	ret = rdma_connect(qp->cm_id, &param);
 	if (ret)
@@ -651,6 +666,35 @@ static void urp_interarrival_sample(struct urp_endpoint *ep)
 		}
 		ia->last_ns[s] = now;
 	}
+}
+
+/*
+ * design 40 §40.2: record the one-way delivery-latency sample for a DATA frame
+ * that carried a TSTAMP trailer. The 8-byte trailer (sender CLOCK_REALTIME ns)
+ * sits at buf->data + header + payload_len -- past the payload, so it is never
+ * delivered to the UDS. owd = t_recv_real - t_send_real against the
+ * PTP-disciplined realtime clock. A negative delta (clock skew or cross-boundary
+ * reordering) is counted as an anomaly and NOT bucketed, so skew can never
+ * corrupt the distribution. Single-writer (recv CQ), same contract as
+ * urp_interarrival_sample; only the buckets/counters are atomic for the reader.
+ * The caller guarantees the trailer bytes are actually present on the wire.
+ */
+static void urp_owd_sample(struct urp_endpoint *ep, const struct urp_buffer *buf,
+			   u32 payload_len)
+{
+	const u8 *trailer = buf->data + URP_FRAME_HEADER_SIZE + payload_len;
+	u64 t_send = urp_frame_tstamp_decode(trailer);
+	s64 owd = (s64)(ktime_get_real_ns() - t_send);
+	u32 b;
+
+	if (owd < 0) {
+		atomic64_inc(&ep->owd.anomalies);
+		return;
+	}
+	b = urp_owd_bucket((u64)owd);
+	atomic64_inc(&ep->owd.h.bucket[b]);
+	atomic64_add((u64)owd, &ep->owd.h.sum_ns);
+	atomic64_inc(&ep->owd.h.count);
 }
 
 static int urp_rx_send_uds(struct urp_endpoint *ep, struct urp_stream *s,
@@ -963,6 +1007,18 @@ static void urp_recv_done(struct ib_cq *cq, struct ib_wc *wc)
 	 */
 	if (urp_interarrival_hist)
 		urp_interarrival_sample(ep);
+
+	/*
+	 * design 40 §40.2: one-way delivery latency. Sample only when both peers
+	 * negotiated TSTAMP, THIS frame set the flag, and the 8 trailer bytes are
+	 * actually present on the wire -- the last guard defends against a hostile
+	 * peer that sets the flag without the trailer (it would otherwise read
+	 * stale buffer bytes; still in-bounds, but garbage OWD).
+	 */
+	if (ep->tstamp_negotiated && (dec.flags & URP_DATA_FLAG_TSTAMP) &&
+	    wc->byte_len >= URP_FRAME_HEADER_SIZE + payload_len +
+			    URP_TSTAMP_TRAILER_LEN)
+		urp_owd_sample(ep, buf, payload_len);
 
 	/*
 	 * Deliver the payload to the UDS socket.
@@ -1350,9 +1406,7 @@ static int urp_cm_accept_one(struct rdma_cm_id *child, struct urp_endpoint *ep,
 		param.private_data = reply_priv;
 		param.private_data_len =
 			urp_conn_priv_build_full(reply_priv, ep->auth_len,
-						 ep->kind, 0,
-						 READ_ONCE(urp_window_bytes_advertise) ?
-							URP_CONN_CAP_WINDOW_BYTES : 0);
+						 ep->kind, 0, urp_local_caps());
 	}
 
 	/*
@@ -1378,6 +1432,10 @@ static int urp_cm_accept_one(struct rdma_cm_id *child, struct urp_endpoint *ep,
 			urp_conn_priv_peer_caps(peer_priv, peer_priv_len,
 						ep->auth_len, &peer_caps) &&
 			(peer_caps & URP_CONN_CAP_WINDOW_BYTES);
+		ep->qps[qp_index].peer_supports_tstamp =
+			urp_conn_priv_peer_caps(peer_priv, peer_priv_len,
+						ep->auth_len, &peer_caps) &&
+			(peer_caps & URP_CONN_CAP_TSTAMP);
 	}
 
 	ret = rdma_accept(child, &param);
@@ -1498,6 +1556,12 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 						event->param.conn.private_data_len,
 						ep->auth_len, &peer_caps) &&
 					(peer_caps & URP_CONN_CAP_WINDOW_BYTES);
+				ep->qps[ctx->qp_index].peer_supports_tstamp =
+					urp_conn_priv_peer_caps(
+						event->param.conn.private_data,
+						event->param.conn.private_data_len,
+						ep->auth_len, &peer_caps) &&
+					(peer_caps & URP_CONN_CAP_TSTAMP);
 			}
 			/* Design 33 Phase 1: a fresh establish clears the
 			 * connect-retry budget, so a later disconnect gets its
@@ -1535,6 +1599,14 @@ static int urp_cm_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 				ep->window_negotiated = urp_window_negotiate(
 					READ_ONCE(urp_window_bytes_advertise) != 0,
 					ep->qps[ctx->qp_index].peer_supports_window);
+				/*
+				 * design 40 §40.2: latch OWD timestamping the
+				 * same way -- we sample AND the peer advertised
+				 * TSTAMP. Gates the TX-side trailer stamp.
+				 */
+				ep->tstamp_negotiated = urp_tstamp_negotiate(
+					READ_ONCE(urp_latency_sample_period) != 0,
+					ep->qps[ctx->qp_index].peer_supports_tstamp);
 				/* Cache link rate now (all QPs up) for BDP
 				 * window sizing at stream create (design 35).
 				 */

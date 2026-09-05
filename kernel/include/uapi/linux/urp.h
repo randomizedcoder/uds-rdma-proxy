@@ -67,6 +67,13 @@
  * forever, so the window is honored only when both sides advertise support.
  */
 #define URP_CONN_CAP_WINDOW_BYTES	(1 << 0)	/* peer honors byte-windowing */
+/*
+ * design 40 §40.2 (PR-B): peer honors OWD timestamping -- it expects sampled
+ * DATA frames to carry the 8-byte URP_DATA_FLAG_TSTAMP trailer and will strip it
+ * rather than delivering it as payload. Negotiated by BOTH peers (same interop
+ * gate as the byte-window) before any sender appends the trailer.
+ */
+#define URP_CONN_CAP_TSTAMP	(1 << 1)	/* peer honors OWD timestamping */
 
 /* Default port for RDMA CM */
 #define URP_DEFAULT_PORT	4791
