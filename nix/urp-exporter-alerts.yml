@@ -65,6 +65,37 @@ groups:
             the byte window. Expected under saturation; alarming only if paired
             with lost goodput.
 
+      # --- OWD clock skew: the PTP mesh drifted, so OWD numbers are suspect. ---
+      - alert: URPOwdClockSkew
+        expr: rate(urp_endpoint_owd_anomalies_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "urp endpoint {{ $labels.endpoint }} rejecting OWD samples as clock-skewed"
+          description: >-
+            owd_anomalies is increasing on {{ $labels.endpoint }}
+            ({{ printf "%.2f" $value }}/s) -- sampled frames computed a negative
+            one-way delay, meaning the receiver's clock trails the sender's. The
+            PTP mesh (ptp4l/phc2sys) has drifted; the urp_endpoint_owd_seconds
+            percentiles are untrustworthy until sync is restored.
+
+      # --- One-way delivery latency tail blowout (informational). ---
+      - alert: URPOwdTailHigh
+        expr: >-
+          histogram_quantile(0.99,
+            sum by (endpoint, le) (rate(urp_endpoint_owd_seconds_bucket[5m]))) > 0.005
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "urp endpoint {{ $labels.endpoint }} one-way delivery p99 latency is high"
+          description: >-
+            OWD p99 on {{ $labels.endpoint }} is {{ humanizeDuration $value }}
+            (>5ms). The single-flow floor is tens of us; a p99 this high points to
+            node contention or the startup fairness latch (design 38 §38.5), not
+            fabric latency. Threshold is fabric-specific -- tune per deployment.
+
       # --- Liveness: endpoint fell out of the active state. ---
       - alert: URPEndpointNotActive
         expr: max_over_time(urp_endpoint_state{state="active"}[1m]) == 0

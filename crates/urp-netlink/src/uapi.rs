@@ -78,6 +78,7 @@ pub enum UrpEndpointAttr {
     Mode = 15,
     Kind = 16,
     Interarrival = 17,
+    Owd = 18,
 }
 
 // --- enum urp_hist_attr (design 40 §40.1) ---
@@ -91,9 +92,24 @@ pub enum UrpHistAttr {
     Count = 4,
 }
 
+// --- enum urp_owd_attr (design 40 §40.2), nested in URP_ENDPOINT_A_OWD ---
+#[repr(u16)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum UrpOwdAttr {
+    Unspec = 0,
+    Hist = 1,          // NLA_NESTED -- one urp_hist_attr set
+    ClockOffsetNs = 2, // NLA_U64 -- PTP servo offset, 0 = unknown
+    Anomalies = 3,     // NLA_U64 -- skew-rejected sample count
+}
+
 /// Number of histogram buckets (14 finite le edges + +Inf), mirroring
 /// `URP_HIST_NBUCKETS` in `kernel/urp_hist.h`.
 pub const URP_HIST_NBUCKETS: usize = 15;
+
+/// Number of OWD histogram buckets (13 finite le edges + +Inf), mirroring
+/// `URP_OWD_NBUCKETS` in `kernel/urp_hist.h`. The OWD nest reuses the
+/// `urp_hist_attr` codec but carries only 14 bucket counts.
+pub const URP_OWD_NBUCKETS: usize = 14;
 
 /// enum urp_ep_mode -- endpoint operating mode (URP_ENDPOINT_A_MODE payload).
 pub const URP_EP_MODE_MULTISTREAM: u8 = 0;

@@ -151,6 +151,18 @@ static inline u32 urp_ep_max_payload(u32 buf_size)
 }
 
 /*
+ * design 40 §40.2 (PR-B2): the max payload the TX pump reads per frame. Reserves
+ * URP_TSTAMP_TRAILER_LEN at the tail so a sampled frame's 8-byte OWD trailer
+ * always fits the buffer -- reserved UNCONDITIONALLY (not only when OWD is on) to
+ * keep the TX buffer math branch-free; 8 bytes out of buf_size is negligible.
+ * URP_BUFFER_SIZE_MIN (68) - header (20) - 8 = 40 > 0, so this never underflows.
+ */
+static inline u32 urp_ep_tx_max_payload(u32 buf_size)
+{
+	return urp_ep_max_payload(buf_size) - URP_TSTAMP_TRAILER_LEN;
+}
+
+/*
  * Derive the chunk geometry for a buf_size on a device advertising @max_sge
  * scatter-gather entries (design 37 path Y). Returns the chunk count and writes
  * the per-chunk byte size to @out_chunk_size; the frame is gathered from that
@@ -321,6 +333,14 @@ struct urp_qp {
 	 * byte-window disabled => frame-credit fallback). PR3 consumes it.
 	 */
 	bool			peer_supports_window;
+
+	/*
+	 * design 40 §40.2 (PR-B2): did the peer advertise URP_CONN_CAP_TSTAMP?
+	 * Set from the same authoritative side as peer_supports_window, combined
+	 * with this endpoint's urp.latency_sample_period by urp_tstamp_negotiate()
+	 * into ep->tstamp_negotiated. Defaults false (peer never gets a trailer).
+	 */
+	bool			peer_supports_tstamp;
 
 	/*
 	 * Step 4: per-QP credit-based flow control state. Initialized on
@@ -730,6 +750,15 @@ struct urp_endpoint {
 	 * PR3's sender gate / grant emission gate on it. Defaults false.
 	 */
 	bool			window_negotiated;
+
+	/*
+	 * design 40 §40.2 (PR-B2): OWD timestamping negotiated with the peer --
+	 * this endpoint samples (urp.latency_sample_period != 0) AND the peer
+	 * advertised URP_CONN_CAP_TSTAMP. Latched at ESTABLISHED alongside
+	 * window_negotiated; gates the TX-side trailer stamp. Defaults false, so
+	 * a peer that never advertised TSTAMP is never sent a trailer.
+	 */
+	bool			tstamp_negotiated;
 
 	/*
 	 * Link rate (Mb/s) of the RoCE port, from ib_query_port at establish

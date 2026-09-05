@@ -10,8 +10,8 @@
 
 use std::fmt::Write;
 
-use urp_netlink::format::{Endpoint, Qp, Stats, Stream, URP_HIST_EDGES_NS};
-use urp_netlink::uapi::URP_HIST_NBUCKETS;
+use urp_netlink::format::{Endpoint, Qp, Stats, Stream, URP_HIST_EDGES_NS, URP_OWD_EDGES_NS};
+use urp_netlink::uapi::{URP_HIST_NBUCKETS, URP_OWD_NBUCKETS};
 
 use crate::config::Config;
 
@@ -87,6 +87,11 @@ pub fn endpoint_series_count(ep: &Endpoint, cfg: &Config) -> usize {
         // per stride: NBUCKETS _bucket lines + _sum + _count (design 40 §40.1).
         n += ep.interarrival.len() * (URP_HIST_NBUCKETS + 2);
     }
+    if cfg.owd && ep.owd.is_some() {
+        // OWD hist: NBUCKETS _bucket lines + _sum + _count, plus the clock-offset
+        // gauge + anomalies counter (design 40 §40.2).
+        n += URP_OWD_NBUCKETS + 2 + 2;
+    }
     n
 }
 
@@ -154,6 +159,7 @@ pub fn render_into_scratch(
         render_streams(buf, eps);
     }
     render_interarrival(buf, eps, cfg);
+    render_owd(buf, eps, cfg);
     capped_now
 }
 
@@ -499,6 +505,82 @@ fn ia_labels_le(buf: &mut String, ep: &Endpoint, stride: u32, bucket: usize) {
     buf.push_str("\"}");
 }
 
+/// RX one-way delivery-latency family (design 40 §40.2): a single classic
+/// histogram plus the PTP clock-offset gauge and the skew-anomaly counter. Like
+/// the inter-arrival family it accumulates per-bucket counts into the cumulative
+/// `_bucket` contract as it emits (zero steady-state alloc) and is emitted only
+/// when enabled AND at least one endpoint carries the nest -- a module without
+/// the feature, an unsampled endpoint, or an un-negotiated peer reports `None`,
+/// so the whole family silently vanishes.
+fn render_owd(buf: &mut String, eps: &[Endpoint], cfg: &Config) {
+    if !cfg.owd || eps.iter().all(|e| e.owd.is_none()) {
+        return;
+    }
+    help(
+        buf,
+        "urp_endpoint_owd_seconds",
+        "histogram",
+        "RX one-way delivery latency (sender->receiver) of sampled DATA frames; needs PTP-synced clocks.",
+    );
+    for ep in eps {
+        let Some(o) = &ep.owd else { continue };
+        let mut running = 0u64;
+        for (i, &c) in o.hist.buckets.iter().enumerate() {
+            running += c;
+            let _ = write!(buf, "urp_endpoint_owd_seconds_bucket");
+            owd_labels_le(buf, ep, i);
+            let _ = writeln!(buf, " {running}");
+        }
+        let _ = write!(buf, "urp_endpoint_owd_seconds_sum");
+        ep_labels(buf, ep);
+        let _ = writeln!(buf, " {}", o.hist.sum_ns as f64 / 1e9);
+        let _ = write!(buf, "urp_endpoint_owd_seconds_count");
+        ep_labels(buf, ep);
+        let _ = writeln!(buf, " {}", o.hist.count);
+    }
+    // PTP servo offset (last observed, nanoseconds -> seconds). 0 == unknown.
+    help(
+        buf,
+        "urp_endpoint_owd_clock_offset_seconds",
+        "gauge",
+        "Last PTP servo clock offset between this receiver and its peers; 0 = unknown.",
+    );
+    for ep in eps {
+        let Some(o) = &ep.owd else { continue };
+        let _ = write!(buf, "urp_endpoint_owd_clock_offset_seconds");
+        ep_labels(buf, ep);
+        let _ = writeln!(buf, " {}", o.clock_offset_ns as f64 / 1e9);
+    }
+    // Samples rejected as clock-skewed (negative OWD), never bucketed.
+    help(
+        buf,
+        "urp_endpoint_owd_anomalies_total",
+        "counter",
+        "Sampled frames whose computed OWD was negative (clock skew); rejected, not bucketed.",
+    );
+    for ep in eps {
+        let Some(o) = &ep.owd else { continue };
+        let _ = write!(buf, "urp_endpoint_owd_anomalies_total");
+        ep_labels(buf, ep);
+        let _ = writeln!(buf, " {}", o.anomalies);
+    }
+}
+
+/// `{endpoint,device,le}` -- the OWD bucket label set. Bucket `i < NBUCKETS-1`
+/// uses the finite edge (ns -> seconds); the last bucket is `+Inf`. Edges come
+/// from the const table shared with the kernel header (design 40 §40.2).
+fn owd_labels_le(buf: &mut String, ep: &Endpoint, bucket: usize) {
+    ep_labels_open(buf, ep);
+    buf.push_str(",le=\"");
+    if bucket + 1 < URP_OWD_NBUCKETS {
+        let secs = URP_OWD_EDGES_NS[bucket] as f64 / 1e9;
+        let _ = write!(buf, "{secs:e}");
+    } else {
+        let _ = write!(buf, "+Inf");
+    }
+    buf.push_str("\"}");
+}
+
 /* ---- label + header helpers ------------------------------------------- */
 
 fn help(buf: &mut String, name: &str, kind: &str, text: &str) {
@@ -634,6 +716,7 @@ mod tests {
                 auth_failures: 0,
             }),
             interarrival: vec![],
+            owd: None,
         }
     }
 
@@ -947,6 +1030,131 @@ mod tests {
         assert!(
             !b3.contains("urp_endpoint_interarrival_seconds"),
             "family must vanish when --no-interarrival:\n{b3}"
+        );
+    }
+
+    // design 40 §40.2: the OWD histogram renders as a valid Prometheus histogram
+    // (cumulative _bucket, bucket[+Inf] == _count), the clock-offset gauge +
+    // anomalies counter emit once, and the whole family vanishes when no endpoint
+    // carries the nest (unsampled / old module) or --no-owd is set.
+    #[test]
+    fn owd_histogram_truth_table() {
+        use urp_netlink::format::{Histogram, Owd};
+        let cfg = Config {
+            per_qp: false,
+            ..Config::default()
+        };
+        // counts 0..9 over the first 10 buckets, then zeros -> cumulative[+Inf]==45.
+        let mut ep = ep_fixture();
+        let buckets: Vec<u64> = (0..URP_OWD_NBUCKETS as u64)
+            .map(|b| if b < 10 { b } else { 0 })
+            .collect();
+        let total: u64 = buckets.iter().sum();
+        ep.owd = Some(Owd {
+            hist: Histogram {
+                stride: 0,
+                buckets,
+                sum_ns: 9_000,
+                count: total,
+            },
+            clock_offset_ns: 36,
+            anomalies: 3,
+        });
+        let mut buf = String::new();
+        render_into(
+            &mut buf,
+            std::slice::from_ref(&ep),
+            &cfg,
+            &SelfStats::default(),
+        );
+
+        // HELP/TYPE histogram exactly once; no stride label on OWD (single hist).
+        assert_eq!(
+            buf.matches("# TYPE urp_endpoint_owd_seconds histogram")
+                .count(),
+            1,
+            "type once\n{buf}"
+        );
+        // first finite le is the 1000ns == 1e-6 s edge.
+        assert!(
+            buf.contains("urp_endpoint_owd_seconds_bucket{endpoint=\"pair_acceptor\",device=\"mlx5_0\",le=\"1e-6\"}"),
+            "first owd bucket le label missing:\n{buf}"
+        );
+        // cumulative +Inf bucket == count == 45.
+        assert!(
+            buf.contains(&format!(
+                "urp_endpoint_owd_seconds_bucket{{endpoint=\"pair_acceptor\",device=\"mlx5_0\",le=\"+Inf\"}} {total}"
+            )),
+            "+Inf cumulative should equal count {total}:\n{buf}"
+        );
+        assert!(
+            buf.contains(&format!(
+                "urp_endpoint_owd_seconds_count{{endpoint=\"pair_acceptor\",device=\"mlx5_0\"}} {total}"
+            )),
+            "_count missing:\n{buf}"
+        );
+        // clock offset gauge (36ns -> 3.6e-8 s) + anomalies counter, once each.
+        assert_eq!(
+            buf.matches("# TYPE urp_endpoint_owd_clock_offset_seconds gauge")
+                .count(),
+            1,
+            "offset gauge type once\n{buf}"
+        );
+        assert!(
+            buf.contains(
+                "urp_endpoint_owd_clock_offset_seconds{endpoint=\"pair_acceptor\",device=\"mlx5_0\"} 0.000000036"
+            ) || buf.contains(
+                "urp_endpoint_owd_clock_offset_seconds{endpoint=\"pair_acceptor\",device=\"mlx5_0\"} 3.6e-8"
+            ),
+            "clock offset value missing:\n{buf}"
+        );
+        assert!(
+            buf.contains(
+                "urp_endpoint_owd_anomalies_total{endpoint=\"pair_acceptor\",device=\"mlx5_0\"} 3"
+            ),
+            "anomalies counter missing:\n{buf}"
+        );
+        // _bucket lines monotonic non-decreasing across le.
+        let mut last = 0u64;
+        for line in buf
+            .lines()
+            .filter(|l| l.starts_with("urp_endpoint_owd_seconds_bucket"))
+        {
+            let v: u64 = line.rsplit(' ').next().unwrap().parse().unwrap();
+            assert!(v >= last, "cumulative went backwards: {line}");
+            last = v;
+        }
+        assert_eq!(last, total, "final cumulative == count");
+
+        // negative: no nest (unsampled / old module) -> family absent, flag on.
+        let bare = ep_fixture(); // owd: None
+        let mut b2 = String::new();
+        render_into(
+            &mut b2,
+            std::slice::from_ref(&bare),
+            &cfg,
+            &SelfStats::default(),
+        );
+        assert!(
+            !b2.contains("urp_endpoint_owd_seconds"),
+            "family must vanish without the nest:\n{b2}"
+        );
+
+        // negative: --no-owd -> family absent even with data present.
+        let cfg_off = Config {
+            owd: false,
+            ..cfg.clone()
+        };
+        let mut b3 = String::new();
+        render_into(
+            &mut b3,
+            std::slice::from_ref(&ep),
+            &cfg_off,
+            &SelfStats::default(),
+        );
+        assert!(
+            !b3.contains("urp_endpoint_owd_seconds"),
+            "family must vanish when --no-owd:\n{b3}"
         );
     }
 
